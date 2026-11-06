@@ -594,7 +594,18 @@ class AppLauncherGUI:
         for item in self.tree_acc.get_children():
             self.tree_acc.delete(item)
         for acc in self.accounts_data:
-            has_token = "設定済 (Cookie)" if acc.get("auth_token") else "パスワード"
+            acc_id_str = str(acc.get("アカウントID", "") or acc.get("アカウント名", "") or acc.get("ユーザー名", "")).strip()
+            clean_acc = normalize_screen_name(acc_id_str)
+            prof_dir = os.path.join(self.base_dir, "browser_profiles", sanitize_filename(clean_acc))
+            has_profile = os.path.isdir(prof_dir)
+            if has_profile:
+                has_token = "✅ profile連携済"
+            elif acc.get("auth_token"):
+                has_token = "設定済 (Cookie)"
+            elif acc.get("パスワード"):
+                has_token = "設定済 (PW)"
+            else:
+                has_token = "👤 profile連携 (推奨)"
             t_cnt = acc.get("ターゲット件数") or acc.get("ターゲット数") or acc.get("目標件数") or acc.get("送信件数") or 15
             min_b = acc.get("連続処理件数最小数") or 5
             max_b = acc.get("連続処理件数最大数") or 10
