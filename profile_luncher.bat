@@ -4,6 +4,22 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 title Chrome カスタムプロファイル起動ツール (profile_luncher)
 
+if exist "profile_luncher.exe" (
+    profile_luncher.exe %*
+    pause
+    exit /b 0
+)
+if exist "profile_launcher.exe" (
+    profile_launcher.exe %*
+    pause
+    exit /b 0
+)
+if exist "x_auto_dm_gui.exe" (
+    x_auto_dm_gui.exe --cli-profile %*
+    pause
+    exit /b 0
+)
+
 set "PY="
 where py >nul 2>&1 && set "PY=py"
 if not defined PY where python >nul 2>&1 && set "PY=python"
@@ -26,9 +42,9 @@ if not defined PY (
 
 set PYTHONIOENCODING=utf-8
 set PYTHONUTF8=1
-if exist "profile_launcher.py" (
-    "%PY%" profile_launcher.py %*
-) else if exist "profile_luncher.py" (
+if exist "profile_luncher.py" (
     "%PY%" profile_luncher.py %*
+) else if exist "profile_launcher.py" (
+    "%PY%" profile_launcher.py %*
 )
 pause

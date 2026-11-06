@@ -63,6 +63,16 @@ if os.path.exists(dist_src):
         else:
             shutil.copy2(s, d)
 
+# (A-2) profile_luncher.exe も同名で複製
+if os.path.exists(os.path.join(out_dir, "profile_launcher.exe")):
+    shutil.copy2(os.path.join(out_dir, "profile_launcher.exe"), os.path.join(out_dir, "profile_luncher.exe"))
+
+# (A-3) プロファイル起動バッチを他PC配布フォルダに同梱
+for bname in ["03_プロファイル起動_profile_launcher.bat", "profile_launcher.bat", "profile_luncher.bat"]:
+    bpath = os.path.join(base_dir, bname)
+    if os.path.exists(bpath):
+        shutil.copy2(bpath, os.path.join(out_dir, bname))
+
 # (B) Playwright Chromiumブラウザを同梱 (_internal/ms-playwright 内に完全格納しルートはシンプルに保持)
 print("   ・Playwright Chromiumブラウザ本体を同梱中 (他PCダウンロード不要)...")
 local_appdata = os.environ.get("LOCALAPPDATA", "")

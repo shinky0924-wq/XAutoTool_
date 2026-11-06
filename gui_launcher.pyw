@@ -1038,6 +1038,8 @@ class AppLauncherGUI:
                         cmd = [sys.executable, "--cli-test"]
                     elif "edit_account.py" in script_path:
                         cmd = [sys.executable, "--cli-edit"]
+                    elif "profile_launcher.py" in script_path or "profile_luncher.py" in script_path:
+                        cmd = [sys.executable, "--cli-profile"]
                     else:
                         cmd = [sys.executable, "--cli-main"]
                 else:
@@ -1194,6 +1196,14 @@ class AppLauncherGUI:
             return
 
         prof_name = prof_name.strip()
+        if getattr(sys, 'frozen', False):
+            exe_path = sys.executable
+            if prof_name:
+                subprocess.Popen(f'start cmd /k ""{exe_path}" --cli-profile "{prof_name}""', shell=True, cwd=self.base_dir)
+            else:
+                subprocess.Popen(f'start cmd /k ""{exe_path}" --cli-profile"', shell=True, cwd=self.base_dir)
+            return
+
         if prof_name:
             if os.path.exists(bat_script):
                 subprocess.Popen(f'start cmd /k ""{bat_script}" "{prof_name}""', shell=True, cwd=self.base_dir)
@@ -1349,6 +1359,14 @@ if __name__ == "__main__":
     elif len(sys.argv) > 1 and sys.argv[1] == "--cli-edit":
         import edit_account
         edit_account.main()
+        sys.exit(0)
+    elif len(sys.argv) > 1 and sys.argv[1] == "--cli-profile":
+        import profile_launcher
+        if len(sys.argv) > 2:
+            sys.argv = [sys.argv[0]] + sys.argv[2:]
+        else:
+            sys.argv = [sys.argv[0]]
+        profile_launcher.main()
         sys.exit(0)
     else:
         try:

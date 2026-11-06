@@ -3,6 +3,12 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 title X Auto DM Launcher
 
+REM 0. If standalone EXE exists (distribution package without Python)
+if exist "x_auto_dm_gui.exe" (
+    start "" "x_auto_dm_gui.exe"
+    exit /b 0
+)
+
 REM 1. Detect pythonw / pyw for silent GUI launch (No black CMD window stays open)
 set "PYW="
 where pyw >nul 2>&1 && set "PYW=pyw"

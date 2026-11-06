@@ -83,11 +83,62 @@ exe = EXE(
     icon=None
 )
 
+a_prof = Analysis(
+    ['profile_launcher.py'],
+    pathex=[],
+    binaries=pw_binaries + xl_binaries,
+    datas=[
+        ('browser_controller.py', '.'),
+        ('config_manager.py', '.'),
+        ('db_manager.py', '.'),
+    ] + pw_datas + xl_datas,
+    hiddenimports=[
+        'profile_launcher',
+        'browser_controller',
+        'config_manager',
+        'db_manager',
+        'playwright',
+        'playwright.sync_api',
+        'openpyxl',
+        'sqlite3',
+    ] + pw_hidden + xl_hidden,
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=['matplotlib', 'scipy', 'numpy', 'pandas'],
+    win_no_prefer_redirects=False,
+    win_private_assemblies=False,
+    cipher=block_cipher,
+    noarchive=False,
+)
+
+pyz_prof = PYZ(a_prof.pure, a_prof.zipped_data, cipher=block_cipher)
+
+exe_prof = EXE(
+    pyz_prof,
+    a_prof.scripts,
+    [],
+    exclude_binaries=True,
+    name='profile_launcher',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=True,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=None
+)
+
 coll = COLLECT(
     exe,
-    a.binaries,
-    a.zipfiles,
-    a.datas,
+    exe_prof,
+    a.binaries + a_prof.binaries,
+    a.zipfiles + a_prof.zipfiles,
+    a.datas + a_prof.datas,
     strip=False,
     upx=True,
     upx_exclude=[],
