@@ -61,10 +61,21 @@ def normalize_screen_name(val: str) -> str:
     return s.lstrip("@").strip()
 
 class ConfigManager:
-    def __init__(self, account_config_path: str, target_list_path: str, base_dir: str = ""):
-        self.account_config_path = account_config_path
-        self.target_list_path = target_list_path
-        self.base_dir = base_dir or os.path.dirname(os.path.abspath(account_config_path))
+    def __init__(self, account_config_path: str = "", target_list_path: str = "", base_dir: str = ""):
+        # 1引数のみでディレクトリが渡された場合、または空引数に対応 (例: ConfigManager(self.base_dir))
+        if account_config_path and os.path.isdir(account_config_path):
+            base_dir = account_config_path
+            account_config_path = ""
+
+        if not base_dir:
+            if account_config_path and os.path.isfile(account_config_path):
+                base_dir = os.path.dirname(os.path.abspath(account_config_path))
+            else:
+                base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+
+        self.base_dir = base_dir
+        self.account_config_path = account_config_path or os.path.join(self.base_dir, "アカウント情報.xlsx")
+        self.target_list_path = target_list_path or os.path.join(self.base_dir, "アカウント名.xlsx")
 
     def get_target_path_for_account(self, account_id: str) -> str:
         """アカウント情報に登録されているアカウント名に応じた個別Excelファイル (例: reghv6.xlsx) を最優先で取得"""

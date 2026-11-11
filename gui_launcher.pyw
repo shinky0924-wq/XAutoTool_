@@ -117,7 +117,9 @@ class AppLauncherGUI:
         else:
             self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.running_process = None
-        self.config_mgr = ConfigManager(self.base_dir)
+        acc_path = os.path.join(self.base_dir, "アカウント情報.xlsx")
+        name_path = os.path.join(self.base_dir, "アカウント名.xlsx")
+        self.config_mgr = ConfigManager(acc_path, name_path, self.base_dir)
 
         # アプリ終了ハンドラー（ウィンドウの「×」で閉じたら裏の全プロセス・ブラウザを確実に全停止）
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
