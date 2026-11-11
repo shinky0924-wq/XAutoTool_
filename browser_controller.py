@@ -1633,6 +1633,24 @@ class XBrowserController:
             print(f"   ⚠️ ステータス画面取得エラー: {e}")
             return None
 
+    def get_tweet_text_from_url(self, tweet_url: str) -> str:
+        """指定したツイートURLにアクセスして投稿本文テキストを取得"""
+        if not tweet_url or "/status/" not in tweet_url:
+            return ""
+        try:
+            target_tweet = self._find_tweet_on_status_page(tweet_url)
+            if target_tweet:
+                text_el = target_tweet.locator('div[data-testid="tweetText"]')
+                if text_el.count() > 0:
+                    return text_el.first.inner_text().strip()
+            page = self.ensure_page()
+            all_texts = page.locator('div[data-testid="tweetText"]')
+            if all_texts.count() > 0:
+                return all_texts.first.inner_text().strip()
+        except Exception as e:
+            print(f"   ⚠️ ツイートテキスト取得例外: {e}")
+        return ""
+
     def send_reply(self, target_screen_name: str, reply_text: str, tweet_url: str = "") -> tuple[str, str]:
         """
         指定ポストまたは指定ユーザーの最新ポストへリプライ送信
