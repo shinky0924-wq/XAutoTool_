@@ -14,6 +14,7 @@ import threading
 import sqlite3
 import tkinter as tk
 from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
+from config_manager import ConfigManager
 
 # Windows CP932 / Emoji UnicodeEncodeError 対策
 if sys.platform == "win32":
@@ -116,6 +117,7 @@ class AppLauncherGUI:
         else:
             self.base_dir = os.path.dirname(os.path.abspath(__file__))
         self.running_process = None
+        self.config_mgr = ConfigManager(self.base_dir)
 
         # アプリ終了ハンドラー（ウィンドウの「×」で閉じたら裏の全プロセス・ブラウザを確実に全停止）
         self.root.protocol("WM_DELETE_WINDOW", self.on_window_close)
@@ -638,8 +640,12 @@ class AppLauncherGUI:
             passcode_display = f"登録済 ({passcode_val})" if passcode_val else "未設定 (初回時に自動保存)"
 
             # アカウント専用Excel (例: wqwq1320.xlsx) から個別動作設定 (動作設定シート) を読込
-            acc_target_path = config_mgr.get_target_path_for_account(clean_acc)
-            acc_set = config_mgr.load_account_settings(clean_acc, target_path_override=acc_target_path, fallback_acc=acc)
+            try:
+                acc_target_path = self.config_mgr.get_target_path_for_account(clean_acc)
+                acc_set = self.config_mgr.load_account_settings(clean_acc, target_path_override=acc_target_path, fallback_acc=acc)
+            except Exception:
+                acc_target_path = ""
+                acc_set = {}
 
             excel_name = os.path.basename(acc_target_path) if acc_target_path and os.path.exists(acc_target_path) else "アカウント名.xlsx"
             target_mode_display = acc_set.get("target_mode") or "1,2,3 (全自動)"
