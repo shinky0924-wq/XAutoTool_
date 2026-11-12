@@ -14,6 +14,9 @@ import time
 import random
 import math
 
+import functools
+print = functools.partial(print, flush=True)
+
 # Windows CP932 / Emoji UnicodeEncodeError 対策
 if sys.platform == "win32":
     try:
@@ -834,12 +837,19 @@ class XBrowserController:
                 'input[name="password"]',
                 'input[autocomplete="current-password"]',
                 'input[autocomplete="password"]',
+                'label:has-text("パスワード") input',
+                'label:has-text("Password" i) input',
                 'input[placeholder*="パスワード"]',
                 'input[placeholder*="Password" i]',
                 'div[role="dialog"] input[type="password"]',
             ]
         else:
             selectors = [
+                'label:has-text("メールアドレス") input',
+                'label:has-text("ユーザー名") input',
+                'label:has-text("username" i) input',
+                'label:has-text("email" i) input',
+                'label:has-text("phone" i) input',
                 'input[autocomplete="username"]',
                 'input[name="text"]',
                 'input[name="username"]',
@@ -868,6 +878,33 @@ class XBrowserController:
                         return item
             except Exception:
                 continue
+
+        # JavaScriptによるDOM走査フォールバック
+        try:
+            found_sel = page.evaluate('''(isPw) => {
+                const inps = Array.from(document.querySelectorAll('input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])')).filter(el => {
+                    if (el.matches('[data-testid*="Search" i], [placeholder*="検索" i], [placeholder*="Search" i]')) return false;
+                    return el.offsetParent !== null;
+                });
+                for (let i = 0; i < inps.length; i++) {
+                    const el = inps[i];
+                    const t = (el.type || 'text').toLowerCase();
+                    if (isPw && (t === 'password' || el.name === 'password')) {
+                        el.setAttribute('data-target-input', 'password');
+                        return 'input[data-target-input="password"]';
+                    }
+                    if (!isPw && t !== 'password') {
+                        el.setAttribute('data-target-input', 'username');
+                        return 'input[data-target-input="username"]';
+                    }
+                }
+                return null;
+            }''', is_password)
+            if found_sel:
+                return page.locator(found_sel).first
+        except Exception:
+            pass
+
         return None
 
     def _safe_fill_input(self, locator, value: str):
@@ -885,13 +922,15 @@ class XBrowserController:
         # 1. クリック＆フォーカス
         try:
             locator.click(force=True, timeout=3000)
+            locator.focus()
             time.sleep(0.15)
         except Exception:
             pass
 
-        # 2. 既存入力クリア
+        # 2. 全選択してクリア
         try:
-            locator.fill("")
+            page.keyboard.press("Control+A")
+            page.keyboard.press("Backspace")
             time.sleep(0.05)
         except Exception:
             pass
@@ -923,7 +962,16 @@ class XBrowserController:
         except Exception:
             pass
 
-        # 5. キーボード打鍵イベントも補助発火
+        # 5. もし値が反映されていなければ物理キーボードで直接タイピング
+        try:
+            current_val = locator.input_value()
+            if not current_val:
+                page.keyboard.type(value, delay=35)
+                time.sleep(0.1)
+        except Exception:
+            pass
+
+        # 6. キーボード打鍵イベントも補助発火
         try:
             page.keyboard.press("End")
         except Exception:
@@ -983,6 +1031,27 @@ class XBrowserController:
                                 pass
             except Exception:
                 continue
+
+        # JSによるクリック実行 (disabled/aria-disabled を強制解除してクリック)
+        try:
+            clicked = page.evaluate('''(isLogin) => {
+                const candidates = isLogin ? ['ログイン', 'log in', '続ける', 'continue'] : ['続ける', 'continue', '次へ', 'next'];
+                const btns = Array.from(document.querySelectorAll('button, div[role="button"], input[type="submit"]')).filter(b => b.offsetParent !== null);
+                for (const b of btns) {
+                    const txt = (b.innerText || b.value || '').trim().toLowerCase();
+                    if (candidates.some(c => txt.includes(c))) {
+                        b.removeAttribute('disabled');
+                        b.setAttribute('aria-disabled', 'false');
+                        b.click();
+                        return true;
+                    }
+                }
+                return false;
+            }''', is_login_submit)
+            if clicked:
+                return True
+        except Exception:
+            pass
 
         # セレクタで見つからない場合は Enter キー
         try:

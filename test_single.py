@@ -13,6 +13,9 @@ import sys
 import re
 import time
 
+import functools
+print = functools.partial(print, flush=True)
+
 # Windows CP932 / Emoji UnicodeEncodeError 対策
 if sys.platform == "win32":
     try:
