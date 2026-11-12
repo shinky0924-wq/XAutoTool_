@@ -105,8 +105,8 @@ def main():
     print(f"💾 アカウント専用DB: {acc_db_path}")
     print(f"📂 ターゲット設定ファイル: {os.path.basename(acc_target_path)}")
 
-    auth_token = str(first_acc.get("auth_token", "") or first_acc.get("authtoken", "")).strip()
-    password = str(first_acc.get("パスワード", "") or first_acc.get("password", "")).strip()
+    auth_token = str(first_acc.get("auth_token", "") or first_acc.get("authtoken", "") or first_acc.get("セッションID", "") or first_acc.get("session_id", "")).strip()
+    password = str(first_acc.get("アカウントPW", "") or first_acc.get("パスワード", "") or first_acc.get("password", "") or first_acc.get("pw", "")).strip()
     dm_raw = ""
     for k, v in first_acc.items():
         if k and v is not None and str(v).strip():

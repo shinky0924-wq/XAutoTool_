@@ -825,10 +825,14 @@ class XBrowserController:
 
     def login(self, account_id: str, auth_token: str = "", password: str = "", passcode: str = "") -> bool:
         """
-        プロファイル優先・ID/PWによるログイン維持 (Cookie強制ログアウト防止対策)
-        1. 既存プロファイルにログインセッションが存在するか確認（存在すればCookie注入を行わずそのまま維持）
-        2. 未ログイン時はID・パスワードによる自動フォームログインを実行してプロファイルに永続保存
-        3. パスワード未設定時のみ auth_token によるフォールバックを試行
+        プロファイル・セッションID・ID/PWハイブリッドログイン
+        1. 永続プロファイル内の既存ログインセッションを確認 (すでにログイン中なら即座に継続)
+        2. セッションID (auth_token) がある場合: まずCookieログインを試行
+           - 成功時: プロファイルにセッション同期して即完了
+           - 失敗時 (無効・期限切れ・強制ログアウト等): 自動的にID・PWログインへフォールバック
+        3. セッションID未設定時、またはセッションIDでログインできない場合:
+           ID・パスワードによる自動フォームログインを実行し、プロファイルに永続保存
+        4. 2FA等の追加確認時は手動入力待ち受け (最大60秒ポーリング検知)
         """
         self.current_account_id = account_id
         if passcode:
@@ -846,73 +850,31 @@ class XBrowserController:
                 pass
         passcode = passcode or self.current_passcode
 
-        print(f"🔑 [@{account_id}] ブラウザプロファイルのログインセッション確認中...")
         page = self.ensure_page()
 
-        # 1. 永続プロファイル内の既存ログインセッション確認 (セッション強制ログアウトを完全防止)
+        # -------------------------------------------------------------
+        # 1. 永続プロファイル内の既存ログインセッション確認
+        # -------------------------------------------------------------
+        print(f"🔑 [@{account_id}] ブラウザプロファイルの既存ログイン状態を確認中...")
         try:
             page.goto("https://x.com/home", timeout=30000, wait_until="domcontentloaded")
-            # 描画待ち (最大6秒ポーリング)
-            for _ in range(12):
+            for _ in range(10):
                 time.sleep(0.5)
                 if self._is_logged_in():
-                    print(f"✅ [@{account_id}] プロファイルの既存ログインセッションを確認しました！（ID・PWログイン保持 / 再認証不要）")
+                    print(f"✅ [@{account_id}] プロファイルの既存セッションを確認しました！（ログイン維持 / 再認証不要）")
                     self.save_storage_state()
                     return True
-                # 明確なログイン要求画面にリダイレクトされた場合は抜ける
                 if "/login" in page.url or "/flow/login" in page.url:
                     break
         except Exception:
             pass
 
-        # 2. 未ログイン時: パスワード指定がある場合は ID・パスワードによる自動フォームログイン
-        if password:
-            print(f"🔑 [@{account_id}] ID・パスワードによるログインを実行し、プロファイルに永続保存します...")
-            try:
-                page.goto("https://x.com/i/flow/login", timeout=45000, wait_until="domcontentloaded")
-                time.sleep(2.5)
-
-                # ユーザーID入力
-                user_input = page.locator('input[autocomplete="username"], input[name="text"]')
-                user_input.first.wait_for(timeout=10000)
-                self.human_type(user_input.first, account_id)
-                time.sleep(0.5)
-                page.keyboard.press("Enter")
-                time.sleep(2.5)
-
-                # 追加の身元確認 (電話番号/メール/アカウント名要求) が出た場合の自動通過
-                challenge_input = page.locator('input[data-testid="ocfEnterTextTextInput"], input[name="text"]')
-                if challenge_input.count() > 0 and page.locator('input[type="password"]').count() == 0:
-                    print(f"   🔍 追加の身元確認要求を検出。アカウントID (@{account_id}) を自動入力します...")
-                    self.human_type(challenge_input.first, account_id)
-                    time.sleep(0.5)
-                    page.keyboard.press("Enter")
-                    time.sleep(2.5)
-
-                # パスワード入力
-                pass_input = page.locator('input[type="password"], input[name="password"]')
-                pass_input.first.wait_for(timeout=10000)
-                self.human_type(pass_input.first, password)
-                time.sleep(0.5)
-                page.keyboard.press("Enter")
-                time.sleep(3.5)
-
-                # 2FA / パスコード / 確認コードの要求チェック
-                if self.is_passcode_prompt_active():
-                    self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="ログイン認証コード")
-                    time.sleep(2.5)
-
-                if self._is_logged_in():
-                    print(f"🎉 [@{account_id}] ID・パスワードでのログインが成功し、ブラウザプロファイルに永続保存されました！")
-                    self.save_storage_state()
-                    return True
-            except Exception as e:
-                print(f"   ⚠️ フォームログイン試行エラー: {e}")
-
-        # 3. フォールバック: パスワードなしの場合の auth_token Cookie ログイン
-        if auth_token and not password:
-            print(f"   ℹ️ [@{account_id}] パスワード未設定のため、auth_token によるCookieログインを試行します...")
-            clean_token = auth_token.strip()
+        # -------------------------------------------------------------
+        # 2. セッションID (auth_token) がある場合: まずCookie注入ログインを試行
+        # -------------------------------------------------------------
+        clean_token = auth_token.strip() if auth_token else ""
+        if clean_token:
+            print(f"🍪 [@{account_id}] セッションID (auth_token) によるログインを試行します...")
             try:
                 self.context.add_cookies([
                     {
@@ -935,27 +897,116 @@ class XBrowserController:
                     }
                 ])
                 page.goto("https://x.com/home", timeout=35000, wait_until="domcontentloaded")
-                time.sleep(3)
+                time.sleep(2.5)
+
                 if self.is_passcode_prompt_active():
                     self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="Cookieログイン後認証")
                     time.sleep(2)
 
                 if self._is_logged_in():
-                    print(f"✅ [@{account_id}] Cookieログインに成功しました！（プロファイルにセッション同期）")
+                    print(f"✅ [@{account_id}] セッションIDでのログインに成功しました！（プロファイルにセッション同期）")
                     self.save_storage_state()
                     return True
                 else:
-                    print(f"⚠️ [@{account_id}] auth_token でのログインに失敗しました（トークン期限切れまたはX側の無効化）。")
+                    print(f"⚠️ [@{account_id}] セッションIDでのログインに失敗しました（失効または強制ログアウト検知）。")
             except Exception as e:
-                print(f"   ⚠️ Cookie登録エラー: {e}")
+                print(f"⚠️ [@{account_id}] セッションID登録エラー: {e}")
 
-        # 4. ログイン失敗時の親切なガイダンス
+        # -------------------------------------------------------------
+        # 3. セッションIDがない場合、またはセッションIDでログインできない場合:
+        #    ID・パスワードによる自動フォームログインを実行
+        # -------------------------------------------------------------
+        clean_pass = password.strip() if password else ""
+        if not clean_token:
+            print(f"ℹ️ [@{account_id}] セッションID (auth_token) が未設定のため、ID・パスワードでログインします...")
+        else:
+            print(f"🔄 [@{account_id}] セッションIDでログインできないため、ID・パスワードによる自動ログインへ切り替えます...")
+
+        if clean_pass:
+            print(f"🔑 [@{account_id}] ID・パスワードによる自動フォームログインを開始します...")
+            try:
+                page.goto("https://x.com/i/flow/login", timeout=45000, wait_until="domcontentloaded")
+                time.sleep(2.5)
+
+                # ユーザー名/ID入力
+                user_input = page.locator('input[autocomplete="username"], input[name="text"]')
+                user_input.first.wait_for(timeout=12000)
+                self.human_type(user_input.first, account_id)
+                time.sleep(0.5)
+
+                # 「次へ」ボタンまたはEnter
+                next_btn = page.locator('button:has-text("次へ"), button:has-text("Next"), div[role="button"]:has-text("次へ"), div[role="button"]:has-text("Next")')
+                if next_btn.count() > 0 and next_btn.first.is_visible():
+                    next_btn.first.click()
+                else:
+                    page.keyboard.press("Enter")
+                time.sleep(2.5)
+
+                # 追加の身元確認要求 (電話番号/メールアドレス/アカウント名) が出た場合の自動入力
+                challenge_input = page.locator('input[data-testid="ocfEnterTextTextInput"], input[name="text"]')
+                if challenge_input.count() > 0 and page.locator('input[type="password"]').count() == 0:
+                    print(f"   🔍 追加の身元確認要求を検出。アカウントID (@{account_id}) を自動入力します...")
+                    self.human_type(challenge_input.first, account_id)
+                    time.sleep(0.5)
+                    ch_next = page.locator('button:has-text("次へ"), button:has-text("Next"), div[role="button"]:has-text("次へ")')
+                    if ch_next.count() > 0 and ch_next.first.is_visible():
+                        ch_next.first.click()
+                    else:
+                        page.keyboard.press("Enter")
+                    time.sleep(2.5)
+
+                # パスワード入力
+                pass_input = page.locator('input[type="password"], input[name="password"]')
+                pass_input.first.wait_for(timeout=12000)
+                self.human_type(pass_input.first, clean_pass)
+                time.sleep(0.5)
+
+                # 「ログイン」ボタンまたはEnter
+                login_btn = page.locator('button[data-testid="LoginForm_Login_Button"], button:has-text("ログイン"), button:has-text("Log in"), div[role="button"]:has-text("ログイン")')
+                if login_btn.count() > 0 and login_btn.first.is_visible():
+                    login_btn.first.click()
+                else:
+                    page.keyboard.press("Enter")
+                time.sleep(3.5)
+
+                # 2FA / パスコード / 認証コードチェック
+                if self.is_passcode_prompt_active():
+                    self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="ログイン認証コード")
+                    time.sleep(2.5)
+
+                # ログイン確認ポーリング (最大12秒)
+                for _ in range(12):
+                    if self._is_logged_in():
+                        print(f"🎉 [@{account_id}] ID・パスワードでのログインが成功しました！セッション情報をプロファイルに永続保存します。")
+                        self.save_storage_state()
+                        return True
+                    time.sleep(1.0)
+
+            except Exception as e:
+                print(f"   ⚠️ ID・パスワード フォームログイン試行エラー: {e}")
+        else:
+            print(f"⚠️ [@{account_id}] アカウント情報.xlsx にパスワードが登録されていません。")
+
+        # -------------------------------------------------------------
+        # 4. 手動ログイン待ち受け救済 (ブラウザ画面上で手動ログインを待機)
+        # -------------------------------------------------------------
+        print(f"⏳ [@{account_id}] 画面上でログイン認証の完了を確認中（最大60秒待機）...")
+        for wait_idx in range(30):
+            time.sleep(2.0)
+            if self._is_logged_in():
+                print(f"🎉 [@{account_id}] ログインが確認できました！セッション情報を永続プロファイルに保存します。")
+                self.save_storage_state()
+                return True
+            if wait_idx % 5 == 0 and wait_idx > 0:
+                print(f"   ⏳ ログイン完了を待機中... ({wait_idx * 2}/60秒)")
+
+        # 5. 失敗時のガイダンス
         print()
         print(f"❌ [@{account_id}] ログイン状態が確認できませんでした。")
         print("💡 【おすすめの解決方法】")
-        print(f"   付属の『profile_launcher.bat』（プロファイル起動ツール）を起動し、")
-        print(f"   プロファイル名に「{account_id}」を入力してブラウザ上で一度手動ログイン（ID・パスワード）を行ってください。")
-        print("   一度ログインを完了すれば、このプロファイルにログイン状態が永続保存され、次回以降は自動で動作します。")
+        print("   1. 『アカウント情報.xlsx』の「アカウントPW」列に正しいパスワードが記入されているか確認してください。")
+        print(f"   2. または付属の『profile_launcher.bat』を実行し、プロファイル名に「{account_id}」を入力してブラウザ上で1度手動ログインを行ってください。")
+        print("      （一度ログインすればブラウザプロファイルに永続保存され、次回以降パスワード入力も不要になります）")
         print()
         return False
 

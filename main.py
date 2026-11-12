@@ -588,8 +588,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
         set_current_logger(acc_logger)
 
-        auth_token = get_acc_val(acc, ["auth_token", "authtoken", "token", "クッキー"], "").strip()
-        password = get_acc_val(acc, ["パスワード", "password", "pass", "アカウントpw", "pw"], "").strip()
+        auth_token = get_acc_val(acc, ["auth_token", "authtoken", "セッションid", "session_id", "token", "クッキー", "cookie"], "").strip()
+        password = get_acc_val(acc, ["アカウントpw", "アカウントパスワード", "パスワード", "password", "pass", "pw"], "").strip()
         dm_passcode = get_acc_val(acc, ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "暗号化dm", "pin", "dmpin", "復号", "2fa", "認証コード", "dmpasscode", "passcode"], "").strip()
         if not dm_passcode:
             try:

@@ -46,8 +46,8 @@ def main():
 
     first_acc = accounts[0]
     account_id = first_acc.get("アカウントID", "").strip()
-    auth_token = first_acc.get("auth_token", "").strip()
-    password = first_acc.get("パスワード", "").strip()
+    auth_token = str(first_acc.get("auth_token", "") or first_acc.get("セッションID", "") or first_acc.get("session_id", "")).strip()
+    password = str(first_acc.get("アカウントPW", "") or first_acc.get("パスワード", "") or first_acc.get("password", "")).strip()
     dm_raw = ""
     for k, v in first_acc.items():
         if k and v is not None and str(v).strip():
