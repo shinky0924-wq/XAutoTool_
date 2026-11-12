@@ -823,6 +823,175 @@ class XBrowserController:
             print(f"   ⚠️ [{context_label}] パスコード処理中にエラー: {ex}", flush=True)
         return False
 
+    def _find_login_input(self, page: Page, is_password: bool = False):
+        """
+        X (Twitter) のログイン画面・オンボーディング画面の入力欄を高精度に自動検出
+        /i/flow/login および /i/jf/onboarding/web?mode=login の両方に完全対応
+        """
+        if is_password:
+            selectors = [
+                'input[type="password"]',
+                'input[name="password"]',
+                'input[autocomplete="current-password"]',
+                'input[autocomplete="password"]',
+                'input[placeholder*="パスワード"]',
+                'input[placeholder*="Password" i]',
+                'div[role="dialog"] input[type="password"]',
+            ]
+        else:
+            selectors = [
+                'input[autocomplete="username"]',
+                'input[name="text"]',
+                'input[name="username"]',
+                'input[name="identifier"]',
+                'input[placeholder*="ユーザー名"]',
+                'input[placeholder*="メール"]',
+                'input[placeholder*="電話"]',
+                'input[placeholder*="username" i]',
+                'input[placeholder*="email" i]',
+                'input[placeholder*="phone" i]',
+                'div[role="dialog"] input[type="text"]',
+                'div[role="dialog"] input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"])',
+                'main input[type="text"]',
+                'input[type="text"]',
+                'input[type="email"]',
+                'input:not([type="hidden"]):not([type="checkbox"]):not([type="radio"]):not([data-testid*="Search"])'
+            ]
+
+        for sel in selectors:
+            try:
+                loc = page.locator(sel)
+                cnt = loc.count()
+                for i in range(cnt):
+                    item = loc.nth(i)
+                    if item.is_visible():
+                        return item
+            except Exception:
+                continue
+        return None
+
+    def _safe_fill_input(self, locator, value: str):
+        """
+        Reactの制御されたコンポーネント (Controlled Input) に値を確実に反映させ、
+        プロトタイプセッターおよび input / change イベントを発火して
+        「続ける」「ログイン」ボタンの非活性(disabled)状態を即座に解除する。
+        """
+        page = self.ensure_page()
+        try:
+            locator.scroll_into_view_if_needed(timeout=3000)
+        except Exception:
+            pass
+
+        # 1. クリック＆フォーカス
+        try:
+            locator.click(force=True, timeout=3000)
+            time.sleep(0.15)
+        except Exception:
+            pass
+
+        # 2. 既存入力クリア
+        try:
+            locator.fill("")
+            time.sleep(0.05)
+        except Exception:
+            pass
+
+        # 3. Playwrightネイティブ入力
+        try:
+            locator.fill(value)
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+        # 4. React内部状態更新 (Prototype value setter + Events)
+        try:
+            locator.evaluate('''(el, val) => {
+                el.focus();
+                const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                const prototype = Object.getPrototypeOf(el);
+                const protoSetter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+                if (protoSetter && valueSetter !== protoSetter) {
+                    protoSetter.call(el, val);
+                } else if (valueSetter) {
+                    valueSetter.call(el, val);
+                } else {
+                    el.value = val;
+                }
+                el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+            }''', value)
+        except Exception:
+            pass
+
+        # 5. キーボード打鍵イベントも補助発火
+        try:
+            page.keyboard.press("End")
+        except Exception:
+            pass
+        time.sleep(0.2)
+
+    def _click_next_or_submit(self, page: Page, is_login_submit: bool = False) -> bool:
+        """
+        「続ける」「次へ」「ログイン」「Log in」ボタンを検索してクリック。
+        見つからない場合は Enter キーを押下。
+        """
+        if is_login_submit:
+            selectors = [
+                'button[data-testid="LoginForm_Login_Button"]',
+                'button:has-text("ログイン")',
+                'button:has-text("Log in")',
+                'button:has-text("続ける")',
+                'button:has-text("Continue")',
+                'button:has-text("次へ")',
+                'button:has-text("Next")',
+                'div[role="button"]:has-text("ログイン")',
+                'div[role="button"]:has-text("Log in")',
+                'div[role="button"]:has-text("続ける")',
+                'div[role="button"]:has-text("Continue")',
+                'button[type="submit"]',
+            ]
+        else:
+            selectors = [
+                'button:has-text("続ける")',
+                'button:has-text("Continue")',
+                'button:has-text("次へ")',
+                'button:has-text("Next")',
+                'div[role="button"]:has-text("続ける")',
+                'div[role="button"]:has-text("Continue")',
+                'div[role="button"]:has-text("次へ")',
+                'div[role="button"]:has-text("Next")',
+                'button[type="submit"]',
+                'button[data-testid*="next" i]',
+                'div[data-testid*="next" i]'
+            ]
+
+        for sel in selectors:
+            try:
+                btn = page.locator(sel)
+                cnt = btn.count()
+                for i in range(cnt):
+                    item = btn.nth(i)
+                    if item.is_visible():
+                        try:
+                            item.click(timeout=3000)
+                            return True
+                        except Exception:
+                            try:
+                                item.click(force=True, timeout=3000)
+                                return True
+                            except Exception:
+                                pass
+            except Exception:
+                continue
+
+        # セレクタで見つからない場合は Enter キー
+        try:
+            page.keyboard.press("Enter")
+            return True
+        except Exception:
+            pass
+        return False
+
     def login(self, account_id: str, auth_token: str = "", password: str = "", passcode: str = "") -> bool:
         """
         プロファイル・セッションID・ID/PWハイブリッドログイン
@@ -832,6 +1001,9 @@ class XBrowserController:
            - 失敗時 (無効・期限切れ・強制ログアウト等): 自動的にID・PWログインへフォールバック
         3. セッションID未設定時、またはセッションIDでログインできない場合:
            ID・パスワードによる自動フォームログインを実行し、プロファイルに永続保存
+           - /i/flow/login および /i/jf/onboarding/web?mode=login の両UIに対応
+           - 「メールアドレスまたはユーザー名」入力欄への確実な自動入力と「続ける」ボタン押下
+           - パスワード入力欄への自動入力と「ログイン」ボタン押下
         4. 2FA等の追加確認時は手動入力待ち受け (最大60秒ポーリング検知)
         """
         self.current_account_id = account_id
@@ -857,14 +1029,15 @@ class XBrowserController:
         # -------------------------------------------------------------
         print(f"🔑 [@{account_id}] ブラウザプロファイルの既存ログイン状態を確認中...")
         try:
-            page.goto("https://x.com/home", timeout=30000, wait_until="domcontentloaded")
-            for _ in range(10):
+            page.goto("https://x.com/home", timeout=25000, wait_until="domcontentloaded")
+            for _ in range(8):
                 time.sleep(0.5)
                 if self._is_logged_in():
                     print(f"✅ [@{account_id}] プロファイルの既存セッションを確認しました！（ログイン維持 / 再認証不要）")
                     self.save_storage_state()
                     return True
-                if "/login" in page.url or "/flow/login" in page.url:
+                cur_url = page.url.lower()
+                if "/login" in cur_url or "/flow/login" in cur_url or "mode=login" in cur_url:
                     break
         except Exception:
             pass
@@ -896,12 +1069,12 @@ class XBrowserController:
                         "sameSite": "Lax"
                     }
                 ])
-                page.goto("https://x.com/home", timeout=35000, wait_until="domcontentloaded")
-                time.sleep(2.5)
+                page.goto("https://x.com/home", timeout=30000, wait_until="domcontentloaded")
+                time.sleep(2.0)
 
                 if self.is_passcode_prompt_active():
                     self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="Cookieログイン後認証")
-                    time.sleep(2)
+                    time.sleep(2.0)
 
                 if self._is_logged_in():
                     print(f"✅ [@{account_id}] セッションIDでのログインに成功しました！（プロファイルにセッション同期）")
@@ -917,75 +1090,108 @@ class XBrowserController:
         #    ID・パスワードによる自動フォームログインを実行
         # -------------------------------------------------------------
         clean_pass = password.strip() if password else ""
+        raw_acc_str = str(account_id or "").strip()
+        if "@" in raw_acc_str and "." in raw_acc_str and not raw_acc_str.startswith("@"):
+            target_username = raw_acc_str
+        elif raw_acc_str.startswith("@"):
+            target_username = raw_acc_str[1:].strip()
+        else:
+            target_username = raw_acc_str
+
         if not clean_token:
-            print(f"ℹ️ [@{account_id}] セッションID (auth_token) が未設定のため、ID・パスワードでログインします...")
+            print(f"ℹ️ [@{account_id}] セッションID (auth_token) が未設定のため、ID・パスワードで自動ログインします...")
         else:
             print(f"🔄 [@{account_id}] セッションIDでログインできないため、ID・パスワードによる自動ログインへ切り替えます...")
 
-        if clean_pass:
-            print(f"🔑 [@{account_id}] ID・パスワードによる自動フォームログインを開始します...")
+        # パスワードが渡されていない場合でも、保存済みキャッシュ等から探索
+        if not clean_pass:
             try:
-                page.goto("https://x.com/i/flow/login", timeout=45000, wait_until="domcontentloaded")
-                time.sleep(2.5)
+                from db_manager import get_saved_passcodes
+                saved_p = get_saved_passcodes(self.base_dir)
+                clean_acc = normalize_screen_name(account_id).lower()
+                for k, v in saved_p.items():
+                    if f"{clean_acc}_pw" == str(k).lower():
+                        clean_pass = str(v).strip()
+                        break
+            except Exception:
+                pass
 
-                # ユーザー名/ID入力
-                user_input = page.locator('input[autocomplete="username"], input[name="text"]')
-                user_input.first.wait_for(timeout=12000)
-                self.human_type(user_input.first, account_id)
+        print(f"🔑 [@{account_id}] ID・パスワードによる自動フォームログインを開始します...")
+        try:
+            # ログインページへ移動 (既にログイン/オンボーディング画面にいる場合はそのまま利用)
+            cur_url = page.url.lower()
+            if not ("/login" in cur_url or "mode=login" in cur_url or "/i/flow/" in cur_url):
+                page.goto("https://x.com/i/flow/login", timeout=35000, wait_until="domcontentloaded")
+            time.sleep(2.0)
+
+            # ユーザー名 / メールアドレス入力欄を検出 (最大15秒ポーリング)
+            user_input = None
+            for _ in range(30):
+                user_input = self._find_login_input(page, is_password=False)
+                if user_input:
+                    break
                 time.sleep(0.5)
 
-                # 「次へ」ボタンまたはEnter
-                next_btn = page.locator('button:has-text("次へ"), button:has-text("Next"), div[role="button"]:has-text("次へ"), div[role="button"]:has-text("Next")')
-                if next_btn.count() > 0 and next_btn.first.is_visible():
-                    next_btn.first.click()
-                else:
-                    page.keyboard.press("Enter")
-                time.sleep(2.5)
+            if user_input:
+                print(f"   📝 ユーザー名/アカウントID ({target_username}) を入力中...")
+                self._safe_fill_input(user_input, target_username)
+                time.sleep(0.6)
 
-                # 追加の身元確認要求 (電話番号/メールアドレス/アカウント名) が出た場合の自動入力
-                challenge_input = page.locator('input[data-testid="ocfEnterTextTextInput"], input[name="text"]')
-                if challenge_input.count() > 0 and page.locator('input[type="password"]').count() == 0:
-                    print(f"   🔍 追加の身元確認要求を検出。アカウントID (@{account_id}) を自動入力します...")
-                    self.human_type(challenge_input.first, account_id)
+                print("   👉 「続ける / 次へ」ボタンをクリックします...")
+                self._click_next_or_submit(page, is_login_submit=False)
+                time.sleep(2.5)
+            else:
+                print("   ℹ️ ユーザー名入力欄は既に通過しているか、直接パスワード入力画面です。")
+
+            # 追加の身元確認要求 (電話番号/メールアドレス/アカウント名) が出た場合の自動入力
+            time.sleep(1.0)
+            pass_check = self._find_login_input(page, is_password=True)
+            if not pass_check:
+                challenge_input = self._find_login_input(page, is_password=False)
+                if challenge_input:
+                    print(f"   🔍 追加の身元確認画面を検出。アカウントID (@{account_id}) を自動入力します...")
+                    self._safe_fill_input(challenge_input, target_username)
                     time.sleep(0.5)
-                    ch_next = page.locator('button:has-text("次へ"), button:has-text("Next"), div[role="button"]:has-text("次へ")')
-                    if ch_next.count() > 0 and ch_next.first.is_visible():
-                        ch_next.first.click()
-                    else:
-                        page.keyboard.press("Enter")
+                    self._click_next_or_submit(page, is_login_submit=False)
                     time.sleep(2.5)
 
-                # パスワード入力
-                pass_input = page.locator('input[type="password"], input[name="password"]')
-                pass_input.first.wait_for(timeout=12000)
-                self.human_type(pass_input.first, clean_pass)
+            # パスワード入力欄を検出 (最大15秒ポーリング)
+            pass_input = None
+            for _ in range(30):
+                pass_input = self._find_login_input(page, is_password=True)
+                if pass_input:
+                    break
                 time.sleep(0.5)
 
-                # 「ログイン」ボタンまたはEnter
-                login_btn = page.locator('button[data-testid="LoginForm_Login_Button"], button:has-text("ログイン"), button:has-text("Log in"), div[role="button"]:has-text("ログイン")')
-                if login_btn.count() > 0 and login_btn.first.is_visible():
-                    login_btn.first.click()
+            if pass_input:
+                if clean_pass:
+                    print(f"   🔑 パスワードを自動入力中...")
+                    self._safe_fill_input(pass_input, clean_pass)
+                    time.sleep(0.6)
+
+                    print("   🚀 「ログイン」ボタンをクリックします...")
+                    self._click_next_or_submit(page, is_login_submit=True)
+                    time.sleep(3.0)
                 else:
-                    page.keyboard.press("Enter")
-                time.sleep(3.5)
+                    print(f"   ⚠️ アカウント情報.xlsx にパスワードが未設定です。ブラウザ画面でパスワードを手動入力してください...")
+            else:
+                print("   ℹ️ パスワード入力欄は検出されませんでした（既にログイン完了または追加認証待ち）。")
 
-                # 2FA / パスコード / 認証コードチェック
-                if self.is_passcode_prompt_active():
-                    self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="ログイン認証コード")
-                    time.sleep(2.5)
+            # 2FA / パスコード / 認証コードチェック
+            if self.is_passcode_prompt_active():
+                self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="ログイン認証コード")
+                time.sleep(2.5)
 
-                # ログイン確認ポーリング (最大12秒)
-                for _ in range(12):
-                    if self._is_logged_in():
-                        print(f"🎉 [@{account_id}] ID・パスワードでのログインが成功しました！セッション情報をプロファイルに永続保存します。")
-                        self.save_storage_state()
-                        return True
-                    time.sleep(1.0)
+            # ログイン確認ポーリング (最大15秒)
+            for _ in range(15):
+                if self._is_logged_in():
+                    print(f"🎉 [@{account_id}] ID・パスワードでのログインが成功しました！セッション情報をプロファイルに永続保存します。")
+                    self.save_storage_state()
+                    return True
+                time.sleep(1.0)
 
-            except Exception as e:
-                print(f"   ⚠️ ID・パスワード フォームログイン試行エラー: {e}")
-        else:
-            print(f"⚠️ [@{account_id}] アカウント情報.xlsx にパスワードが登録されていません。")
+        except Exception as e:
+            print(f"   ⚠️ ID・パスワード フォームログイン試行エラー: {e}")
 
         # -------------------------------------------------------------
         # 4. 手動ログイン待ち受け救済 (ブラウザ画面上で手動ログインを待機)
@@ -1017,7 +1223,7 @@ class XBrowserController:
             url = page.url.lower()
 
             # ログイン画面またはフロー中は未ログイン
-            if "/login" in url or "/i/flow/" in url or "/logout" in url:
+            if "/login" in url or "/i/flow/" in url or "/logout" in url or "mode=login" in url or "/onboarding" in url:
                 return False
 
             # 明確なログインボタンが表示されている場合は未ログイン
@@ -2376,10 +2582,19 @@ class XBrowserController:
     def human_type(self, locator, text: str):
         """
         人間らしいタイピング:
+        - ターゲット要素のクリック＆フォーカス
         - 1文字ごとの打鍵間隔ゆらぎ (40ms〜120ms)
         - 句読点（、。！？）や改行での小休止
+        - React controlled input イベントの発火
         """
         page = self.ensure_page()
+        if locator is not None:
+            try:
+                locator.click(force=True, timeout=3000)
+                locator.focus()
+                time.sleep(0.1)
+            except Exception:
+                pass
         for char in text:
             if char == "\n":
                 page.keyboard.press("Shift+Enter")

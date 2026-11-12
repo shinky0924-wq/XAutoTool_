@@ -105,8 +105,26 @@ def main():
     print(f"💾 アカウント専用DB: {acc_db_path}")
     print(f"📂 ターゲット設定ファイル: {os.path.basename(acc_target_path)}")
 
-    auth_token = str(first_acc.get("auth_token", "") or first_acc.get("authtoken", "") or first_acc.get("セッションID", "") or first_acc.get("session_id", "")).strip()
-    password = str(first_acc.get("アカウントPW", "") or first_acc.get("パスワード", "") or first_acc.get("password", "") or first_acc.get("pw", "")).strip()
+    auth_token = ""
+    for k, v in first_acc.items():
+        if k and v is not None and str(v).strip():
+            k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
+            if any(m in k_clean for m in ["auth_token", "authtoken", "セッションid", "session_id", "token", "クッキー", "cookie"]):
+                auth_token = str(v).strip()
+                break
+
+    password = ""
+    for k, v in first_acc.items():
+        if k and v is not None and str(v).strip():
+            k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
+            if any(m in k_clean for m in ["アカウントpw", "アカウントパスワード", "パスワード", "password", "pass", "pw", "暗証番号"]):
+                s = str(v).strip()
+                if s.endswith(".0") and s[:-2].isdigit():
+                    password = s[:-2]
+                else:
+                    password = s
+                break
+
     dm_raw = ""
     for k, v in first_acc.items():
         if k and v is not None and str(v).strip():
@@ -124,7 +142,8 @@ def main():
             pass
 
     print(f"\n[1] テスト対象アカウント: @{account_id}")
-    print(f"    auth_token設定: {'あり (' + auth_token[:10] + '...)' if auth_token else 'なし (パスワードログイン)'}")
+    print(f"    auth_token設定: {'あり (' + auth_token[:10] + '...)' if auth_token else 'なし (セッションID未設定)'}")
+    print(f"    パスワード設定: {'あり (ID/PW自動フォームログイン有効)' if password else '未設定 (手動ログイン待機)'}")
     print(f"    パスコード設定: {'あり (暗号化DM/2FA自動入力有効)' if dm_passcode else '未設定'}")
 
     # 2. テスト送信先の入力 (Excelからのターゲット取得、または入力)

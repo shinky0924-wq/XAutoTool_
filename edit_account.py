@@ -45,9 +45,35 @@ def main():
         return
 
     first_acc = accounts[0]
-    account_id = first_acc.get("アカウントID", "").strip()
-    auth_token = str(first_acc.get("auth_token", "") or first_acc.get("セッションID", "") or first_acc.get("session_id", "")).strip()
-    password = str(first_acc.get("アカウントPW", "") or first_acc.get("パスワード", "") or first_acc.get("password", "")).strip()
+    account_id = ""
+    for k, v in first_acc.items():
+        if k and v is not None and str(v).strip():
+            k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
+            if any(m in k_clean for m in ["アカウントid", "アカウント名", "ユーザー名", "id"]):
+                account_id = str(v).strip()
+                break
+    account_id = account_id or first_acc.get("アカウントID", "").strip()
+
+    auth_token = ""
+    for k, v in first_acc.items():
+        if k and v is not None and str(v).strip():
+            k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
+            if any(m in k_clean for m in ["auth_token", "authtoken", "セッションid", "session_id", "token", "クッキー", "cookie"]):
+                auth_token = str(v).strip()
+                break
+
+    password = ""
+    for k, v in first_acc.items():
+        if k and v is not None and str(v).strip():
+            k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
+            if any(m in k_clean for m in ["アカウントpw", "アカウントパスワード", "パスワード", "password", "pass", "pw", "暗証番号"]):
+                s = str(v).strip()
+                if s.endswith(".0") and s[:-2].isdigit():
+                    password = s[:-2]
+                else:
+                    password = s
+                break
+
     dm_raw = ""
     for k, v in first_acc.items():
         if k and v is not None and str(v).strip():
