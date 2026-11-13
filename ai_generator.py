@@ -189,7 +189,8 @@ class AIGenerator:
         post_text: str = "",
         action_type: str = "reply",
         target_name: str = "",
-        custom_instruction: str = ""
+        custom_instruction: str = "",
+        parent_post_text: str = ""
     ) -> str:
         action_label = "リプライ（返信）" if "reply" in action_type.lower() else "引用リツイート（感想・紹介）"
 
@@ -198,19 +199,40 @@ class AIGenerator:
             "ハッシュタグ（#）、絵文字の過剰使用、不自然な敬語、宣伝的な表現は避けてください。"
         )
 
-        prompt = f"""あなたはX(Twitter)の親しみやすく礼儀正しいユーザーです。
-以下の投稿に対して、魅力的な{action_label}のメッセージを作成してください。
+        has_parent = bool(parent_post_text and parent_post_text.strip())
+        if has_parent:
+            context_block = f"""【対象の投稿情報（やり取り・返信への反応）】
+・投稿者: @{target_name if target_name else 'ユーザー'}
+・投稿URL: {post_url if post_url else 'なし'}
 
-【対象の投稿情報】
+【元ポスト（会話の前提）】
+\"\"\"
+{parent_post_text.strip()}
+\"\"\"
+
+【対象者の返信内容】
+\"\"\"
+{post_text.strip() if post_text and post_text.strip() else '（返信本文取得不可・元ポストや対象者に合わせて自然な共感メッセージを作成）'}
+\"\"\"
+"""
+            context_note = f"\n※【元ポスト（会話の前提）】と【対象者の返信内容】の両方の文脈を踏まえ、対象者（@{target_name if target_name else 'ユーザー'}）の返信内容に沿った自然な{action_label}を作成してください。"
+        else:
+            context_block = f"""【対象の投稿情報】
 ・投稿者: @{target_name if target_name else 'ユーザー'}
 ・投稿URL: {post_url if post_url else 'なし'}
 ・投稿本文:
 \"\"\"
 {post_text.strip() if post_text and post_text.strip() else '（投稿本文取得不可・投稿者名や文脈に合わせて自然な応援/共感メッセージを作成）'}
 \"\"\"
+"""
+            context_note = ""
 
+        prompt = f"""あなたはX(Twitter)の親しみやすく礼儀正しいユーザーです。
+以下の投稿に対して、魅力的な{action_label}のメッセージを作成してください。
+
+{context_block}
 【指示】
-{instruction}
+{instruction}{context_note}
 
 ※出力は送信するメッセージ本文のみを1〜2行（140文字以内）で返してください。挨拶や前置き（例: 「了解しました」「返信案:」）や引用符などの余計な注釈は一切含めないでください。"""
         return prompt
@@ -251,7 +273,8 @@ class AIGenerator:
         api_key: str = "",
         custom_prompt: str = "",
         page = None,
-        use_dedicated_window: bool = False
+        use_dedicated_window: bool = False,
+        parent_post_text: str = ""
     ) -> Tuple[bool, str]:
         """
         指定されたAIエンジンを使用して返信・引用文章を生成
@@ -261,7 +284,7 @@ class AIGenerator:
         if eff_eng in ["none", "off", "無効", ""]:
             return False, "AIエンジンが未指定または無効です"
 
-        prompt = cls.build_prompt(post_url, post_text, action_type, target_name, custom_prompt)
+        prompt = cls.build_prompt(post_url, post_text, action_type, target_name, custom_prompt, parent_post_text=parent_post_text)
 
         try:
             # 1. Google Gemini API (推奨)
@@ -1469,7 +1492,8 @@ class AIDedicatedWindowManager:
         custom_prompt: str = "",
         headless: bool = False,
         base_dir: str = ".",
-        slot_id: int = 1
+        slot_id: int = 1,
+        parent_post_text: str = ""
     ) -> Tuple[bool, str]:
         """
         AI専用ウィンドウで選択されたAIエンジン・接続URLを起動して文章を生成し、クリップボードおよび戻り値として返却
@@ -1504,15 +1528,23 @@ class AIDedicatedWindowManager:
                     api_key=api_key,
                     custom_prompt=custom_prompt,
                     page=ai_page,
-                    use_dedicated_window=True
+                    use_dedicated_window=True,
+                    parent_post_text=parent_post_text
                 )
                 if ok and result_text:
                     try:
+                        parent_html = (
+                            f"<div style='background:#fff;border:1px solid #cbd5e1;padding:12px;border-radius:8px;margin-bottom:12px;'>"
+                            f"<b>元ポスト（会話の前提）:</b><br>{(parent_post_text or '').replace('<','&lt;')}<br><br>"
+                            f"<b>対象者の返信内容:</b><br>{(post_text or '').replace('<','&lt;')}</div>"
+                        ) if (parent_post_text and parent_post_text.strip()) else (
+                            f"<div style='background:#fff;border:1px solid #cbd5e1;padding:12px;border-radius:8px;margin-bottom:12px;'>"
+                            f"<b>元ポスト:</b><br>{(post_text or '').replace('<','&lt;')}</div>"
+                        )
                         preview_html = f"""<html><body style='font-family:Meiryo,sans-serif;padding:24px;background:#f8fafc;'>
                         <h2 style='color:#312e81;'>AI専用ウィンドウ 生成結果 ({eff_eng})</h2>
                         <p><b>対象:</b> @{target_name} / {post_url}</p>
-                        <div style='background:#fff;border:1px solid #cbd5e1;padding:12px;border-radius:8px;margin-bottom:12px;'>
-                        <b>元ポスト:</b><br>{(post_text or '').replace('<','&lt;')}</div>
+                        {parent_html}
                         <div style='background:#eef2ff;border:2px solid #6366f1;padding:14px;border-radius:8px;'>
                         <b>生成文章:</b><br>{result_text.replace('<','&lt;')}</div></body></html>"""
                         ai_page.set_content(preview_html)
@@ -1530,15 +1562,16 @@ class AIDedicatedWindowManager:
                     api_key=api_key,
                     custom_prompt=custom_prompt,
                     page=ai_page,
-                    use_dedicated_window=True
+                    use_dedicated_window=True,
+                    parent_post_text=parent_post_text
                 )
                 if not ok:
-                    prompt = AIGenerator.build_prompt(post_url, post_text, action_type, target_name, custom_prompt)
+                    prompt = AIGenerator.build_prompt(post_url, post_text, action_type, target_name, custom_prompt, parent_post_text=parent_post_text)
                     ok, result_text = cls._generate_via_gemini_web(ai_page, prompt)
 
             # 3. Web連携エンジンまたは接続URL指定時: AI専用ウィンドウ上の対象AIサイトで生成！
             else:
-                prompt = AIGenerator.build_prompt(post_url, post_text, action_type, target_name, custom_prompt)
+                prompt = AIGenerator.build_prompt(post_url, post_text, action_type, target_name, custom_prompt, parent_post_text=parent_post_text)
                 custom_web_url = api_key.strip() if AIGenerator.is_web_url(api_key) else ""
                 if eff_eng == "chatgpt":
                     ok, result_text = cls._generate_via_chatgpt_web(ai_page, prompt, custom_web_url)

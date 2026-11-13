@@ -800,11 +800,15 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         t_url = item.get("tweet_url", "")
                         d_name = item.get("display_name", "")
                         t_text = item.get("tweet_text", "")
+                        p_text = item.get("parent_tweet_text", "")
+                        is_rep = bool(item.get("is_reply", False))
                     else:
                         user = str(item)
                         t_url = ""
                         d_name = ""
                         t_text = ""
+                        p_text = ""
+                        is_rep = False
                     config_mgr.append_discovered_target(user, source_label, target_path_override=acc_target_path, tweet_url=t_url, display_name=d_name)
                     clean_u = normalize_screen_name(user)
                     if clean_u and not any(t.get("アカウント名") == clean_u for t in dest_list):
@@ -813,6 +817,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             "ターゲットURL": t_url if t_url else f"https://x.com/{clean_u}",
                             "ツイートURL": t_url,
                             "ツイート本文": t_text,
+                            "親ツイート本文": p_text,
+                            "is_reply": is_rep,
                             "個別メッセージ": "",
                             "ステータス": "未送信",
                             "表示名": d_name
@@ -896,16 +902,35 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 mode_targets_cache[m_type] = collected
                 return collected
 
-            def generate_ai_or_template_text(kind: str, target_screen_name: str, resolved_disp: str, tweet_url: str, use_ai: bool, cached_tweet_text: str = "") -> str:
+            def generate_ai_or_template_text(kind: str, target_screen_name: str, resolved_disp: str, tweet_url: str, use_ai: bool, cached_tweet_text: str = "", cached_parent_text: str = "", is_reply_target: bool = False) -> str:
                 if use_ai and ai_engine and str(ai_engine).strip().lower() not in ["none", "off", "無効"]:
                     try:
                         from ai_generator import AIGenerator, AIDedicatedWindowManager
                         post_txt = (cached_tweet_text or "").strip()
-                        if not post_txt and tweet_url:
+                        parent_txt = (cached_parent_text or "").strip()
+
+                        need_ctx_fetch = False
+                        if tweet_url and "/status/" in tweet_url:
+                            if not post_txt:
+                                need_ctx_fetch = True
+                            elif (is_reply_target or post_txt.lstrip().startswith("@")) and not parent_txt:
+                                need_ctx_fetch = True
+
+                        if need_ctx_fetch:
                             try:
-                                post_txt = browser_ctrl.get_tweet_text_from_url(tweet_url)
+                                ctx = browser_ctrl.get_tweet_context_from_url(tweet_url)
+                                if isinstance(ctx, dict):
+                                    if not post_txt and ctx.get("tweet_text"):
+                                        post_txt = ctx["tweet_text"].strip()
+                                    if not parent_txt and ctx.get("parent_tweet_text"):
+                                        parent_txt = ctx["parent_tweet_text"].strip()
                             except Exception:
-                                post_txt = ""
+                                if not post_txt:
+                                    try:
+                                        post_txt = browser_ctrl.get_tweet_text_from_url(tweet_url)
+                                    except Exception:
+                                        post_txt = ""
+
                         if not post_txt and target_screen_name:
                             try:
                                 fetched_url, fetched_txt = browser_ctrl.get_latest_tweet_info(target_screen_name)
@@ -915,6 +940,9 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                     tweet_url = fetched_url
                             except Exception:
                                 pass
+
+                        if parent_txt:
+                            log(f"   🧵 [会話コンテキスト取得] 元ポスト: 「{parent_txt[:35]}...」 / 対象返信: 「{post_txt[:35]}...」")
 
                         custom_p = ai_prompt_extra or acc_prompt_setting
                         use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
@@ -930,7 +958,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 custom_prompt=custom_p,
                                 headless=False,
                                 base_dir=base_dir,
-                                slot_id=active_slot
+                                slot_id=active_slot,
+                                parent_post_text=parent_txt
                             )
                         else:
                             ok_ai, ai_res = AIGenerator.generate_comment(
@@ -941,7 +970,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 target_name=resolved_disp or target_screen_name,
                                 api_key=ai_api_key,
                                 custom_prompt=custom_p,
-                                page=browser_ctrl.page
+                                page=browser_ctrl.page,
+                                parent_post_text=parent_txt
                             )
                         if ok_ai and ai_res and ai_res.strip():
                             prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if use_win_flow else "🤖 [AI生成成功"
@@ -1065,7 +1095,9 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     elif act_key in ["reply", "reply_ai"]:
                         resolved_disp = get_target_name()
                         target_tweet_text = str(target_item.get("ツイート本文") or target_item.get("tweet_text") or "").strip()
-                        rep_msg = generate_ai_or_template_text("reply", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai, cached_tweet_text=target_tweet_text)
+                        target_parent_text = str(target_item.get("親ツイート本文") or target_item.get("parent_tweet_text") or "").strip()
+                        is_rep_tgt = bool(target_item.get("is_reply", False)) or target_tweet_text.lstrip().startswith("@")
+                        rep_msg = generate_ai_or_template_text("reply", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai, cached_tweet_text=target_tweet_text, cached_parent_text=target_parent_text, is_reply_target=is_rep_tgt)
                         preview_name = resolved_disp or "相手のアカウント名"
                         preview_log = format_template_message(rep_msg, preview_name, target_screen_name, preserve_unresolved=False)
                         log(f"   💬 [リプライ送信中] 「{preview_log[:35]}...」")
@@ -1120,7 +1152,9 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     elif act_key in ["quote", "quote_ai"]:
                         resolved_disp = get_target_name()
                         target_tweet_text = str(target_item.get("ツイート本文") or target_item.get("tweet_text") or "").strip()
-                        q_msg = generate_ai_or_template_text("quote", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai, cached_tweet_text=target_tweet_text)
+                        target_parent_text = str(target_item.get("親ツイート本文") or target_item.get("parent_tweet_text") or "").strip()
+                        is_rep_tgt = bool(target_item.get("is_reply", False)) or target_tweet_text.lstrip().startswith("@")
+                        q_msg = generate_ai_or_template_text("quote", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai, cached_tweet_text=target_tweet_text, cached_parent_text=target_parent_text, is_reply_target=is_rep_tgt)
                         preview_name = resolved_disp or "相手のアカウント名"
                         preview_log = format_template_message(q_msg, preview_name, target_screen_name, preserve_unresolved=False)
                         log(f"   🔁 [引用RT実行中] 「{preview_log[:35]}...」")

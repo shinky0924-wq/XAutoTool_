@@ -2054,16 +2054,213 @@ class XBrowserController:
             print(f"   ⚠️ ステータス画面取得エラー: {e}")
             return None
 
+    def _inspect_tweet_article(self, tweet_el, expected_author: str = "") -> dict:
+        """
+        ツイートarticle要素を解析して以下を判定:
+        - is_ad: 広告・プロモーションか
+        - is_repost: 他人のリポスト（リツイート）か
+        - is_reply: 誰かへの返信（「返信先 / Replying to」表示、または本文冒頭が @ユーザーID）か
+        - reason: スキップ理由（"AD" / "REPOST" / "REPLY" / ""）
+        - tweet_text: 取得した本文
+        """
+        info = {"is_ad": False, "is_repost": False, "is_reply": False, "reason": "", "tweet_text": ""}
+        try:
+            res = tweet_el.evaluate("""(el, expAuthor) => {
+                const socialEl = el.querySelector('[data-testid="socialContext"]');
+                const socialText = socialEl ? (socialEl.innerText || '').trim() : '';
+                const socialLower = socialText.toLowerCase();
+
+                // 1. 広告・プロモーション判定
+                const adEl = Array.from(el.querySelectorAll('span')).find(sp => {
+                    const t = (sp.innerText || '').trim();
+                    return t === '広告' || t === 'プロモーション' || t === 'Ad' || t === 'Promoted';
+                });
+                const isAd = Boolean(adEl) || /プロモーション|Promoted/i.test(socialText);
+
+                // 2. リポスト判定 (socialContext または プロフィール主と投稿者ID不一致)
+                let isRepost = false;
+                if (socialText && (
+                    socialText.includes('リポスト') ||
+                    socialText.includes('リツイート') ||
+                    socialLower.includes('reposted') ||
+                    socialLower.includes('retweeted')
+                )) {
+                    isRepost = true;
+                }
+
+                if (!isRepost && expAuthor) {
+                    const userBox = el.querySelector('[data-testid="User-Name"]');
+                    if (userBox) {
+                        const handles = Array.from(userBox.querySelectorAll('a[role="link"]'))
+                            .map(a => (a.getAttribute('href') || '').trim())
+                            .filter(h => h.startsWith('/') && !h.startsWith('/i/') && !h.includes('/status/'))
+                            .map(h => h.replace(/^\\/+/, '').split('/')[0].split('?')[0].toLowerCase())
+                            .filter(Boolean);
+                        if (handles.length > 0 && !handles.includes(expAuthor.toLowerCase())) {
+                            isRepost = true;
+                        }
+                    }
+                }
+
+                // 3. 本文取得
+                const ttEl = el.querySelector('div[data-testid="tweetText"]');
+                const tweetText = ttEl ? (ttEl.innerText || '').trim() : '';
+
+                // 4. リプライ（「返信先 / Replying to」または冒頭 @ユーザーID）判定
+                let isReply = false;
+                if (tweetText && /^@[A-Za-z0-9_]{1,15}(?:[^A-Za-z0-9_]|$)/.test(tweetText.trim())) {
+                    isReply = true;
+                }
+                if (!isReply) {
+                    const divs = el.querySelectorAll('div');
+                    for (const d of divs) {
+                        if (d.closest('[data-testid="tweetText"]') || d.closest('[data-testid="User-Name"]') || d.closest('[data-testid="card.wrapper"]')) {
+                            continue;
+                        }
+                        const linkAnc = d.closest('div[role="link"]');
+                        if (linkAnc && linkAnc.querySelector('[data-testid="tweetText"]')) {
+                            continue;
+                        }
+                        const dt = (d.innerText || '').trim();
+                        if (!dt || dt.length > 160) continue;
+                        if (/^(返信先[:：]?|Replying to)\\s*@?/i.test(dt)) {
+                            isReply = true;
+                            break;
+                        }
+                    }
+                }
+
+                return { isAd, isRepost, isReply, tweetText };
+            }""", expected_author or "")
+
+            if isinstance(res, dict):
+                info["is_ad"] = bool(res.get("isAd"))
+                info["is_repost"] = bool(res.get("isRepost"))
+                info["is_reply"] = bool(res.get("isReply"))
+                info["tweet_text"] = str(res.get("tweetText") or "").strip()
+                if info["is_ad"]:
+                    info["reason"] = "AD"
+                elif info["is_repost"]:
+                    info["reason"] = "REPOST"
+                elif info["is_reply"]:
+                    info["reason"] = "REPLY"
+        except Exception:
+            pass
+        return info
+
+    def _find_first_original_tweet_on_profile(self, page: Page, clean_target: str, max_scan: int = 8):
+        """
+        プロフィールタイムラインから「リポスト」「誰かへの返信」「広告」を除外し、
+        本人の最初の通常ポスト（オリジナル投稿）を探す
+        """
+        for scroll_pass in range(2):
+            tweet_articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]')
+            if tweet_articles.count() == 0:
+                tweet_articles = page.locator('article[data-testid="tweet"]')
+            total = tweet_articles.count()
+            limit = min(total, max_scan)
+            for idx in range(limit):
+                cand = tweet_articles.nth(idx)
+                info = self._inspect_tweet_article(cand, expected_author=clean_target)
+                if info["is_ad"] or info["is_repost"] or info["is_reply"]:
+                    continue
+                return cand, info
+            if scroll_pass == 0 and total > 0:
+                try:
+                    page.mouse.wheel(0, 750)
+                    time.sleep(1.2)
+                except Exception:
+                    break
+        return None, None
+
+    def get_tweet_context_from_url(self, tweet_url: str) -> dict:
+        """
+        指定したツイートURLのステータス画面から、以下を辞書で取得:
+        - tweet_text: 対象ツイート自身の本文
+        - parent_tweet_text: 会話元（親ポスト）の本文（リプライの場合）
+        - is_reply: リプライかどうか
+        """
+        ctx = {"tweet_text": "", "parent_tweet_text": "", "is_reply": False}
+        if not tweet_url or "/status/" not in tweet_url:
+            return ctx
+        try:
+            page = self.ensure_page()
+            target_tweet = self._find_tweet_on_status_page(tweet_url)
+            if target_tweet is None:
+                return ctx
+
+            status_id = tweet_url.split("/status/")[-1].split("?")[0].split("/")[0]
+            tweet_articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]')
+            if tweet_articles.count() == 0:
+                tweet_articles = page.locator('article[data-testid="tweet"]')
+
+            def _locate_target_idx() -> int:
+                cnt = tweet_articles.count()
+                if status_id:
+                    for idx in range(min(cnt, 8)):
+                        cand = tweet_articles.nth(idx)
+                        try:
+                            if cand.locator(f'a[href*="/status/{status_id}"] time').count() > 0:
+                                return idx
+                        except Exception:
+                            pass
+                    for idx in range(min(cnt, 8)):
+                        cand = tweet_articles.nth(idx)
+                        try:
+                            if cand.locator(f'a[href*="/status/{status_id}"]').count() > 0:
+                                return idx
+                        except Exception:
+                            pass
+                return 0
+
+            target_idx = _locate_target_idx()
+            if tweet_articles.count() > target_idx:
+                focal = tweet_articles.nth(target_idx)
+                focal_info = self._inspect_tweet_article(focal)
+                ctx["tweet_text"] = focal_info.get("tweet_text", "")
+                ctx["is_reply"] = bool(focal_info.get("is_reply"))
+
+                # 対象が画面最上部に位置していて親ポストが上に隠れている場合、少し上へスクロールして再確認
+                if target_idx == 0 and ctx["is_reply"]:
+                    try:
+                        page.mouse.wheel(0, -500)
+                        time.sleep(0.8)
+                        target_idx = _locate_target_idx()
+                    except Exception:
+                        pass
+
+                if target_idx > 0:
+                    ctx["is_reply"] = True
+                    # 対象ポストの直上（会話元・親ポスト）から本文を取得
+                    for p_idx in range(target_idx - 1, -1, -1):
+                        p_el = tweet_articles.nth(p_idx)
+                        try:
+                            p_txt_el = p_el.locator('div[data-testid="tweetText"]')
+                            if p_txt_el.count() > 0:
+                                p_txt = p_txt_el.first.inner_text().strip()
+                                if p_txt:
+                                    ctx["parent_tweet_text"] = p_txt
+                                    break
+                        except Exception:
+                            continue
+
+            if not ctx["tweet_text"] and target_tweet:
+                try:
+                    text_el = target_tweet.locator('div[data-testid="tweetText"]')
+                    if text_el.count() > 0:
+                        ctx["tweet_text"] = text_el.first.inner_text().strip()
+                except Exception:
+                    pass
+        except Exception as e:
+            print(f"   ⚠️ ツイート文脈取得例外: {e}")
+        return ctx
+
     def get_tweet_text_from_url(self, tweet_url: str) -> str:
         """指定したツイートURLにアクセスして投稿本文テキストを取得"""
-        if not tweet_url or "/status/" not in tweet_url:
-            return ""
+        ctx = self.get_tweet_context_from_url(tweet_url)
+        if ctx.get("tweet_text"):
+            return ctx["tweet_text"]
         try:
-            target_tweet = self._find_tweet_on_status_page(tweet_url)
-            if target_tweet:
-                text_el = target_tweet.locator('div[data-testid="tweetText"]')
-                if text_el.count() > 0:
-                    return text_el.first.inner_text().strip()
             page = self.ensure_page()
             all_texts = page.locator('div[data-testid="tweetText"]')
             if all_texts.count() > 0:
@@ -2073,7 +2270,7 @@ class XBrowserController:
         return ""
 
     def get_latest_tweet_info(self, target_screen_name: str) -> tuple[str, str]:
-        """対象ユーザーのプロフィールから最新ツイートの (tweet_url, tweet_text) を取得"""
+        """対象ユーザーのプロフィールから通常ポスト（リプライ・リポスト除外）の最新 (tweet_url, tweet_text) を取得"""
         clean_target = normalize_screen_name(target_screen_name)
         if not clean_target:
             return "", ""
@@ -2087,17 +2284,21 @@ class XBrowserController:
             while tweet_articles.count() == 0 and time.time() - wait_s < 8.0:
                 time.sleep(0.5)
             if tweet_articles.count() > 0:
-                first_tweet = tweet_articles.first
-                t_text = ""
-                try:
-                    tel = first_tweet.locator('div[data-testid="tweetText"]')
-                    if tel.count() > 0:
-                        t_text = tel.first.inner_text().strip()
-                except Exception:
-                    pass
+                orig_tweet, info = self._find_first_original_tweet_on_profile(page, clean_target, max_scan=8)
+                if orig_tweet is None:
+                    print(f"   ⏩ @{clean_target} のプロフィール上部に通常ポストが見つかりませんでした（リプライ・リポスト除外）")
+                    return "", ""
+                t_text = (info or {}).get("tweet_text", "")
+                if not t_text:
+                    try:
+                        tel = orig_tweet.locator('div[data-testid="tweetText"]')
+                        if tel.count() > 0:
+                            t_text = tel.first.inner_text().strip()
+                    except Exception:
+                        pass
                 t_url = ""
                 try:
-                    time_els = first_tweet.locator('time')
+                    time_els = orig_tweet.locator('time')
                     if time_els.count() > 0:
                         pa = time_els.first.locator('xpath=ancestor::a[contains(@href, "/status/")]')
                         if pa.count() > 0:
@@ -2228,7 +2429,10 @@ class XBrowserController:
             print("   ⚠️ ポストが見つかりません。")
             return "NO_POSTS", "ポストなし"
 
-        first_tweet = tweet_articles.first
+        first_tweet, _ = self._find_first_original_tweet_on_profile(page, clean_target, max_scan=8)
+        if first_tweet is None:
+            print("   ⏩ 通常ポスト（リプライ・リポスト除外後）が見つからないためスキップします。")
+            return "NO_POSTS", "通常ポストなし（リプライ・リポストのみ）"
         reply_btn = first_tweet.locator('button[data-testid="reply"]')
         if reply_btn.count() == 0:
             print("   ⚠️ リプライボタンが見つかりません（返信制限の可能性）。")
@@ -2390,13 +2594,18 @@ class XBrowserController:
                 return "LOCKED_ACCOUNT", "鍵アカウント（ポスト非公開）"
             return "NO_POSTS", "ポストなし (未投稿または読み込み制限)"
 
-        # 3. 最新3件のツイートを走査し、未いいねのポストにいいねを実行
+        # 3. 最新ポストを走査し、リプライ・リポストを除外した未いいねの通常ポストにいいねを実行
         total_tweets = tweet_articles.count()
-        inspected = min(total_tweets, 3)
+        inspected = min(total_tweets, 8)
         all_already_liked = True
+        found_original = False
 
         for i in range(inspected):
             tweet = tweet_articles.nth(i)
+            info = self._inspect_tweet_article(tweet, expected_author=clean_target)
+            if info["is_ad"] or info["is_repost"] or info["is_reply"]:
+                continue
+            found_original = True
             try:
                 tweet.scroll_into_view_if_needed(timeout=4000)
                 time.sleep(0.4)
@@ -2431,6 +2640,9 @@ class XBrowserController:
                 print("   ❤️ いいねをクリックしました。反映待機中...")
                 time.sleep(random.uniform(2.0, 3.2))
                 return "SUCCESS", "いいね完了"
+
+        if not found_original:
+            return "NO_POSTS", "通常ポストなし（リプライ・リポストのみ）"
 
         if all_already_liked:
             return "ALREADY_LIKED", "最新ポストは全ていいね済"
@@ -2658,7 +2870,9 @@ class XBrowserController:
         except Exception:
             return "NO_POSTS", "ポストなし"
 
-        first_tweet = tweet_articles.first
+        first_tweet, _ = self._find_first_original_tweet_on_profile(page, clean_target, max_scan=8)
+        if first_tweet is None:
+            return "NO_POSTS", "通常ポストなし（リプライ・リポストのみ）"
         retweet_btn = first_tweet.locator('button[data-testid="retweet"]')
         if retweet_btn.count() == 0:
             return "FAILED", "RTボタンなし"
@@ -2891,11 +3105,13 @@ class XBrowserController:
             if not tweet_articles:
                 tweet_articles = page.locator('article[data-testid="tweet"]').all()
 
+            skipped_filter_cnt = 0
             for tweet in tweet_articles:
                 try:
-                    # 広告・プロモーションの除外
-                    txt = tweet.inner_text()
-                    if any(ad in txt for ad in ["プロモーション", "Promoted", "広告", "Ad"]):
+                    # 通常モード除外: 広告・リポスト・誰かへの返信をスキップし本人の通常ポストのみ対象
+                    t_info = self._inspect_tweet_article(tweet)
+                    if t_info["is_ad"] or t_info["is_repost"] or t_info["is_reply"]:
+                        skipped_filter_cnt += 1
                         continue
 
                     # ツイート投稿者のリンク抽出（複数戦略: User-Name > Tweet-User-Avatar > 内部プロフィールリンク）
@@ -2965,27 +3181,31 @@ class XBrowserController:
                         except Exception:
                             pass
 
-                    tweet_text = ""
-                    try:
-                        tt_el = tweet.locator('div[data-testid="tweetText"]')
-                        if tt_el.count() > 0:
-                            tweet_text = tt_el.first.inner_text().strip()
-                    except Exception:
-                        pass
+                    tweet_text = t_info.get("tweet_text", "")
+                    if not tweet_text:
+                        try:
+                            tt_el = tweet.locator('div[data-testid="tweetText"]')
+                            if tt_el.count() > 0:
+                                tweet_text = tt_el.first.inner_text().strip()
+                        except Exception:
+                            pass
 
                     seen.add(clean_u.lower())
                     discovered.append({
                         "screen_name": clean_u,
                         "tweet_url": tweet_url,
                         "display_name": disp_name,
-                        "tweet_text": tweet_text
+                        "tweet_text": tweet_text,
+                        "parent_tweet_text": "",
+                        "is_reply": False
                     })
                     if max_targets > 0 and len(discovered) >= max_targets:
                         break
                 except Exception:
                     continue
 
-            print(f"   スクロール [{scroll_idx + 1}/{scroll_limit}]: 検索結果タイムラインから現在 {len(discovered)} 件抽出 (上から順)")
+            skip_note = f" (リプライ/リポスト/広告 {skipped_filter_cnt}件除外)" if skipped_filter_cnt > 0 else ""
+            print(f"   スクロール [{scroll_idx + 1}/{scroll_limit}]: 検索結果タイムラインから現在 {len(discovered)} 件抽出 (上から順){skip_note}")
             if max_targets > 0 and len(discovered) >= max_targets:
                 print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件) に達したため、収集を完了します。")
                 break
@@ -3042,10 +3262,34 @@ class XBrowserController:
         seen = set()
         system_names = {"home", "explore", "notifications", "messages", "search", "settings", "i", "privacy", "tos", "elonmusk"}
 
+        root_status_id = ""
+        root_post_text = ""
+        if "/status/" in replies_url:
+            root_status_id = replies_url.split("/status/")[-1].split("?")[0].split("/")[0]
+
         for scroll_idx in range(scroll_limit):
             tweet_articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]').all()
             if not tweet_articles:
                 tweet_articles = page.locator('article[data-testid="tweet"]').all()
+
+            # ステータスURLの場合、最初の親ポスト本文を取得して会話文脈に保持
+            if root_status_id and not root_post_text and tweet_articles:
+                for cand_t in tweet_articles[:3]:
+                    try:
+                        if cand_t.locator(f'a[href*="/status/{root_status_id}"] time').count() > 0 or cand_t.locator(f'a[href*="/status/{root_status_id}"]').count() > 0:
+                            rt_el = cand_t.locator('div[data-testid="tweetText"]')
+                            if rt_el.count() > 0:
+                                root_post_text = rt_el.first.inner_text().strip()
+                            break
+                    except Exception:
+                        continue
+                if not root_post_text:
+                    try:
+                        rt_el = tweet_articles[0].locator('div[data-testid="tweetText"]')
+                        if rt_el.count() > 0:
+                            root_post_text = rt_el.first.inner_text().strip()
+                    except Exception:
+                        pass
 
             for tweet in tweet_articles:
                 try:
@@ -3085,6 +3329,10 @@ class XBrowserController:
                     except Exception:
                         pass
 
+                    # ステータスURL収集時は親ポスト自身（返信している人ではない）をスキップ
+                    if root_status_id and tweet_url and f"/status/{root_status_id}" in tweet_url:
+                        continue
+
                     disp_name = ""
                     if user_box.count() > 0:
                         try:
@@ -3113,7 +3361,9 @@ class XBrowserController:
                         "screen_name": clean_u,
                         "tweet_url": tweet_url,
                         "display_name": disp_name,
-                        "tweet_text": tweet_text
+                        "tweet_text": tweet_text,
+                        "parent_tweet_text": root_post_text,
+                        "is_reply": True
                     })
                     if max_targets > 0 and len(discovered) >= max_targets:
                         break
@@ -3233,8 +3483,9 @@ class XBrowserController:
 
         for tweet in tweet_articles:
             try:
-                txt = tweet.inner_text()
-                if any(ad in txt for ad in ["プロモーション", "Promoted", "広告", "Ad"]):
+                # 通常モード除外: 広告・リポスト・誰かへの返信をスキップし本人の通常ポストのみ対象
+                t_info = self._inspect_tweet_article(tweet)
+                if t_info["is_ad"] or t_info["is_repost"] or t_info["is_reply"]:
                     continue
 
                 links = []
@@ -3302,20 +3553,23 @@ class XBrowserController:
                     except Exception:
                         pass
 
-                tweet_text = ""
-                try:
-                    tt_el = tweet.locator('div[data-testid="tweetText"]')
-                    if tt_el.count() > 0:
-                        tweet_text = tt_el.first.inner_text().strip()
-                except Exception:
-                    pass
+                tweet_text = t_info.get("tweet_text", "")
+                if not tweet_text:
+                    try:
+                        tt_el = tweet.locator('div[data-testid="tweetText"]')
+                        if tt_el.count() > 0:
+                            tweet_text = tt_el.first.inner_text().strip()
+                    except Exception:
+                        pass
 
                 seen.add(clean_u.lower())
                 discovered.append({
                     "screen_name": clean_u,
                     "tweet_url": tweet_url,
                     "display_name": disp_name,
-                    "tweet_text": tweet_text
+                    "tweet_text": tweet_text,
+                    "parent_tweet_text": "",
+                    "is_reply": False
                 })
                 added_count += 1
                 if max_targets > 0 and len(discovered) >= max_targets:
