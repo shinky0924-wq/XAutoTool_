@@ -173,10 +173,10 @@ except Exception:
 launch_bat = os.path.join(out_dir, "🚀 ツール起動.bat")
 debug_bat = os.path.join(out_dir, "【エラー確認用】コマンドプロンプトで起動.bat")
 try:
-    with open(launch_bat, "w", encoding="cp932", errors="replace") as f:
-        f.write('@echo off\r\nchcp 65001 >nul\r\ntitle X Auto DM Tool Pro\r\ncd /d "%~dp0"\r\nif not exist "x_auto_dm_gui.exe" (\r\n    echo [エラー] x_auto_dm_gui.exe が見つかりません。ZIPを「すべて展開」してください。\r\n    pause\r\n    exit /b 1\r\n)\r\nstart "" "x_auto_dm_gui.exe"\r\nexit\r\n')
-    with open(debug_bat, "w", encoding="cp932", errors="replace") as f:
-        f.write('@echo off\r\nchcp 65001 >nul\r\ntitle X Auto DM Tool Pro Debug\r\ncd /d "%~dp0"\r\necho ========================================================\r\necho   X 自動DMツール (エラー確認・診断コンソール起動)\r\necho   ※ 画面が閉じずにエラーログが残ります\r\necho ========================================================\r\necho.\r\nx_auto_dm_gui.exe\r\necho.\r\necho ========================================================\r\necho   アプリが終了しました。キーを押すと画面を閉じます。\r\necho ========================================================\r\npause\r\n')
+    with open(launch_bat, "w", encoding="ascii") as f:
+        f.write('@echo off\r\ntitle X Auto DM Tool Pro\r\ncd /d "%~dp0"\r\nif not exist "x_auto_dm_gui.exe" (\r\n    echo [ERROR] x_auto_dm_gui.exe not found. Please extract the ZIP archive first.\r\n    pause\r\n    exit /b 1\r\n)\r\nstart "" "x_auto_dm_gui.exe"\r\nexit /b 0\r\n')
+    with open(debug_bat, "w", encoding="ascii") as f:
+        f.write('@echo off\r\nchcp 65001 >nul\r\ntitle X Auto DM Tool Pro Debug\r\ncd /d "%~dp0"\r\necho ========================================================\r\necho   X Auto DM Tool Pro - Debug Console\r\necho ========================================================\r\necho.\r\nx_auto_dm_gui.exe\r\necho.\r\necho ========================================================\r\necho   Process exited. Press any key to close.\r\necho ========================================================\r\npause\r\n')
 except Exception:
     pass
 
