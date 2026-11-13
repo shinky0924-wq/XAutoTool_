@@ -931,36 +931,46 @@ class XBrowserController:
         try:
             page.keyboard.press("Control+A")
             page.keyboard.press("Backspace")
+            locator.fill("")
             time.sleep(0.05)
         except Exception:
             pass
 
-        # 3. Playwrightネイティブ入力
+        # 3. 1文字ずつリアルタイピング (React controlled inputの状態更新・続けるボタン活性化に最適)
+        typed_ok = False
         try:
-            locator.fill(value)
-            time.sleep(0.1)
+            locator.press_sequentially(value, delay=25)
+            time.sleep(0.15)
+            if locator.input_value() == value:
+                typed_ok = True
         except Exception:
             pass
 
-        # 4. React内部状態更新 (Prototype value setter + Events)
-        try:
-            locator.evaluate('''(el, val) => {
-                el.focus();
-                const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
-                const prototype = Object.getPrototypeOf(el);
-                const protoSetter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
-                if (protoSetter && valueSetter !== protoSetter) {
-                    protoSetter.call(el, val);
-                } else if (valueSetter) {
-                    valueSetter.call(el, val);
-                } else {
-                    el.value = val;
-                }
-                el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
-                el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
-            }''', value)
-        except Exception:
-            pass
+        # 4. Playwrightネイティブ入力 + React内部状態更新フォールバック
+        if not typed_ok:
+            try:
+                locator.fill(value)
+                time.sleep(0.1)
+            except Exception:
+                pass
+            try:
+                locator.evaluate('''(el, val) => {
+                    el.focus();
+                    const valueSetter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value')?.set;
+                    const prototype = Object.getPrototypeOf(el);
+                    const protoSetter = Object.getOwnPropertyDescriptor(prototype, 'value')?.set;
+                    if (protoSetter && valueSetter !== protoSetter) {
+                        protoSetter.call(el, val);
+                    } else if (valueSetter) {
+                        valueSetter.call(el, val);
+                    } else {
+                        el.value = val;
+                    }
+                    el.dispatchEvent(new Event('input', { bubbles: true, cancelable: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true, cancelable: true }));
+                }''', value)
+            except Exception:
+                pass
 
         # 5. もし値が反映されていなければ物理キーボードで直接タイピング
         try:
@@ -976,78 +986,148 @@ class XBrowserController:
             page.keyboard.press("End")
         except Exception:
             pass
-        time.sleep(0.2)
+        time.sleep(0.25)
 
-    def _click_next_or_submit(self, page: Page, is_login_submit: bool = False) -> bool:
+    def _click_next_or_submit(self, page: Page, is_login_submit: bool = False, anchor_locator=None) -> bool:
         """
-        「続ける」「次へ」「ログイン」「Log in」ボタンを検索してクリック。
+        入力欄の下にある「続ける」「次へ」「ログイン」「Log in」ボタンを正確に検索してクリック。
+        「電話番号で続ける」「Googleで続ける」「Appleで続ける」は確実に除外する。
         見つからない場合は Enter キーを押下。
         """
+        excluded_terms = [
+            "電話番号", "phone", "google", "apple", "グーグル", "アップル",
+            "パスワードをお忘れ", "forgot", "アカウントを作成", "sign up", "create"
+        ]
+
+        anchor_y = None
+        if anchor_locator is not None:
+            try:
+                box = anchor_locator.bounding_box()
+                if box:
+                    anchor_y = box["y"]
+            except Exception:
+                pass
+
         if is_login_submit:
             selectors = [
                 'button[data-testid="LoginForm_Login_Button"]',
-                'button:has-text("ログイン")',
-                'button:has-text("Log in")',
-                'button:has-text("続ける")',
-                'button:has-text("Continue")',
-                'button:has-text("次へ")',
-                'button:has-text("Next")',
-                'div[role="button"]:has-text("ログイン")',
-                'div[role="button"]:has-text("Log in")',
-                'div[role="button"]:has-text("続ける")',
-                'div[role="button"]:has-text("Continue")',
+                'button:text-is("ログイン")',
+                'button:text-is("Log in")',
+                'div[role="button"]:text-is("ログイン")',
+                'div[role="button"]:text-is("Log in")',
+                'button:text-is("続ける")',
+                'button:text-is("Continue")',
+                'div[role="button"]:text-is("続ける")',
+                'div[role="button"]:text-is("Continue")',
+                'button:text-is("次へ")',
+                'button:text-is("Next")',
                 'button[type="submit"]',
             ]
         else:
             selectors = [
-                'button:has-text("続ける")',
-                'button:has-text("Continue")',
-                'button:has-text("次へ")',
-                'button:has-text("Next")',
-                'div[role="button"]:has-text("続ける")',
-                'div[role="button"]:has-text("Continue")',
-                'div[role="button"]:has-text("次へ")',
-                'div[role="button"]:has-text("Next")',
-                'button[type="submit"]',
+                'button:text-is("続ける")',
+                'button:text-is("Continue")',
+                'div[role="button"]:text-is("続ける")',
+                'div[role="button"]:text-is("Continue")',
+                'button:text-is("次へ")',
+                'button:text-is("Next")',
+                'div[role="button"]:text-is("次へ")',
+                'div[role="button"]:text-is("Next")',
                 'button[data-testid*="next" i]',
-                'div[data-testid*="next" i]'
+                'div[data-testid*="next" i]',
+                'button[type="submit"]',
             ]
 
-        for sel in selectors:
+        def _is_excluded(el) -> bool:
             try:
-                btn = page.locator(sel)
-                cnt = btn.count()
-                for i in range(cnt):
-                    item = btn.nth(i)
-                    if item.is_visible():
-                        try:
-                            item.click(timeout=3000)
-                            return True
-                        except Exception:
+                txt = (el.inner_text() or el.get_attribute("value") or "").strip().lower()
+                return any(ex in txt for ex in excluded_terms)
+            except Exception:
+                return False
+
+        # 入力欄の下にあるボタンを優先して探す (ボタン活性化を最大2秒待機)
+        for _wait in range(4):
+            candidates_found = []
+            for sel in selectors:
+                try:
+                    btn = page.locator(sel)
+                    cnt = btn.count()
+                    for i in range(cnt):
+                        item = btn.nth(i)
+                        if not item.is_visible() or _is_excluded(item):
+                            continue
+                        is_below = True
+                        dist_y = 0.0
+                        if anchor_y is not None:
                             try:
-                                item.click(force=True, timeout=3000)
-                                return True
+                                b_box = item.bounding_box()
+                                if b_box:
+                                    dist_y = b_box["y"] - anchor_y
+                                    is_below = dist_y >= -10.0
                             except Exception:
                                 pass
-            except Exception:
-                continue
+                        candidates_found.append((0 if is_below else 1, abs(dist_y), item))
+                except Exception:
+                    continue
 
-        # JSによるクリック実行 (disabled/aria-disabled を強制解除してクリック)
+            if candidates_found:
+                candidates_found.sort(key=lambda x: (x[0], x[1]))
+                for _, _, target_btn in candidates_found:
+                    try:
+                        if target_btn.is_disabled():
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        target_btn.click(timeout=3000)
+                        return True
+                    except Exception:
+                        try:
+                            target_btn.click(force=True, timeout=3000)
+                            return True
+                        except Exception:
+                            pass
+            time.sleep(0.5)
+
+        # JSによる精密クリック実行 (電話番号/Google/Appleを除外し、入力欄の下にある「続ける」を最優先)
         try:
-            clicked = page.evaluate('''(isLogin) => {
-                const candidates = isLogin ? ['ログイン', 'log in', '続ける', 'continue'] : ['続ける', 'continue', '次へ', 'next'];
+            clicked = page.evaluate('''(args) => {
+                const isLogin = args.isLogin;
+                const anchorY = args.anchorY;
+                const exactCandidates = isLogin
+                    ? ['ログイン', 'log in', '続ける', 'continue', '次へ', 'next']
+                    : ['続ける', 'continue', '次へ', 'next'];
+                const excluded = ['電話番号', 'phone', 'google', 'apple', 'グーグル', 'アップル', 'パスワードをお忘れ', 'forgot', 'アカウントを作成', 'sign up', 'create'];
+
                 const btns = Array.from(document.querySelectorAll('button, div[role="button"], input[type="submit"]')).filter(b => b.offsetParent !== null);
+                const scored = [];
                 for (const b of btns) {
                     const txt = (b.innerText || b.value || '').trim().toLowerCase();
-                    if (candidates.some(c => txt.includes(c))) {
-                        b.removeAttribute('disabled');
-                        b.setAttribute('aria-disabled', 'false');
-                        b.click();
-                        return true;
-                    }
+                    if (!txt) continue;
+                    if (excluded.some(ex => txt.includes(ex))) continue;
+
+                    const isExact = exactCandidates.includes(txt);
+                    const isPartial = !isExact && exactCandidates.some(c => txt.includes(c));
+                    if (!isExact && !isPartial) continue;
+
+                    const rect = b.getBoundingClientRect();
+                    const isBelow = (anchorY === null) ? true : (rect.top >= anchorY - 10);
+                    const dist = (anchorY === null) ? 0 : Math.abs(rect.top - anchorY);
+                    scored.push({
+                        btn: b,
+                        score: (isExact ? 0 : 10000) + (isBelow ? 0 : 5000) + dist
+                    });
+                }
+                if (scored.length > 0) {
+                    scored.sort((a, b) => a.score - b.score);
+                    const target = scored[0].btn;
+                    target.removeAttribute('disabled');
+                    target.setAttribute('aria-disabled', 'false');
+                    target.click();
+                    return true;
                 }
                 return false;
-            }''', is_login_submit)
+            }''', {"isLogin": is_login_submit, "anchorY": anchor_y})
             if clicked:
                 return True
         except Exception:
@@ -1206,8 +1286,8 @@ class XBrowserController:
                 self._safe_fill_input(user_input, target_username)
                 time.sleep(0.6)
 
-                print("   👉 「続ける / 次へ」ボタンをクリックします...")
-                self._click_next_or_submit(page, is_login_submit=False)
+                print("   👉 メールアドレスまたはユーザー名の下にある「続ける / 次へ」ボタンをクリックします...")
+                self._click_next_or_submit(page, is_login_submit=False, anchor_locator=user_input)
                 time.sleep(2.5)
             else:
                 print("   ℹ️ ユーザー名入力欄は既に通過しているか、直接パスワード入力画面です。")
@@ -1221,7 +1301,7 @@ class XBrowserController:
                     print(f"   🔍 追加の身元確認画面を検出。アカウントID (@{account_id}) を自動入力します...")
                     self._safe_fill_input(challenge_input, target_username)
                     time.sleep(0.5)
-                    self._click_next_or_submit(page, is_login_submit=False)
+                    self._click_next_or_submit(page, is_login_submit=False, anchor_locator=challenge_input)
                     time.sleep(2.5)
 
             # パスワード入力欄を検出 (最大15秒ポーリング)
@@ -1239,7 +1319,7 @@ class XBrowserController:
                     time.sleep(0.6)
 
                     print("   🚀 「ログイン」ボタンをクリックします...")
-                    self._click_next_or_submit(page, is_login_submit=True)
+                    self._click_next_or_submit(page, is_login_submit=True, anchor_locator=pass_input)
                     time.sleep(3.0)
                 else:
                     print(f"   ⚠️ アカウント情報.xlsx にパスワードが未設定です。ブラウザ画面でパスワードを手動入力してください...")
