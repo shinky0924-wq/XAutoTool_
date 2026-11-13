@@ -138,41 +138,63 @@ def save_account_passcode(base_dir: str, account_id: str, passcode: str) -> bool
         return False
 
 def update_excel_passcode(base_dir: str, account_id: str, passcode: str) -> bool:
-    """アカウント情報.xlsxのDMパスコード列にも自動保存"""
+    """アカウント名.xlsx (<account_id>.xlsx) の「動作設定」シート【全体動作パラメータ】へDMパスコードを保存"""
     if not account_id or not passcode:
         return False
-    for filename in ["アカウント情報.xlsx", "アカウント情報"]:
-        excel_path = os.path.join(base_dir, filename if filename.endswith(".xlsx") else f"{filename}.xlsx")
-        if not os.path.exists(excel_path):
+    clean_acc = normalize_screen_name(account_id) or str(account_id).strip().lstrip("@")
+    candidates = [
+        os.path.join(base_dir, f"{clean_acc}.xlsx"),
+        os.path.join(base_dir, f"@{clean_acc}.xlsx"),
+        os.path.join(base_dir, f"アカウント名_{clean_acc}.xlsx"),
+        os.path.join(base_dir, "アカウント名.xlsx"),
+    ]
+    if os.path.isdir(base_dir):
+        try:
+            for fname in os.listdir(base_dir):
+                if fname.lower().endswith(".xlsx") and not fname.startswith("~$") and fname != "アカウント情報.xlsx":
+                    stem = os.path.splitext(fname)[0].lstrip("@").strip().lower()
+                    if stem == clean_acc.lower():
+                        candidates.insert(0, os.path.join(base_dir, fname))
+        except Exception:
+            pass
+
+    seen = set()
+    for excel_path in candidates:
+        if not excel_path or excel_path in seen or not os.path.exists(excel_path):
             continue
+        seen.add(excel_path)
         try:
             import openpyxl
-            clean_acc = normalize_screen_name(account_id).lower()
             wb = openpyxl.load_workbook(excel_path)
-            ws = wb.active
-            headers = [str(cell.value or "").strip() for cell in ws[1]]
-            acc_col = -1
-            pass_col = -1
-            for idx, h in enumerate(headers, 1):
-                h_clean = h.replace(" ", "").replace("　", "").lower()
-                if "アカウントid" in h_clean or h_clean == "id":
-                    acc_col = idx
-                if any(k in h_clean for k in ["dmパスコード", "パスコード", "pin", "暗号化"]):
-                    pass_col = idx
-            if acc_col > 0:
-                if pass_col <= 0:
-                    pass_col = ws.max_column + 1
-                    ws.cell(row=1, column=pass_col).value = "DMパスコード"
-                updated = False
-                for row in range(2, ws.max_row + 1):
-                    val = str(ws.cell(row=row, column=acc_col).value or "").strip()
-                    if normalize_screen_name(val).lower() == clean_acc or val.lstrip("@").lower() == clean_acc:
-                        ws.cell(row=row, column=pass_col).value = str(passcode)
-                        updated = True
-                if updated:
-                    wb.save(excel_path)
+            op_sheet = None
+            for sname in ["動作設定", "設定", "アクション設定", "基本設定"]:
+                if sname in wb.sheetnames:
+                    op_sheet = wb[sname]
+                    break
+            if op_sheet is not None:
+                found_row = None
+                action_header_row = None
+                for row_idx in range(1, op_sheet.max_row + 1):
+                    col0 = str(op_sheet.cell(row=row_idx, column=1).value or "").strip()
+                    col0_clean = col0.replace(" ", "").replace("　", "").replace("_", "").lower()
+                    if any(k in col0_clean for k in ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "dmpin", "passcode"]):
+                        found_row = row_idx
+                        break
+                    if "【アクション別" in col0 and action_header_row is None:
+                        action_header_row = row_idx
+                if found_row is not None:
+                    op_sheet.cell(row=found_row, column=2).value = str(passcode)
+                else:
+                    insert_at = action_header_row if action_header_row and action_header_row > 2 else (op_sheet.max_row + 1)
+                    if action_header_row and action_header_row > 2:
+                        op_sheet.insert_rows(insert_at)
+                    op_sheet.cell(row=insert_at, column=1).value = "DMパスコード(不要時は空欄)"
+                    op_sheet.cell(row=insert_at, column=2).value = str(passcode)
+                    op_sheet.cell(row=insert_at, column=3).value = "暗号化DM・PIN自動入力用パスコード（数字4桁等・不要時は空欄）"
+                wb.save(excel_path)
+                wb.close()
+                return True
             wb.close()
-            return True
         except Exception:
             pass
     return False

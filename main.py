@@ -590,7 +590,14 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
         auth_token = get_acc_val(acc, ["auth_token", "authtoken", "セッションid", "session_id", "token", "クッキー", "cookie"], "").strip()
         password = get_acc_val(acc, ["アカウントpw", "アカウントパスワード", "パスワード", "password", "pass", "pw"], "").strip()
-        dm_passcode = get_acc_val(acc, ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "暗号化dm", "pin", "dmpin", "復号", "2fa", "認証コード", "dmpasscode", "passcode"], "").strip()
+
+        # アカウント専用Excel (例: wqwq1320.xlsx) から個別動作設定 (動作設定シート・全体動作パラメータ) を読込
+        acc_target_path = config_mgr.get_target_path_for_account(clean_account_id)
+        acc_settings = config_mgr.load_account_settings(clean_account_id, target_path_override=acc_target_path, fallback_acc=acc)
+
+        dm_passcode = str(acc_settings.get("dm_passcode", "") or "").strip()
+        if not dm_passcode:
+            dm_passcode = get_acc_val(acc, ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "暗号化dm", "pin", "dmpin", "復号", "2fa", "認証コード", "dmpasscode", "passcode"], "").strip()
         if not dm_passcode:
             try:
                 from db_manager import get_saved_passcodes
@@ -598,10 +605,6 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 dm_passcode = saved_passes.get(clean_account_id, "") or saved_passes.get(normalize_screen_name(account_id), "") or saved_passes.get(str(account_id).strip(), "")
             except Exception:
                 pass
-
-        # アカウント専用Excel (例: wqwq1320.xlsx) から個別動作設定 (動作設定シート) を読込
-        acc_target_path = config_mgr.get_target_path_for_account(clean_account_id)
-        acc_settings = config_mgr.load_account_settings(clean_account_id, target_path_override=acc_target_path, fallback_acc=acc)
 
         target_mode = acc_settings.get("target_mode") or get_acc_val(acc, ["取得モード", "対象取得モード", "ターゲットモード", "検索モード", "モード", "抽出モード"], "").strip()
         scroll_limit = acc_settings.get("scroll_limit", 5)

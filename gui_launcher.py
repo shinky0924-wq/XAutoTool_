@@ -620,34 +620,35 @@ class AppLauncherGUI:
             else:
                 has_token = "👤 profile連携 (推奨)"
 
-            passcode_val = ""
-            for k, v in acc.items():
-                if k and v is not None and str(v).strip():
-                    k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
-                    if any(m in k_clean for m in ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "pin", "2fa"]):
-                        raw = str(v).strip()
-                        passcode_val = raw[:-2] if raw.endswith(".0") and raw[:-2].isdigit() else raw
-                        break
-            
-            # 保存済みJSONからも確認（初回入力で記憶された値）
-            if not passcode_val:
-                try:
-                    from db_manager import get_saved_passcodes
-                    acc_clean = normalize_screen_name(str(acc.get("アカウントID", "")).strip())
-                    saved_dict = get_saved_passcodes(self.base_dir)
-                    passcode_val = saved_dict.get(acc_clean, "") or saved_dict.get(str(acc.get("アカウントID", "")).strip(), "")
-                except Exception:
-                    pass
-
-            passcode_display = f"登録済 ({passcode_val})" if passcode_val else "未設定 (初回時に自動保存)"
-
-            # アカウント専用Excel (例: wqwq1320.xlsx) から個別動作設定 (動作設定シート) を読込
+            # アカウント専用Excel (例: wqwq1320.xlsx) から個別動作設定 (動作設定シート・全体動作パラメータ) を読込
             try:
                 acc_target_path = self.config_mgr.get_target_path_for_account(clean_acc)
                 acc_set = self.config_mgr.load_account_settings(clean_acc, target_path_override=acc_target_path, fallback_acc=acc)
             except Exception:
                 acc_target_path = ""
                 acc_set = {}
+
+            passcode_val = str(acc_set.get("dm_passcode", "") or "").strip()
+            if not passcode_val:
+                for k, v in acc.items():
+                    if k and v is not None and str(v).strip():
+                        k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
+                        if any(m in k_clean for m in ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "pin", "2fa"]):
+                            raw = str(v).strip()
+                            passcode_val = raw[:-2] if raw.endswith(".0") and raw[:-2].isdigit() else raw
+                            break
+
+            # 保存済みJSONからも確認（初回入力で記憶された値）
+            if not passcode_val:
+                try:
+                    from db_manager import get_saved_passcodes
+                    acc_clean = normalize_screen_name(str(acc.get("アカウントID", "") or acc.get("アカウント名", "")).strip())
+                    saved_dict = get_saved_passcodes(self.base_dir)
+                    passcode_val = saved_dict.get(acc_clean, "") or saved_dict.get(str(acc.get("アカウントID", "") or acc.get("アカウント名", "")).strip(), "")
+                except Exception:
+                    pass
+
+            passcode_display = f"登録済 ({passcode_val})" if passcode_val else "未設定 (初回時に自動保存)"
 
             excel_name = os.path.basename(acc_target_path) if acc_target_path and os.path.exists(acc_target_path) else "アカウント名.xlsx"
             target_mode_display = acc_set.get("target_mode") or "1,2,3 (全自動)"

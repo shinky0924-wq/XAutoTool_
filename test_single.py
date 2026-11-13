@@ -128,14 +128,17 @@ def main():
                     password = s
                 break
 
-    dm_raw = ""
-    for k, v in first_acc.items():
-        if k and v is not None and str(v).strip():
-            k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
-            if any(m in k_clean for m in ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "pin", "2fa", "passcode"]):
-                dm_raw = str(v).strip()
-                break
-    dm_passcode = dm_raw[:-2] if dm_raw.endswith(".0") and dm_raw[:-2].isdigit() else dm_raw
+    acc_settings = config_mgr.load_account_settings(account_id, target_path_override=acc_target_path, fallback_acc=first_acc)
+    dm_passcode = str(acc_settings.get("dm_passcode", "") or "").strip()
+    if not dm_passcode:
+        dm_raw = ""
+        for k, v in first_acc.items():
+            if k and v is not None and str(v).strip():
+                k_clean = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
+                if any(m in k_clean for m in ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "pin", "2fa", "passcode"]):
+                    dm_raw = str(v).strip()
+                    break
+        dm_passcode = dm_raw[:-2] if dm_raw.endswith(".0") and dm_raw[:-2].isdigit() else dm_raw
     if not dm_passcode:
         try:
             from db_manager import get_saved_passcodes

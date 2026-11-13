@@ -291,6 +291,7 @@ class ConfigManager:
             "target_count": 15,
             "ai_engine": "grok",
             "block_media": True,
+            "dm_passcode": "",
             "actions": {
                 "dm": {"enabled": True, "min_interval": 300.0, "max_interval": 900.0, "min_batch": 3, "max_batch": 8, "ai_gen": False},
                 "like": {"enabled": True, "min_interval": 30.0, "max_interval": 90.0, "min_batch": 5, "max_batch": 10, "ai_gen": False},
@@ -307,6 +308,10 @@ class ConfigManager:
             for k, v in fallback.items():
                 if not k or v is None or str(v).strip() == "": continue
                 kc = str(k).replace(" ", "").replace("　", "").replace("_", "").lower()
+                if any(m in kc for m in ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "暗号化dm", "dmpin", "dmpasscode", "passcode"]):
+                    raw_p = str(v).strip()
+                    res["dm_passcode"] = raw_p[:-2] if raw_p.endswith(".0") and raw_p[:-2].isdigit() else raw_p
+                    continue
                 if "取得モード" in kc or "対象取得モード" in kc or "モード" in kc:
                     res["target_mode"] = str(v).strip()
                 elif "スクロール" in kc:
@@ -346,7 +351,9 @@ class ConfigManager:
                         
                         if len(r) > 1 and r[1] is not None and str(r[1]).strip() != "":
                             val1 = str(r[1]).strip()
-                            if "対象取得モード" in col0_clean:
+                            if any(m in col0_clean for m in ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "dmpin", "dmpasscode", "passcode"]):
+                                res["dm_passcode"] = val1[:-2] if val1.endswith(".0") and val1[:-2].isdigit() else val1
+                            elif "対象取得モード" in col0_clean:
                                 res["target_mode"] = val1
                             elif "ランダムインターバル最小" in col0_clean:
                                 try: res["target_min_sec"] = float(val1)
@@ -365,14 +372,16 @@ class ConfigManager:
                             elif "メディア読込ブロック" in col0_clean:
                                 res["block_media"] = val1.lower() not in ["0", "false", "off", "無効"]
 
+                        is_passcode_row = any(m in col0_clean for m in ["パスコード", "passcode", "暗号化", "pin"])
                         act_key = None
-                        if "dm" in col0_clean: act_key = "dm"
-                        elif "いいね" in col0_clean: act_key = "like"
-                        elif "フォロー" in col0_clean: act_key = "follow"
-                        elif "リプライai" in col0_clean: act_key = "reply_ai"
-                        elif "引用" in col0_clean and "ai" in col0_clean: act_key = "quote_ai"
-                        elif "リプライ" in col0_clean: act_key = "reply"
-                        elif "引用" in col0_clean: act_key = "quote"
+                        if not is_passcode_row:
+                            if "dm" in col0_clean: act_key = "dm"
+                            elif "いいね" in col0_clean: act_key = "like"
+                            elif "フォロー" in col0_clean: act_key = "follow"
+                            elif "リプライai" in col0_clean: act_key = "reply_ai"
+                            elif "引用" in col0_clean and "ai" in col0_clean: act_key = "quote_ai"
+                            elif "リプライ" in col0_clean: act_key = "reply"
+                            elif "引用" in col0_clean: act_key = "quote"
 
                         if act_key and len(r) >= 2:
                             def _parse_cell(idx, def_val):
