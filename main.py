@@ -90,6 +90,11 @@ def check_app_termination(base_dir: str = "", browser_ctrl = None) -> bool:
             print("🛑 アプリ画面の閉鎖または停止命令を検知しました。裏の実行プロセスおよびブラウザを即座に完全停止します...", flush=True)
         except Exception:
             pass
+        try:
+            from ai_generator import AIDedicatedWindowManager
+            AIDedicatedWindowManager.close_ai_window()
+        except Exception:
+            pass
         if browser_ctrl:
             try:
                 browser_ctrl.close()
@@ -611,6 +616,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         target_read_limit = acc_settings.get("target_count", 15)
         block_media = acc_settings.get("block_media", True)
         ai_engine = acc_settings.get("ai_engine", "gemini")
+        ai_dedicated_window = bool(acc_settings.get("ai_dedicated_window", True))
         ai_api_key = acc_settings.get("ai_api_key", "")
         ai_prompt_extra = acc_settings.get("ai_prompt", "")
 
@@ -695,6 +701,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         log(f"   ⚡ メディア読込ブロック: {'ON (省メモリ・超高速)' if block_media else 'OFF (通常)'}")
         log(f"   スクロール上限: {scroll_limit}回 / 読み込みターゲット件数上限: {target_read_limit}件")
         log(f"   AIエンジン: {ai_engine}")
+        log(f"   AI専用ウィンドウ連携: {'ON (専用ウィンドウ起動・連携)' if ai_dedicated_window else 'OFF (API直接生成)'}")
         log(f"   📋 アクション個別設定 (アカウント名.xlsx「動作設定」シート準拠):")
         action_label_map = {
             "dm": "命令実行 DM",
@@ -760,6 +767,23 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             # アカウントログイン直後の一時停止チェック (アカウント編集したい場合に対応)
             check_pause_state(f"アカウント @{account_id} ログイン直後")
 
+            # AI専用ウィンドウ連携がONかつAIアクションが有効なら、ここで専用ウィンドウを先行起動しておく
+            uses_ai_in_jobs = any((a_cfg.get("ai_gen") or a_key.endswith("_ai")) for a_key, _, a_cfg in active_action_jobs)
+            if ai_dedicated_window and uses_ai_in_jobs and ai_engine and str(ai_engine).strip().lower() not in ["none", "off", "無効"]:
+                try:
+                    from ai_generator import AIGenerator, AIDedicatedWindowManager
+                    log("🪟 [AI専用ウィンドウ] AI生成専用ブラウザウィンドウを起動・準備しています...")
+                    AIDedicatedWindowManager.get_or_create_ai_page(
+                        browser_ctrl.playwright,
+                        headless=False,
+                        base_dir=base_dir,
+                        initial_engine=ai_engine,
+                        has_api_key=AIGenerator.has_api_key(ai_engine, ai_api_key),
+                        slot_id=active_slot
+                    )
+                except Exception as ai_win_e:
+                    log(f"   ⚠️ AI専用ウィンドウ先行起動通知: {ai_win_e}")
+
             # --- モード別ターゲット収集 (同一アカウント内キャッシュあり) ---
             mode_targets_cache = {}
 
@@ -769,10 +793,12 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         user = item.get("screen_name") or item.get("username") or ""
                         t_url = item.get("tweet_url", "")
                         d_name = item.get("display_name", "")
+                        t_text = item.get("tweet_text", "")
                     else:
                         user = str(item)
                         t_url = ""
                         d_name = ""
+                        t_text = ""
                     config_mgr.append_discovered_target(user, source_label, target_path_override=acc_target_path, tweet_url=t_url, display_name=d_name)
                     clean_u = normalize_screen_name(user)
                     if clean_u and not any(t.get("アカウント名") == clean_u for t in dest_list):
@@ -780,6 +806,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             "アカウント名": clean_u,
                             "ターゲットURL": t_url if t_url else f"https://x.com/{clean_u}",
                             "ツイートURL": t_url,
+                            "ツイート本文": t_text,
                             "個別メッセージ": "",
                             "ステータス": "未送信",
                             "表示名": d_name
@@ -863,29 +890,55 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 mode_targets_cache[m_type] = collected
                 return collected
 
-            def generate_ai_or_template_text(kind: str, target_screen_name: str, resolved_disp: str, tweet_url: str, use_ai: bool) -> str:
+            def generate_ai_or_template_text(kind: str, target_screen_name: str, resolved_disp: str, tweet_url: str, use_ai: bool, cached_tweet_text: str = "") -> str:
                 if use_ai and ai_engine and str(ai_engine).strip().lower() not in ["none", "off", "無効"]:
                     try:
-                        from ai_generator import AIGenerator
-                        post_txt = ""
-                        if tweet_url:
+                        from ai_generator import AIGenerator, AIDedicatedWindowManager
+                        post_txt = (cached_tweet_text or "").strip()
+                        if not post_txt and tweet_url:
                             try:
                                 post_txt = browser_ctrl.get_tweet_text_from_url(tweet_url)
                             except Exception:
                                 post_txt = ""
+                        if not post_txt and target_screen_name:
+                            try:
+                                fetched_url, fetched_txt = browser_ctrl.get_latest_tweet_info(target_screen_name)
+                                if fetched_txt:
+                                    post_txt = fetched_txt
+                                if fetched_url and not tweet_url:
+                                    tweet_url = fetched_url
+                            except Exception:
+                                pass
+
                         custom_p = ai_prompt_extra or acc_prompt_setting
-                        ok_ai, ai_res = AIGenerator.generate_comment(
-                            engine=ai_engine,
-                            post_url=tweet_url,
-                            post_text=post_txt,
-                            action_type="reply" if kind == "reply" else "quote",
-                            target_name=resolved_disp or target_screen_name,
-                            api_key=ai_api_key,
-                            custom_prompt=custom_p,
-                            page=browser_ctrl.page
-                        )
+                        if ai_dedicated_window:
+                            ok_ai, ai_res = AIDedicatedWindowManager.generate_and_copy_via_ai_window(
+                                playwright=browser_ctrl.playwright,
+                                post_url=tweet_url,
+                                post_text=post_txt,
+                                engine=ai_engine,
+                                action_type="reply" if kind == "reply" else "quote",
+                                target_name=resolved_disp or target_screen_name,
+                                api_key=ai_api_key,
+                                custom_prompt=custom_p,
+                                headless=False,
+                                base_dir=base_dir,
+                                slot_id=active_slot
+                            )
+                        else:
+                            ok_ai, ai_res = AIGenerator.generate_comment(
+                                engine=ai_engine,
+                                post_url=tweet_url,
+                                post_text=post_txt,
+                                action_type="reply" if kind == "reply" else "quote",
+                                target_name=resolved_disp or target_screen_name,
+                                api_key=ai_api_key,
+                                custom_prompt=custom_p,
+                                page=browser_ctrl.page
+                            )
                         if ok_ai and ai_res and ai_res.strip():
-                            log(f"   🤖 [AI生成成功/{ai_engine}] 「{ai_res.strip()[:35]}...」")
+                            prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if ai_dedicated_window else "🤖 [AI生成成功"
+                            log(f"   {prefix_icon}/{ai_engine}] 「{ai_res.strip()[:45]}...」")
                             return ai_res.strip()
                         else:
                             log(f"   ⚠️ AI生成フォールバック (理由: {ai_res}) → 定型テンプレートを使用します")
@@ -980,7 +1033,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                     elif act_key in ["reply", "reply_ai"]:
                         resolved_disp = get_target_name()
-                        rep_msg = generate_ai_or_template_text("reply", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai)
+                        target_tweet_text = str(target_item.get("ツイート本文") or target_item.get("tweet_text") or "").strip()
+                        rep_msg = generate_ai_or_template_text("reply", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai, cached_tweet_text=target_tweet_text)
                         preview_name = resolved_disp or "相手のアカウント名"
                         preview_log = format_template_message(rep_msg, preview_name, target_screen_name, preserve_unresolved=False)
                         log(f"   💬 [リプライ送信中] 「{preview_log[:35]}...」")
@@ -1032,7 +1086,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                     elif act_key in ["quote", "quote_ai"]:
                         resolved_disp = get_target_name()
-                        q_msg = generate_ai_or_template_text("quote", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai)
+                        target_tweet_text = str(target_item.get("ツイート本文") or target_item.get("tweet_text") or "").strip()
+                        q_msg = generate_ai_or_template_text("quote", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai, cached_tweet_text=target_tweet_text)
                         preview_name = resolved_disp or "相手のアカウント名"
                         preview_log = format_template_message(q_msg, preview_name, target_screen_name, preserve_unresolved=False)
                         log(f"   🔁 [引用RT実行中] 「{preview_log[:35]}...」")
@@ -1067,6 +1122,11 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 close_during_wait = wait_time >= 300.0
                 if close_during_wait:
                     log(f"🚪 [超長時間待機] 待機時間（{wait_time:.1f}秒）のため、ブラウザウィンドウを一旦安全に閉じます...")
+                    try:
+                        from ai_generator import AIDedicatedWindowManager
+                        AIDedicatedWindowManager.close_ai_window()
+                    except Exception:
+                        pass
                     try:
                         browser_ctrl.close()
                     except Exception as ce:
@@ -1173,6 +1233,11 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             traceback.print_exc()
         finally:
             check_pause_state("ブラウザ終了前")
+            try:
+                from ai_generator import AIDedicatedWindowManager
+                AIDedicatedWindowManager.close_ai_window()
+            except Exception:
+                pass
             if browser_ctrl:
                 try:
                     browser_ctrl.close()

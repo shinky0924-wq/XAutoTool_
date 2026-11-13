@@ -14,9 +14,6 @@ import time
 import random
 import math
 
-import functools
-print = functools.partial(print, flush=True)
-
 # Windows CP932 / Emoji UnicodeEncodeError 対策
 if sys.platform == "win32":
     try:
@@ -215,11 +212,11 @@ class XBrowserController:
 
         # 1. Google Chrome (PCにインストールされている場合、最も安定・高速・BAN耐性高)
         chrome_paths = [
-            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
-            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
-            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
-            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
-            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+            r"C:Program FilesGoogleChromeApplicationchrome.exe",
+            r"C:Program Files (x86)GoogleChromeApplicationchrome.exe",
+            os.path.expandvars(r"%LocalAppData%GoogleChromeApplicationchrome.exe"),
+            os.path.expandvars(r"%ProgramFiles%GoogleChromeApplicationchrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%GoogleChromeApplicationchrome.exe"),
         ]
         if any(os.path.isfile(p) for p in chrome_paths):
             if "chrome" not in candidates:
@@ -227,10 +224,10 @@ class XBrowserController:
 
         # 2. Microsoft Edge (Windows 10/11標準搭載。Microsoft署名済みでセキュリティソフトに絶対ブロックされない)
         edge_paths = [
-            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
-            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
-            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
-            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
+            r"C:Program Files (x86)MicrosoftEdgeApplicationmsedge.exe",
+            r"C:Program FilesMicrosoftEdgeApplicationmsedge.exe",
+            os.path.expandvars(r"%ProgramFiles(x86)%MicrosoftEdgeApplicationmsedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%MicrosoftEdgeApplicationmsedge.exe"),
         ]
         if any(os.path.isfile(p) for p in edge_paths):
             if "msedge" not in candidates:
@@ -1293,13 +1290,11 @@ class XBrowserController:
         else:
             print(f"🔑 [@{account_id}] ID・パスワードによる自動フォームログインを開始します...")
             try:
-                # ログインページへ移動 (既にログイン/オンボーディング画面にいる場合はそのまま利用)
                 cur_url = page.url.lower()
                 if not ("/login" in cur_url or "mode=login" in cur_url or "/i/flow/" in cur_url):
                     page.goto("https://x.com/i/flow/login", timeout=35000, wait_until="domcontentloaded")
                 time.sleep(2.0)
 
-                # ユーザー名 / メールアドレス入力欄を検出 (最大15秒ポーリング)
                 user_input = None
                 for _ in range(30):
                     user_input = self._find_login_input(page, is_password=False)
@@ -1318,7 +1313,6 @@ class XBrowserController:
                 else:
                     print("   ℹ️ ユーザー名入力欄は既に通過しているか、直接パスワード入力画面です。")
 
-                # 追加の身元確認要求 (電話番号/メールアドレス/アカウント名) が出た場合の自動入力
                 time.sleep(1.0)
                 pass_check = self._find_login_input(page, is_password=True)
                 if not pass_check:
@@ -1330,7 +1324,6 @@ class XBrowserController:
                         self._click_next_or_submit(page, is_login_submit=False, anchor_locator=challenge_input)
                         time.sleep(2.5)
 
-                # パスワード入力欄を検出 (最大15秒ポーリング)
                 pass_input = None
                 for _ in range(30):
                     pass_input = self._find_login_input(page, is_password=True)
@@ -1349,12 +1342,10 @@ class XBrowserController:
                 else:
                     print("   ℹ️ パスワード入力欄は検出されませんでした（既にログイン完了または追加認証待ち）。")
 
-                # 2FA / パスコード / 認証コードチェック
                 if self.is_passcode_prompt_active():
                     self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="ログイン認証コード")
                     time.sleep(2.5)
 
-                # ログイン確認ポーリング (最大15秒)
                 for _ in range(15):
                     if self._is_logged_in():
                         print(f"🎉 [@{account_id}] ID・パスワードでのログインが成功しました！セッション情報をプロファイルに永続保存します。")
@@ -2080,6 +2071,46 @@ class XBrowserController:
         except Exception as e:
             print(f"   ⚠️ ツイートテキスト取得例外: {e}")
         return ""
+
+    def get_latest_tweet_info(self, target_screen_name: str) -> tuple[str, str]:
+        """対象ユーザーのプロフィールから最新ツイートの (tweet_url, tweet_text) を取得"""
+        clean_target = normalize_screen_name(target_screen_name)
+        if not clean_target:
+            return "", ""
+        try:
+            page = self.ensure_page()
+            self.wait_for_profile_ready(clean_target, timeout=18.0)
+            tweet_articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]')
+            if tweet_articles.count() == 0:
+                tweet_articles = page.locator('article[data-testid="tweet"]')
+            wait_s = time.time()
+            while tweet_articles.count() == 0 and time.time() - wait_s < 8.0:
+                time.sleep(0.5)
+            if tweet_articles.count() > 0:
+                first_tweet = tweet_articles.first
+                t_text = ""
+                try:
+                    tel = first_tweet.locator('div[data-testid="tweetText"]')
+                    if tel.count() > 0:
+                        t_text = tel.first.inner_text().strip()
+                except Exception:
+                    pass
+                t_url = ""
+                try:
+                    time_els = first_tweet.locator('time')
+                    if time_els.count() > 0:
+                        pa = time_els.first.locator('xpath=ancestor::a[contains(@href, "/status/")]')
+                        if pa.count() > 0:
+                            th = pa.first.get_attribute("href")
+                            if th and "/status/" in th:
+                                clean_th = th.split("?")[0].split("#")[0]
+                                t_url = f"https://x.com{clean_th}" if clean_th.startswith("/") else clean_th
+                except Exception:
+                    pass
+                return t_url, t_text
+        except Exception as e:
+            print(f"   ⚠️ 最新ツイート情報取得例外: {e}")
+        return "", ""
 
     def send_reply(self, target_screen_name: str, reply_text: str, tweet_url: str = "") -> tuple[str, str]:
         """
@@ -2934,11 +2965,20 @@ class XBrowserController:
                         except Exception:
                             pass
 
+                    tweet_text = ""
+                    try:
+                        tt_el = tweet.locator('div[data-testid="tweetText"]')
+                        if tt_el.count() > 0:
+                            tweet_text = tt_el.first.inner_text().strip()
+                    except Exception:
+                        pass
+
                     seen.add(clean_u.lower())
                     discovered.append({
                         "screen_name": clean_u,
                         "tweet_url": tweet_url,
-                        "display_name": disp_name
+                        "display_name": disp_name,
+                        "tweet_text": tweet_text
                     })
                     if max_targets > 0 and len(discovered) >= max_targets:
                         break
@@ -3060,11 +3100,20 @@ class XBrowserController:
                         except Exception:
                             pass
 
+                    tweet_text = ""
+                    try:
+                        tt_el = tweet.locator('div[data-testid="tweetText"]')
+                        if tt_el.count() > 0:
+                            tweet_text = tt_el.first.inner_text().strip()
+                    except Exception:
+                        pass
+
                     seen.add(clean_u.lower())
                     discovered.append({
                         "screen_name": clean_u,
                         "tweet_url": tweet_url,
-                        "display_name": disp_name
+                        "display_name": disp_name,
+                        "tweet_text": tweet_text
                     })
                     if max_targets > 0 and len(discovered) >= max_targets:
                         break
@@ -3253,11 +3302,20 @@ class XBrowserController:
                     except Exception:
                         pass
 
+                tweet_text = ""
+                try:
+                    tt_el = tweet.locator('div[data-testid="tweetText"]')
+                    if tt_el.count() > 0:
+                        tweet_text = tt_el.first.inner_text().strip()
+                except Exception:
+                    pass
+
                 seen.add(clean_u.lower())
                 discovered.append({
                     "screen_name": clean_u,
                     "tweet_url": tweet_url,
-                    "display_name": disp_name
+                    "display_name": disp_name,
+                    "tweet_text": tweet_text
                 })
                 added_count += 1
                 if max_targets > 0 and len(discovered) >= max_targets:
@@ -3291,7 +3349,6 @@ class XBrowserController:
                 pass
             time.sleep(1.0)
 
-        # 指定タブ（「おすすめ」または「フォロー中」）をクリックして切り替え
         try:
             tabs = page.locator('a[role="tab"], div[role="tab"]').all()
             for tab in tabs:
@@ -3398,7 +3455,6 @@ class XBrowserController:
             "i", "privacy", "tos", "help", "support", "x", "twitter", "safety", "verified", "elonmusk"
         }
 
-        # 1. タブ上に直接表示されているツイートがあればスクロール抽出
         for scroll_idx in range(min(3, max(1, scroll_limit))):
             self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets)
             if max_targets > 0 and len(discovered) >= max_targets:
@@ -3411,12 +3467,10 @@ class XBrowserController:
                 pass
             time.sleep(random.uniform(1.5, 2.5))
 
-        # 2. トレンド/ニュース項目カードが並んでいる場合は、上位項目を開いて該当ポストを抽出
         if max_targets == 0 or len(discovered) < max_targets:
             candidate_urls = []
             candidate_queries = []
             try:
-                # リンク付きニュース/トレンド項目を収集
                 for a_el in page.locator('div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[href*="/search"], div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[href*="/i/trending/"], div[data-testid="primaryColumn"] div[data-testid="trend"] a').all():
                     href = a_el.get_attribute("href")
                     if href:
@@ -3424,7 +3478,6 @@ class XBrowserController:
                         if full_u not in candidate_urls:
                             candidate_urls.append(full_u)
 
-                # リンクが取れないトレンドカードからはトピック文字列を抽出して検索URL化
                 if not candidate_urls:
                     for tr in page.locator('div[data-testid="primaryColumn"] div[data-testid="trend"]').all():
                         t_lines = [ln.strip() for ln in (tr.inner_text() or "").splitlines() if ln.strip()]
