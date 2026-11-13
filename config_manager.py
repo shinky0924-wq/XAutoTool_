@@ -228,7 +228,7 @@ class ConfigManager:
         return accounts
 
     def load_max_concurrent(self) -> int:
-        """アカウント情報.xlsx の「モード」シート (またはアカウント設定) から指定窓数 (1~5) を取得"""
+        """アカウント情報.xlsx の「アカウント設定」シート (または互換シート) から指定窓数 (1~5) を取得"""
         try:
             wb = self._safe_load_workbook(self.account_config_path, read_only=True)
             for sname in ["モード", "モード設定", "実行モード"]:
@@ -277,29 +277,31 @@ class ConfigManager:
         """
         アカウント名.xlsx (例: wqwq1320.xlsx) の「動作設定」シートから
         全体設定および各アクション（リプライ、引用RT、いいね、DM、フォロー、AI生成）ごとの
-        実行間隔最短/最長(秒)・連続処理件数最小/最大数を読込。
-        ※「動作設定」シート未存在時はアカウント情報.xlsxの旧行から自動フォールバック。
+        モード(,区切り複数可)・実行間隔最短/最長(秒)・連続処理件数最小/最大数を読込。
         """
         target_path = target_path_override or self.get_target_path_for_account(account_id)
         fallback = fallback_acc or {}
         
         res = {
-            "target_mode": "検索キーワード,URLリスト_リプライ,URLリスト_フォロー",
+            "target_mode": "",
             "target_min_sec": 60.0,
             "target_max_sec": 150.0,
             "scroll_limit": 15,
             "target_count": 15,
-            "ai_engine": "grok",
+            "ai_engine": "gemini",
+            "ai_dedicated_window": True,
+            "ai_api_key": "",
+            "ai_prompt": "",
             "block_media": True,
             "dm_passcode": "",
             "actions": {
-                "dm": {"enabled": True, "min_interval": 300.0, "max_interval": 900.0, "min_batch": 3, "max_batch": 8, "ai_gen": False},
-                "like": {"enabled": True, "min_interval": 30.0, "max_interval": 90.0, "min_batch": 5, "max_batch": 10, "ai_gen": False},
-                "follow": {"enabled": True, "min_interval": 60.0, "max_interval": 180.0, "min_batch": 3, "max_batch": 7, "ai_gen": False},
-                "reply": {"enabled": False, "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": False},
-                "quote": {"enabled": False, "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": False},
-                "reply_ai": {"enabled": False, "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": True},
-                "quote_ai": {"enabled": False, "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": True},
+                "dm": {"enabled": True, "mode": "検索最新,URLリスト（リプライ）,URLリスト（フォロー）", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 3, "max_batch": 8, "ai_gen": False},
+                "like": {"enabled": True, "mode": "検索最新,HOMEおすすめ", "min_interval": 30.0, "max_interval": 90.0, "min_batch": 5, "max_batch": 10, "ai_gen": False},
+                "follow": {"enabled": True, "mode": "検索最新,URLリスト（フォロー）", "min_interval": 60.0, "max_interval": 180.0, "min_batch": 3, "max_batch": 7, "ai_gen": False},
+                "reply": {"enabled": False, "mode": "検索最新,URLリスト（リプライ）", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": False},
+                "quote": {"enabled": False, "mode": "検索話題のポスト検索,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": False},
+                "reply_ai": {"enabled": False, "mode": "検索最新,HOMEおすすめ,トレンド", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": True},
+                "quote_ai": {"enabled": False, "mode": "ニュース,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": True},
             }
         }
 
@@ -344,10 +346,36 @@ class ConfigManager:
                         break
                 if op_sheet:
                     rows = list(op_sheet.iter_rows(values_only=True))
+                    col_map = None
                     for r in rows:
                         if not r or not any(r): continue
                         col0 = str(r[0] or "").strip()
                         col0_clean = col0.replace(" ", "").replace("　", "").replace("_", "").lower()
+
+                        # 注記・セクション見出し行はアクション誤認を防ぐためスキップ
+                        if col0.startswith("※") or col0.startswith("【"):
+                            continue
+
+                        # アクション表のヘッダー行を検出して列インデックスを動的マッピング
+                        if col0_clean in ["アクション名", "アクション", "action", "actionname"]:
+                            col_map = {}
+                            for idx, h_cell in enumerate(r):
+                                h_clean = str(h_cell or "").replace(" ", "").replace("　", "").replace("_", "").lower()
+                                if "モード" in h_clean or "mode" in h_clean:
+                                    col_map["mode"] = idx
+                                elif "命令実行" in h_clean or "実行(" in h_clean or h_clean == "実行" or "enabled" in h_clean:
+                                    col_map["enabled"] = idx
+                                elif "実行間隔最短" in h_clean or "間隔最短" in h_clean or "mininterval" in h_clean:
+                                    col_map["min_interval"] = idx
+                                elif "実行間隔最長" in h_clean or "間隔最長" in h_clean or "maxinterval" in h_clean:
+                                    col_map["max_interval"] = idx
+                                elif "連続処理件数最小" in h_clean or "最小数" in h_clean or "minbatch" in h_clean:
+                                    col_map["min_batch"] = idx
+                                elif "連続処理件数最大" in h_clean or "最大数" in h_clean or "maxbatch" in h_clean:
+                                    col_map["max_batch"] = idx
+                                elif "ai生成" in h_clean or "aigen" in h_clean:
+                                    col_map["ai_gen"] = idx
+                            continue
                         
                         if len(r) > 1 and r[1] is not None and str(r[1]).strip() != "":
                             val1 = str(r[1]).strip()
@@ -369,6 +397,12 @@ class ConfigManager:
                                 except: pass
                             elif "aiエンジン" in col0_clean:
                                 res["ai_engine"] = val1
+                            elif "ai専用ウィンドウ" in col0_clean:
+                                res["ai_dedicated_window"] = val1.lower() not in ["0", "false", "off", "無効"]
+                            elif "aiapiキー" in col0_clean or "接続url" in col0_clean:
+                                res["ai_api_key"] = val1
+                            elif "aiプロンプト" in col0_clean:
+                                res["ai_prompt"] = val1
                             elif "メディア読込ブロック" in col0_clean:
                                 res["block_media"] = val1.lower() not in ["0", "false", "off", "無効"]
 
@@ -385,22 +419,51 @@ class ConfigManager:
 
                         if act_key and len(r) >= 2:
                             def _parse_cell(idx, def_val):
-                                if len(r) > idx and r[idx] is not None and str(r[idx]).strip() != "":
+                                if idx is not None and len(r) > idx and r[idx] is not None and str(r[idx]).strip() != "":
                                     return str(r[idx]).strip()
                                 return def_val
 
-                            flag_str = _parse_cell(1, "1" if res["actions"][act_key]["enabled"] else "0").lower()
+                            if col_map is not None:
+                                idx_mode = col_map.get("mode")
+                                idx_en = col_map.get("enabled", 2 if idx_mode == 1 else 1)
+                                idx_min_i = col_map.get("min_interval", idx_en + 1)
+                                idx_max_i = col_map.get("max_interval", idx_en + 2)
+                                idx_min_b = col_map.get("min_batch", idx_en + 3)
+                                idx_max_b = col_map.get("max_batch", idx_en + 4)
+                                idx_ai = col_map.get("ai_gen", idx_en + 5)
+                            else:
+                                # ヘッダー未検出時：新9列フォーマット (>=8列 または 列2が数値かつ列1がモード文字) か旧フォーマットかを自動判別
+                                has_mode_col = False
+                                if len(r) >= 8:
+                                    has_mode_col = True
+                                elif len(r) >= 3:
+                                    c1_str = str(r[1] or "").strip()
+                                    if any(mk in c1_str for mk in ["検索", "HOME", "URLリスト", "ニュース", "トレンド", ","]):
+                                        has_mode_col = True
+                                if has_mode_col:
+                                    idx_mode, idx_en, idx_min_i, idx_max_i, idx_min_b, idx_max_b, idx_ai = 1, 2, 3, 4, 5, 6, 7
+                                else:
+                                    idx_mode, idx_en, idx_min_i, idx_max_i, idx_min_b, idx_max_b, idx_ai = None, 1, 2, 3, 4, 5, 6
+
+                            if idx_mode is not None:
+                                m_val = _parse_cell(idx_mode, "")
+                                if m_val:
+                                    res["actions"][act_key]["mode"] = m_val
+                            elif res["target_mode"]:
+                                res["actions"][act_key]["mode"] = res["target_mode"]
+
+                            flag_str = _parse_cell(idx_en, "1" if res["actions"][act_key]["enabled"] else "0").lower()
                             res["actions"][act_key]["enabled"] = flag_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
                             
-                            try: res["actions"][act_key]["min_interval"] = float(_parse_cell(2, res["actions"][act_key]["min_interval"]))
+                            try: res["actions"][act_key]["min_interval"] = float(_parse_cell(idx_min_i, res["actions"][act_key]["min_interval"]))
                             except: pass
-                            try: res["actions"][act_key]["max_interval"] = float(_parse_cell(3, res["actions"][act_key]["max_interval"]))
+                            try: res["actions"][act_key]["max_interval"] = float(_parse_cell(idx_max_i, res["actions"][act_key]["max_interval"]))
                             except: pass
-                            try: res["actions"][act_key]["min_batch"] = int(float(_parse_cell(4, res["actions"][act_key]["min_batch"])))
+                            try: res["actions"][act_key]["min_batch"] = int(float(_parse_cell(idx_min_b, res["actions"][act_key]["min_batch"])))
                             except: pass
-                            try: res["actions"][act_key]["max_batch"] = int(float(_parse_cell(5, res["actions"][act_key]["max_batch"])))
+                            try: res["actions"][act_key]["max_batch"] = int(float(_parse_cell(idx_max_b, res["actions"][act_key]["max_batch"])))
                             except: pass
-                            ai_str = _parse_cell(6, "1" if res["actions"][act_key]["ai_gen"] else "0").lower()
+                            ai_str = _parse_cell(idx_ai, "1" if res["actions"][act_key]["ai_gen"] else "0").lower()
                             res["actions"][act_key]["ai_gen"] = ai_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
                 wb.close()
             except Exception:

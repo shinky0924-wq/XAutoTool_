@@ -417,7 +417,7 @@ class AppLauncherGUI:
         ttk.Button(top_bar, text="🔑 DMパスコード設定 (初回保存)", command=self._set_passcode_dialog).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="🌐 アカウント編集ブラウザ起動 (ウィンドウ保持)", command=self._start_edit_browser_process).pack(side=tk.RIGHT, padx=3)
 
-        cols = ("アカウントID", "アカウントPW", "auth_token状態", "DMパスコード", "動作設定Excel", "対象取得モード", "ターゲット件数", "DM実行", "いいね実行", "フォロー実行", "リプライ実行", "引用RT実行")
+        cols = ("アカウントID", "アカウントPW", "auth_token状態", "DMパスコード", "動作設定Excel", "設定モード", "ターゲット件数", "DM実行", "いいね実行", "フォロー実行", "リプライ実行", "引用RT実行")
         self.tree_acc = ttk.Treeview(self.tab_accounts, columns=cols, show="headings", height=8)
         for c in cols:
             self.tree_acc.heading(c, text=c)
@@ -427,7 +427,7 @@ class AppLauncherGUI:
         self.tree_acc.column("auth_token状態", width=95, anchor=tk.CENTER)
         self.tree_acc.column("DMパスコード", width=110, anchor=tk.CENTER)
         self.tree_acc.column("動作設定Excel", width=140, anchor=tk.W)
-        self.tree_acc.column("対象取得モード", width=140, anchor=tk.W)
+        self.tree_acc.column("設定モード", width=180, anchor=tk.W)
         self.tree_acc.column("ターゲット件数", width=85, anchor=tk.CENTER)
 
         scrollbar = ttk.Scrollbar(self.tab_accounts, orient=tk.VERTICAL, command=self.tree_acc.yview)
@@ -651,10 +651,15 @@ class AppLauncherGUI:
             passcode_display = f"登録済 ({passcode_val})" if passcode_val else "未設定 (初回時に自動保存)"
 
             excel_name = os.path.basename(acc_target_path) if acc_target_path and os.path.exists(acc_target_path) else "アカウント名.xlsx"
-            target_mode_display = acc_set.get("target_mode") or "1,2,3 (全自動)"
+            acts = acc_set.get("actions", {})
+            enabled_modes = []
+            for a_k, a_lbl in [("dm", "DM"), ("like", "いいね"), ("follow", "フォロー"), ("reply", "リプライ"), ("quote", "引用"), ("reply_ai", "リプライAI"), ("quote_ai", "引用AI")]:
+                a_info = acts.get(a_k, {})
+                if a_info.get("enabled") and a_info.get("mode"):
+                    enabled_modes.append(f"{a_lbl}:{a_info.get('mode')}")
+            target_mode_display = " / ".join(enabled_modes) if enabled_modes else (acc_set.get("target_mode") or "アクション別設定")
             t_cnt = acc_set.get("target_count", 15)
 
-            acts = acc_set.get("actions", {})
             is_dm = "ON" if acts.get("dm", {}).get("enabled") else "OFF"
             is_like = "ON" if acts.get("like", {}).get("enabled") else "OFF"
             is_follow = "ON" if acts.get("follow", {}).get("enabled") else "OFF"
@@ -868,8 +873,18 @@ class AppLauncherGUI:
         # 4. 最上部サマリーラベル更新
         if self.accounts_data:
             first_acc = self.accounts_data[0]
-            acc_id = first_acc.get("アカウントID", "未設定")
-            mode = first_acc.get("対象取得モード(,区切り)", "") or first_acc.get("対象取得モード", "全取得")
+            acc_id = first_acc.get("アカウントID", "") or first_acc.get("アカウント名", "未設定")
+            clean_first = normalize_screen_name(str(acc_id))
+            try:
+                first_path = self.config_mgr.get_target_path_for_account(clean_first)
+                first_set = self.config_mgr.load_account_settings(clean_first, target_path_override=first_path, fallback_acc=first_acc)
+            except Exception:
+                first_set = {}
+            first_acts = first_set.get("actions", {})
+            first_modes = [f"{k}:{v.get('mode')}" for k, v in first_acts.items() if v.get("enabled") and v.get("mode")]
+            mode = " / ".join(first_modes) if first_modes else "アクション別モード設定"
+            if len(mode) > 42:
+                mode = mode[:42] + "..."
             try:
                 from main import extract_target_interval_seconds, extract_account_interval_seconds
                 tgt_min_s, tgt_max_s = extract_target_interval_seconds(first_acc, 60.0, 150.0)
