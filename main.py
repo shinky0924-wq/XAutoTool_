@@ -767,20 +767,23 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             # アカウントログイン直後の一時停止チェック (アカウント編集したい場合に対応)
             check_pause_state(f"アカウント @{account_id} ログイン直後")
 
-            # AI専用ウィンドウ連携がONかつAIアクションが有効なら、ここで専用ウィンドウを先行起動しておく
+            # AIアクションが有効な場合、専用ウィンドウ連携ONまたはWeb AIエンジン/URL指定時は即座に専用ウィンドウを起動・遷移しておく
             uses_ai_in_jobs = any((a_cfg.get("ai_gen") or a_key.endswith("_ai")) for a_key, _, a_cfg in active_action_jobs)
-            if ai_dedicated_window and uses_ai_in_jobs and ai_engine and str(ai_engine).strip().lower() not in ["none", "off", "無効"]:
+            if uses_ai_in_jobs and ai_engine and str(ai_engine).strip().lower() not in ["none", "off", "無効"]:
                 try:
                     from ai_generator import AIGenerator, AIDedicatedWindowManager
-                    log("🪟 [AI専用ウィンドウ] AI生成専用ブラウザウィンドウを起動・準備しています...")
-                    AIDedicatedWindowManager.get_or_create_ai_page(
-                        browser_ctrl.playwright,
-                        headless=False,
-                        base_dir=base_dir,
-                        initial_engine=ai_engine,
-                        has_api_key=AIGenerator.has_api_key(ai_engine, ai_api_key),
-                        slot_id=active_slot
-                    )
+                    if AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window):
+                        eff_eng, eff_url = AIGenerator.resolve_engine_and_url(ai_engine, ai_api_key)
+                        log(f"🪟 [AI専用ウィンドウ] AI生成専用ブラウザウィンドウを起動・準備しています (エンジン: {eff_eng}" + (f" / URL: {eff_url}" if eff_url else "") + ")...")
+                        AIDedicatedWindowManager.get_or_create_ai_page(
+                            browser_ctrl.playwright,
+                            headless=False,
+                            base_dir=base_dir,
+                            initial_engine=ai_engine,
+                            has_api_key=AIGenerator.has_api_key(ai_engine, ai_api_key),
+                            slot_id=active_slot,
+                            connection_url=ai_api_key
+                        )
                 except Exception as ai_win_e:
                     log(f"   ⚠️ AI専用ウィンドウ先行起動通知: {ai_win_e}")
 
@@ -911,7 +914,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 pass
 
                         custom_p = ai_prompt_extra or acc_prompt_setting
-                        if ai_dedicated_window:
+                        use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
+                        if use_win_flow:
                             ok_ai, ai_res = AIDedicatedWindowManager.generate_and_copy_via_ai_window(
                                 playwright=browser_ctrl.playwright,
                                 post_url=tweet_url,
@@ -937,7 +941,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 page=browser_ctrl.page
                             )
                         if ok_ai and ai_res and ai_res.strip():
-                            prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if ai_dedicated_window else "🤖 [AI生成成功"
+                            prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if use_win_flow else "🤖 [AI生成成功"
                             log(f"   {prefix_icon}/{ai_engine}] 「{ai_res.strip()[:45]}...」")
                             return ai_res.strip()
                         else:

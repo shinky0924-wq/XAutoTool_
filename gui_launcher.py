@@ -581,7 +581,7 @@ class AppLauncherGUI:
         if os.path.exists(acc_path):
             try:
                 wb = openpyxl.load_workbook(acc_path, data_only=True)
-                sheet = wb.active
+                sheet = wb["アカウント設定"] if "アカウント設定" in wb.sheetnames else wb.active
                 rows = list(sheet.iter_rows(values_only=True))
                 if rows and len(rows) > 1:
                     headers = [str(h).strip() if h else f"col_{i}" for i, h in enumerate(rows[0])]
@@ -900,6 +900,14 @@ class AppLauncherGUI:
             self.lbl_summary_target.config(text=f"ターゲット: {len(self.targets_data)}件 (未送信: {pending}件)")
         else:
             self.lbl_summary_acc.config(text="アカウント: 未設定")
+
+        # アカウント情報.xlsx の「窓数」シートから窓数をGUIコンボボックスへ反映
+        try:
+            excel_conc = self.config_mgr.load_max_concurrent()
+            if hasattr(self, "var_concurrency") and 1 <= excel_conc <= 5:
+                self.var_concurrency.set(excel_conc)
+        except Exception:
+            pass
 
         # 読込完了メッセージ (登録アカウントに応じたExcelファイル名を動的表示)
         if not hasattr(self, "_ready_logged_file") or self._ready_logged_file != self.current_target_file_name:

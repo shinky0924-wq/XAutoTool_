@@ -228,10 +228,10 @@ class ConfigManager:
         return accounts
 
     def load_max_concurrent(self) -> int:
-        """アカウント情報.xlsx の「アカウント設定」シート (または互換シート) から指定窓数 (1~5) を取得"""
+        """アカウント情報.xlsx の「窓数」シート (または互換シート) から指定窓数 (1~5) を取得"""
         try:
             wb = self._safe_load_workbook(self.account_config_path, read_only=True)
-            for sname in ["モード", "モード設定", "実行モード"]:
+            for sname in ["窓数", "窓数設定", "モード", "モード設定", "実行モード"]:
                 if sname in wb.sheetnames:
                     sheet = wb[sname]
                     rows = list(sheet.iter_rows(values_only=True))
@@ -247,6 +247,17 @@ class ConfigManager:
                                 if r and len(r) > win_col and r[win_col] is not None:
                                     try:
                                         val = int(float(str(r[win_col]).strip()))
+                                        if 1 <= val <= 5:
+                                            wb.close()
+                                            return val
+                                    except Exception:
+                                        pass
+                        # 「窓数」シートでヘッダー名が自由入力の場合でも先頭列の1〜5数値をフォールバック取得
+                        if sname in ["窓数", "窓数設定"]:
+                            for r in rows:
+                                if r and len(r) > 0 and r[0] is not None:
+                                    try:
+                                        val = int(float(str(r[0]).strip()))
                                         if 1 <= val <= 5:
                                             wb.close()
                                             return val
