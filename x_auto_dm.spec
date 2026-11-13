@@ -1,7 +1,6 @@
 # -*- mode: python ; coding: utf-8 -*-
-# PyInstaller Spec ファイル: x_auto_dm.spec (他PC配布用・Playwright同梱対応)
+# PyInstaller Spec ファイル: x_auto_dm.spec (単一EXE + 必要最小限構成)
 import os
-import sys
 
 block_cipher = None
 
@@ -23,32 +22,18 @@ try:
 except Exception:
     pass
 
-# 存在するPythonスクリプトのみ安全に追加 (ファイル未存在時のPyInstallerエラーを完全防止)
-extra_py_files = [
-    'config_manager.py',
-    'browser_controller.py',
-    'db_manager.py',
-    'main.py',
-    'test_single.py',
-    'edit_account.py',
-    'chrome_launcher.py',
-    'profile_launcher.py',
-    'profile_luncher.py',
-]
-extra_datas = [(f, '.') for f in extra_py_files if os.path.isfile(f)]
-
+# ※ 注意: .pyソースファイルをdatasに複製同梱しない（全実行モジュールはhiddenimports経由でPYZにコンパイル格納）
 a = Analysis(
-    ['gui_launcher.pyw'],
+    ['gui_launcher.py'],
     pathex=[],
     binaries=pw_binaries + xl_binaries,
-    datas=extra_datas + pw_datas + xl_datas,
+    datas=pw_datas + xl_datas,
     hiddenimports=[
         'main',
+        'ai_generator',
         'test_single',
         'edit_account',
         'chrome_launcher',
-        'profile_launcher',
-        'profile_luncher',
         'browser_controller',
         'config_manager',
         'db_manager',
@@ -57,11 +42,41 @@ a = Analysis(
         'openpyxl',
         'sqlite3',
         'tkinter',
+        'tkinter.ttk',
+        'tkinter.messagebox',
+        'tkinter.scrolledtext',
+        'tkinter.filedialog',
+        'tkinter.simpledialog',
+        'concurrent.futures',
+        'urllib.request',
+        'urllib.parse',
+        'urllib.error',
+        'json',
+        'ssl',
+        'winreg',
     ] + pw_hidden + xl_hidden,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['matplotlib', 'scipy', 'numpy', 'pandas'],
+    excludes=[
+        'build_dist_package',
+        'diagnose',
+        'profile_launcher',
+        'profile_luncher',
+        'run_launcher',
+        'PyInstaller',
+        'pip',
+        'setuptools',
+        'wheel',
+        'unittest',
+        'pydoc',
+        'doctest',
+        'matplotlib',
+        'scipy',
+        'numpy',
+        'pandas',
+        'PIL',
+    ],
     win_no_prefer_redirects=False,
     win_private_assemblies=False,
     cipher=block_cipher,
@@ -86,114 +101,14 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=None
+    icon=None,
 )
 
-coll_exes = [exe]
-coll_binaries = list(a.binaries)
-coll_zipfiles = list(a.zipfiles)
-coll_datas = list(a.datas)
-
-# chrome_launcher.exe (軽量・正規Chrome手動プロファイル起動EXE)
-if os.path.isfile('chrome_launcher.py'):
-    a_chrome = Analysis(
-        ['chrome_launcher.py'],
-        pathex=[],
-        binaries=[],
-        datas=[],
-        hiddenimports=['winreg'],
-        hookspath=[],
-        hooksconfig={},
-        runtime_hooks=[],
-        excludes=['matplotlib', 'scipy', 'numpy', 'pandas', 'playwright', 'openpyxl', 'tkinter'],
-        win_no_prefer_redirects=False,
-        win_private_assemblies=False,
-        cipher=block_cipher,
-        noarchive=False,
-    )
-    pyz_chrome = PYZ(a_chrome.pure, a_chrome.zipped_data, cipher=block_cipher)
-    exe_chrome = EXE(
-        pyz_chrome,
-        a_chrome.scripts,
-        [],
-        exclude_binaries=True,
-        name='chrome_launcher',
-        debug=False,
-        bootloader_ignore_signals=False,
-        strip=False,
-        upx=True,
-        console=True,
-        disable_windowed_traceback=False,
-        argv_emulation=False,
-        target_arch=None,
-        codesign_identity=None,
-        entitlements_file=None,
-        icon=None
-    )
-    coll_exes.append(exe_chrome)
-    coll_binaries += a_chrome.binaries
-    coll_zipfiles += a_chrome.zipfiles
-    coll_datas += a_chrome.datas
-
-# プロファイルランチャーの単体EXE化 (存在する場合のみ安全に追加)
-prof_entry = None
-if os.path.isfile('profile_launcher.py'):
-    prof_entry = 'profile_launcher.py'
-elif os.path.isfile('profile_luncher.py'):
-    prof_entry = 'profile_luncher.py'
-
-if prof_entry:
-    prof_support_files = ['chrome_launcher.py', 'browser_controller.py', 'config_manager.py', 'db_manager.py']
-    prof_datas = [(f, '.') for f in prof_support_files if os.path.isfile(f)]
-    a_prof = Analysis(
-        [prof_entry],
-        pathex=[],
-        binaries=[],
-        datas=prof_datas,
-        hiddenimports=[
-            'chrome_launcher',
-            'profile_launcher',
-            'profile_luncher',
-            'winreg',
-        ],
-        hookspath=[],
-        hooksconfig={},
-        runtime_hooks=[],
-        excludes=['matplotlib', 'scipy', 'numpy', 'pandas', 'playwright', 'openpyxl', 'tkinter'],
-        win_no_prefer_redirects=False,
-        win_private_assemblies=False,
-        cipher=block_cipher,
-        noarchive=False,
-    )
-    pyz_prof = PYZ(a_prof.pure, a_prof.zipped_data, cipher=block_cipher)
-    exe_prof = EXE(
-        pyz_prof,
-        a_prof.scripts,
-        [],
-        exclude_binaries=True,
-        name='profile_launcher',
-        debug=False,
-        bootloader_ignore_signals=False,
-        strip=False,
-        upx=True,
-        console=True,
-        disable_windowed_traceback=False,
-        argv_emulation=False,
-        target_arch=None,
-        codesign_identity=None,
-        entitlements_file=None,
-        icon=None
-    )
-    coll_exes.append(exe_prof)
-    coll_binaries += a_prof.binaries
-    coll_zipfiles += a_prof.zipfiles
-    coll_datas += a_prof.datas
-
 coll = COLLECT(
-    *coll_exes,
-    coll_binaries,
-    coll_zipfiles,
-    coll_datas,
+    exe,
+    a.binaries,
+    a.zipfiles,
+    a.datas,
     strip=False,
     upx=True,
     upx_exclude=[],

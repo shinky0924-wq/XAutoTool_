@@ -51,10 +51,6 @@ if not defined PYW (
 REM 3. Launch GUI app without CMD window and exit immediately
 if exist "run_launcher.pyw" (
     start "" "%PYW%" run_launcher.pyw
-) else if exist "gui_launcher.pyw" (
-    start "" "%PYW%" gui_launcher.pyw
-) else if exist "run_launcher.py" (
-    start "" "%PYW%" run_launcher.py
 ) else (
     start "" "%PYW%" gui_launcher.py
 )

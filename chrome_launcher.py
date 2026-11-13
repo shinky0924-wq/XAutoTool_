@@ -269,6 +269,9 @@ def main():
 
         launch_chrome_profile(profile_name)
 
+        if not (sys.stdin and hasattr(sys.stdin, "isatty") and sys.stdin.isatty()):
+            break
+
         print("\n別のアカウント / プロファイルも続けて作成・起動しますか？")
         try:
             ans = input("続ける場合は Enter キー（終了する場合は 'q' を入力）: ").strip()

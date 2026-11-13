@@ -3,13 +3,6 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 title Chrome Custom Profile Launcher (chrome_launcher)
 
-if exist "chrome_launcher.exe" (
-    chcp 65001 >nul
-    chrome_launcher.exe %*
-    pause
-    exit /b 0
-)
-
 set "PY="
 py --version >nul 2>&1 && set "PY=py"
 if not defined PY python --version >nul 2>&1 && set "PY=python"
@@ -36,15 +29,10 @@ if defined PY (
     )
 )
 
-if exist "x_auto_dm_gui.exe" (
-    chcp 65001 >nul
-    x_auto_dm_gui.exe --cli-profile %*
-    pause
-    exit /b 0
-)
-
 echo ========================================================
-echo  [ERROR] chrome_launcher.exe and Python were not found.
+echo  [ERROR] Python or chrome_launcher.py was not found.
+echo  On another PC without Python, launch x_auto_dm_gui.exe
+echo  and click the [Chrome Profile Launcher] button in GUI.
 echo ========================================================
 pause
 exit /b 1

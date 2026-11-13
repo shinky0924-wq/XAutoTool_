@@ -1,7 +1,8 @@
 """
 他PC配布用パッケージ自動作成スクリプト (build_dist_package.py)
-このPCでPythonコードをEXEコンパイルし、Playwright Chromiumブラウザを完全同梱して、
-他PCではZIP解凍だけで何もセットアップせずに即座に実行できる「超シンプル構成」の完全版パッケージを作成します。
+このPCでPythonコードを単一EXE (x_auto_dm_gui.exe) へコンパイルし、
+Playwright Chromiumブラウザを同梱して、他PCではZIP解凍だけで即起動できる最小構成パッケージを作成します。
+※ 重複ファイル (.bat/.exe/.py) や開発用スクリプトは配布フォルダへ一切同梱しません。
 """
 
 import os
@@ -13,11 +14,11 @@ import subprocess
 base_dir = os.path.dirname(os.path.abspath(__file__))
 
 print("=" * 70)
-print("  📦 他PC配布用パッケージ自動作成 (Python・ブラウザ完全同梱コンパイル)")
-print("  ★ このPCでコンパイル実行 ➜ 他PCではZIP解凍だけで即座に動く完全版を作成")
+print("  📦 他PC配布用パッケージ自動作成 (最小・重複なし完全版ビルド)")
+print("  ★ このPCでEXE化 ➜ Python未導入の他PCではZIP解凍だけで即動作")
 print("=" * 70)
 
-# 1. 依存ライブラリの自動確認 & インストール
+# 1. 依存ライブラリの確認 & インストール
 print("\n[1/5] PyInstaller および必要パッケージの確認...")
 try:
     subprocess.run([sys.executable, "-m", "pip", "install", "pyinstaller", "openpyxl", "playwright", "--quiet"], check=True)
@@ -33,40 +34,14 @@ try:
 except Exception as e:
     print(f"⚠️ Playwright ブラウザ準備警告: {e}")
 
-# 2.5 必須スクリプトファイルの存在確認 & 自動同期 (chrome_launcher.py / profile_launcher.py)
-print("\n[2.5/5] スクリプトファイルの整合性確認...")
-target_chrome = os.path.join(base_dir, "chrome_launcher.py")
-target_launcher = os.path.join(base_dir, "profile_launcher.py")
-target_luncher = os.path.join(base_dir, "profile_luncher.py")
-
-if not os.path.exists(target_launcher) and os.path.exists(target_luncher):
-    shutil.copy2(target_luncher, target_launcher)
-    print("   ✅ profile_launcher.py を自動同期しました")
-elif not os.path.exists(target_luncher) and os.path.exists(target_launcher):
-    shutil.copy2(target_launcher, target_luncher)
-    print("   ✅ profile_luncher.py を自動同期しました")
-elif os.path.exists(target_chrome) and (not os.path.exists(target_launcher) or not os.path.exists(target_luncher)):
-    stub_code = '''# -*- coding: utf-8 -*-
-from chrome_launcher import (
-    normalize_screen_name,
-    sanitize_profile_name,
-    get_base_dir,
-    launch_chrome_profile as launch_profile,
-    main,
-)
-if __name__ == "__main__":
-    main()
-'''
-    if not os.path.exists(target_launcher):
-        with open(target_launcher, "w", encoding="utf-8") as f:
-            f.write(stub_code)
-    if not os.path.exists(target_luncher):
-        with open(target_luncher, "w", encoding="utf-8") as f:
-            f.write(stub_code)
-    print("   ✅ profile_launcher.py を自動同期しました")
-
-# 3. PyInstaller によるEXE化コンパイル
+# 3. PyInstaller による単一EXE化コンパイル (古いビルド成果物を事前クリーン)
 print("\n[3/5] Pythonコードを単一EXE化コンパイル中 (PyInstaller)...")
+dist_src = os.path.join(base_dir, "dist", "x_auto_dm_tool")
+build_tmp = os.path.join(base_dir, "build")
+for clean_dir in (dist_src, build_tmp):
+    if os.path.exists(clean_dir):
+        shutil.rmtree(clean_dir, ignore_errors=True)
+
 spec_path = os.path.join(base_dir, "x_auto_dm.spec")
 res = subprocess.run([sys.executable, "-m", "PyInstaller", spec_path, "--noconfirm", "--clean"], cwd=base_dir)
 if res.returncode != 0:
@@ -74,18 +49,14 @@ if res.returncode != 0:
     sys.exit(1)
 print("   ✅ EXEコンパイル完了 (x_auto_dm_gui.exe)")
 
-# 4. 超シンプル構成の他PC配布用フォルダを作成
-print("\n[4/5] 他PC配布用フォルダを整理中 (ファイル構成を超シンプルに最小化)...")
+# 4. 超シンプル・重複なしの他PC配布用フォルダを作成
+print("\n[4/5] 他PC配布用フォルダを整理中 (不要・重複ファイルを除外)...")
 out_dir = os.path.join(base_dir, "dist", "【他PC用】x_auto_dm_tool")
 if os.path.exists(out_dir):
-    try:
-        shutil.rmtree(out_dir, ignore_errors=True)
-    except Exception:
-        pass
+    shutil.rmtree(out_dir, ignore_errors=True)
 os.makedirs(out_dir, exist_ok=True)
 
-# (A) PyInstaller出力物 (EXE本体および_internal) をコピー
-dist_src = os.path.join(base_dir, "dist", "x_auto_dm_tool")
+# (A) PyInstaller出力物 (x_auto_dm_gui.exe および _internal) をコピー
 if os.path.exists(dist_src):
     for item in os.listdir(dist_src):
         s = os.path.join(dist_src, item)
@@ -95,23 +66,7 @@ if os.path.exists(dist_src):
         else:
             shutil.copy2(s, d)
 
-# (A-2) profile_luncher.exe も同名で複製
-if os.path.exists(os.path.join(out_dir, "profile_launcher.exe")):
-    shutil.copy2(os.path.join(out_dir, "profile_launcher.exe"), os.path.join(out_dir, "profile_luncher.exe"))
-
-# (A-3) プロファイル起動バッチを他PC配布フォルダに同梱
-for bname in [
-    "chrome_launcher.bat",
-    "03_Chromeプロファイル起動_chrome_launcher.bat",
-    "03_プロファイル起動_profile_launcher.bat",
-    "profile_launcher.bat",
-    "profile_luncher.bat",
-]:
-    bpath = os.path.join(base_dir, bname)
-    if os.path.exists(bpath):
-        shutil.copy2(bpath, os.path.join(out_dir, bname))
-
-# (B) Playwright Chromiumブラウザを同梱 (_internal/ms-playwright 内に完全格納しルートはシンプルに保持)
+# (B) Playwright Chromiumブラウザを同梱 (_internal/ms-playwright 内に完全格納)
 print("   ・Playwright Chromiumブラウザ本体を同梱中 (他PCダウンロード不要)...")
 local_appdata = os.environ.get("LOCALAPPDATA", "")
 user_profile = os.environ.get("USERPROFILE", "")
@@ -134,10 +89,8 @@ if found_pw_src:
             s = os.path.join(found_pw_src, item)
             d = os.path.join(target_pw, item)
             if os.path.isdir(s):
-                # Chromiumとffmpegのみ同梱し、不要なFirefox/WebKitは除外して軽量化
-                if item.startswith("chromium-") or item.startswith("ffmpeg-"):
-                    shutil.copytree(s, d, dirs_exist_ok=True)
-                elif not (item.startswith("firefox-") or item.startswith("webkit-")):
+                # Chromium本体とffmpegのみ同梱し、Firefox/WebKit/Android等の不要ブラウザは除外
+                if item.startswith(("chromium-", "chromium_headless_shell-", "ffmpeg-", "winldd-")):
                     shutil.copytree(s, d, dirs_exist_ok=True)
         print("   ✅ Playwright Chromiumブラウザの同梱完了 (_internal/ms-playwright)")
     except Exception as e:
@@ -145,7 +98,7 @@ if found_pw_src:
 else:
     print("⚠️ ms-playwright フォルダが見つかりませんでした。")
 
-# (C) ユーザー設定用Excelファイルをコピー (アカウント情報.xlsx, アカウント名.xlsx, 各アカウント専用.xlsxなど全Excel)
+# (C) ユーザー設定用Excelファイルをコピー (一時ロックファイル ~$*.xlsx は除外)
 for fname in os.listdir(base_dir):
     if fname.endswith(".xlsx") and not fname.startswith("~$"):
         fpath = os.path.join(base_dir, fname)
@@ -153,7 +106,7 @@ for fname in os.listdir(base_dir):
             shutil.copy2(fpath, os.path.join(out_dir, fname))
 print("   ✅ 設定用Excelファイルの同梱完了")
 
-# (C-2) logフォルダ および dbフォルダの作成 (実行時にアカウント名.log / アカウント名.DB が自動保存される)
+# (C-2) logフォルダ・dbフォルダ・browser_profilesの作成
 log_dist = os.path.join(out_dir, "logフォルダ")
 db_dist = os.path.join(out_dir, "dbフォルダ")
 profiles_dist = os.path.join(out_dir, "browser_profiles")
@@ -166,10 +119,12 @@ try:
         f.write("実行されたアカウントごとに、ここに「アカウント名.log」（例: wqwq1320.log）が自動生成されます。\n")
     with open(os.path.join(db_dist, "README_データベースについて.txt"), "w", encoding="utf-8") as f:
         f.write("実行されたアカウントごとに、ここに「アカウント名.DB」（例: wqwq1320.DB / 重複防止SQLite3）が自動生成されます。\n")
+    with open(os.path.join(profiles_dist, "README_ブラウザプロファイルについて.txt"), "w", encoding="utf-8") as f:
+        f.write("アカウントごとのログインセッション・Cookieが自動保存されます。GUIの「👤 Chromeプロファイル起動」からも作成可能です。\n")
 except Exception:
     pass
 
-# (D) 他PC用起動バッチ (超シンプル: ダブルクリックするだけ + 未展開チェック)
+# (D) 他PC用起動バッチ (最小構成: 通常起動 + トラブル時デバッグ起動)
 launch_bat = os.path.join(out_dir, "🚀 ツール起動.bat")
 debug_bat = os.path.join(out_dir, "【エラー確認用】コマンドプロンプトで起動.bat")
 try:
@@ -180,7 +135,7 @@ try:
 except Exception:
     pass
 
-# (E) 超シンプルな使い方テキスト
+# (E) かんたんガイドテキスト
 readme_txt = os.path.join(out_dir, "README_他PCでの使い方.txt")
 try:
     with open(readme_txt, "w", encoding="utf-8") as f:
@@ -190,33 +145,38 @@ try:
 
 【このPCでのご利用手順（たったの2ステップ）】
 
-1. 「アカウント情報.xlsx」と「アカウント名.xlsx」を開き、
-   あなたのアカウント設定（auth_token等）やターゲット、メッセージを入力して保存します。
+1. 「アカウント情報.xlsx」と「アカウント名.xlsx」(または アカウントID.xlsx) を開き、
+   アカウント設定やターゲット・メッセージを入力して保存します。
 
 2. 「🚀 ツール起動.bat」または「x_auto_dm_gui.exe」をダブルクリック！
+   ※ 手動ログイン用ブラウザもGUI内の「👤 Chromeプロファイル起動」ボタンから直接使えます。
 
 ※ このフォルダにはPython実行環境・Chromiumブラウザ・全ライブラリが完全に同梱されています。
 ※ 他のPC側でのPythonインストールや環境構築、コマンド実行は【一切不要】です！
-※ 解凍したフォルダのまま、USBメモリや共有ドライブ経由で即座に動作します。
+※ もし「WindowsによってPCが保護されました」と出た場合は「詳細情報」➜「実行」を押してください。
 ======================================================================
 """)
 except Exception:
     pass
 
-# (F) 他PC配布用フォルダ内の不要ファイルを徹底クリーンアップ (ルートは超シンプルに保つ)
+# (F) 不要ファイル (.pyソース/pyc/spec/__pycache__/開発用ファイル) を徹底除去
 for root, dirs, files in os.walk(out_dir):
     for f in files:
-        if f.endswith(".pyc") or f == ".pause" or f.endswith(".spec"):
+        fl = f.lower()
+        if fl.endswith((".py", ".pyw", ".pyc", ".pyo", ".spec", ".log")) or f in (".pause", ".stop"):
             try:
                 os.remove(os.path.join(root, f))
             except Exception:
                 pass
     for d in list(dirs):
         if d == "__pycache__":
-            try:
-                shutil.rmtree(os.path.join(root, d), ignore_errors=True)
-            except Exception:
-                pass
+            shutil.rmtree(os.path.join(root, d), ignore_errors=True)
+            dirs.remove(d)
+
+# ビルド中間キャッシュも掃除
+for tmp_dir in (build_tmp, dist_src):
+    if os.path.exists(tmp_dir):
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
 # 5. 他PC転送用のZIPファイルを自動生成
 print("\n[5/5] 他PC転送用ZIPファイルを作成中...")
@@ -245,23 +205,20 @@ print(f"\n📦 生成された転送用ZIPファイル:\n   👉 {zip_dest}")
 print(f"\n📁 生成された配布フォルダ:\n   👉 {out_dir}")
 print(r"""
 ----------------------------------------------------------------------
-📋 【他PC配布フォルダ内のファイル構成（超シンプル・たったの4ファイル+_internal）】
-   ├── 🚀 ツール起動.bat        ← 他PCではこれをダブルクリックするだけ！
-   ├── x_auto_dm_gui.exe       ← アプリ本体 (直接起動も可能)
-   ├── chrome_launcher.exe     ← 初回手動Chromeログイン用EXE
-   ├── chrome_launcher.bat     ← 初回手動Chromeログイン用バッチ
-   ├── 03_プロファイル起動_profile_launcher.bat ← プロファイル作成
-   ├── profile_launcher.exe    ← プロファイル作成EXE
-   ├── アカウント情報.xlsx     ← アカウント設定
-   ├── アカウント名.xlsx       ← ターゲット・メッセージ設定
+📋 【他PC配布フォルダ内のファイル構成（重複なし・最小構成）】
+   ├── 🚀 ツール起動.bat                      ← 他PCではこれをダブルクリックするだけ！
+   ├── 【エラー確認用】コマンドプロンプトで起動.bat ← トラブル確認用
+   ├── x_auto_dm_gui.exe                      ← アプリ本体 (全機能統合EXE)
+   ├── アカウント情報.xlsx                    ← アカウント設定
+   ├── アカウント名.xlsx                      ← ターゲット・メッセージ設定
    ├── README_他PCでの使い方.txt
-   └── _internal/              ← Python本体・ブラウザ(Chromium)・全依存ファイル完全同梱
+   ├── logフォルダ/ / dbフォルダ/ / browser_profiles/
+   └── _internal/                             ← Python本体・Chromium・依存モジュール同梱
 ----------------------------------------------------------------------
 
 💡 【他PCへの移行方法】:
-   上記で作成された「【他PC用】x_auto_dm_tool_完全版.zip」を
-   USBメモリやGoogle Drive等で別のPCへコピーし、右クリック「すべて展開」して
-   「🚀 ツール起動.bat」をダブルクリックするだけで即座に完全動作します！
+   「【他PC用】x_auto_dm_tool_完全版.zip」をUSBメモリやGoogle Drive等で別PCへコピーし、
+   右クリック「すべて展開」して「🚀 ツール起動.bat」をダブルクリックするだけで即動作します！
    （※他PCでのPythonインストール・pip実行は一切不要です）
 """)
 

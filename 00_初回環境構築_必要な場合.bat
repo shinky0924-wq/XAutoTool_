@@ -32,5 +32,5 @@ echo ========================================================
 "%PY%" -m playwright install --force chromium
 echo.
 echo [Setup completed] Starting application...
-start "" "%PY%" run_launcher.py
+start "" "%PY%" run_launcher.pyw
 exit /b 0

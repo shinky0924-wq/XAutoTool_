@@ -19,7 +19,7 @@ if sys.platform == "win32":
 
 import re
 from config_manager import ConfigManager
-from db_manager import sanitize_filename
+from db_manager import sanitize_filename, normalize_screen_name
 from browser_controller import XBrowserController
 
 def sanitize_filename(name: str) -> str:

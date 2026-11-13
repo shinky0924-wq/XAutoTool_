@@ -1010,9 +1010,23 @@ class AppLauncherGUI:
         self._run_script_in_thread(script, "【単体テスト】")
 
     def _start_setup_process(self):
+        if getattr(sys, 'frozen', False):
+            messagebox.showinfo(
+                "案内",
+                "他PC配布用EXE版にはPython実行環境とChromiumブラウザがすでに同梱されているため、\n"
+                "初回セットアップは不要です（そのままご利用いただけます）。"
+            )
+            return
         self._run_command_in_thread([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], "【pip インストール】", next_cmd=[sys.executable, "-m", "playwright", "install", "chromium"])
 
     def _start_build_dist_process(self):
+        if getattr(sys, 'frozen', False):
+            messagebox.showinfo(
+                "案内",
+                "このアプリはすでに配布用EXEとしてビルド済みです。\n"
+                "このフォルダごと（またはZIP圧縮して）他のPCへコピーするだけでそのまま動作します。"
+            )
+            return
         script = os.path.join(self.base_dir, "build_dist_package.py")
         if not os.path.exists(script):
             messagebox.showinfo("案内", "build_dist_package.py が見つかりません。")
@@ -1052,7 +1066,7 @@ class AppLauncherGUI:
                         cmd = [sys.executable, "--cli-test"]
                     elif "edit_account.py" in script_path:
                         cmd = [sys.executable, "--cli-edit"]
-                    elif "profile_launcher.py" in script_path or "profile_luncher.py" in script_path:
+                    elif "chrome_launcher.py" in script_path:
                         cmd = [sys.executable, "--cli-profile"]
                     else:
                         cmd = [sys.executable, "--cli-main"]
@@ -1179,27 +1193,13 @@ class AppLauncherGUI:
 
     def _start_edit_browser_process(self):
         script = os.path.join(self.base_dir, "edit_account.py")
-        if not os.path.exists(script):
+        if not getattr(sys, 'frozen', False) and not os.path.exists(script):
             messagebox.showinfo("案内", "edit_account.py が見つかりません。")
             return
         self._run_script_in_thread(script, "【アカウント編集用ブラウザ起動】")
 
     def _start_profile_launcher_process(self):
-        """正規 Chrome カスタムプロファイル起動ツール (chrome_launcher / profile_launcher) を実行"""
-        exe_launcher = os.path.join(self.base_dir, "chrome_launcher.exe")
-        script = ""
-        for cand in ("chrome_launcher.py", "profile_launcher.py", "profile_luncher.py"):
-            p = os.path.join(self.base_dir, cand)
-            if os.path.exists(p):
-                script = p
-                break
-        bat_script = ""
-        for cand in ("chrome_launcher.bat", "03_Chromeプロファイル起動_chrome_launcher.bat", "profile_launcher.bat", "profile_luncher.bat"):
-            p = os.path.join(self.base_dir, cand)
-            if os.path.exists(p):
-                bat_script = p
-                break
-
+        """正規 Chrome カスタムプロファイル起動ツール (chrome_launcher) を実行"""
         default_name = ""
         try:
             if hasattr(self, "accounts_data") and self.accounts_data:
@@ -1209,7 +1209,7 @@ class AppLauncherGUI:
 
         prof_name = simpledialog.askstring(
             "Chrome カスタムプロファイル起動 (chrome_launcher)",
-            "作成・使用するプロファイル名を入力してください:\n(例: wqwq1320 / 空白のまま起動すると黒いコンソール画面で入力可能)",
+            "作成・使用するプロファイル名を入力してください:\n(例: wqwq1320)",
             initialvalue=default_name,
             parent=self.root
         )
@@ -1217,32 +1217,30 @@ class AppLauncherGUI:
             return
 
         prof_name = prof_name.strip()
-        if os.path.exists(exe_launcher):
-            if prof_name:
-                subprocess.Popen(f'start cmd /k ""{exe_launcher}" "{prof_name}""', shell=True, cwd=self.base_dir)
-            else:
-                subprocess.Popen(f'start cmd /k "{exe_launcher}"', shell=True, cwd=self.base_dir)
-            return
 
         if getattr(sys, 'frozen', False):
-            exe_path = sys.executable
-            if prof_name:
-                subprocess.Popen(f'start cmd /k ""{exe_path}" --cli-profile "{prof_name}""', shell=True, cwd=self.base_dir)
-            else:
-                subprocess.Popen(f'start cmd /k ""{exe_path}" --cli-profile"', shell=True, cwd=self.base_dir)
+            if not prof_name:
+                messagebox.showinfo("案内", "作成・ログインするプロファイル名（アカウントID）を入力してください。")
+                return
+            self._run_command_in_thread(
+                [sys.executable, "--cli-profile", prof_name],
+                f"【Chromeプロファイル手動ログイン (@{prof_name})】"
+            )
             return
 
+        script = os.path.join(self.base_dir, "chrome_launcher.py")
+        bat_script = os.path.join(self.base_dir, "chrome_launcher.bat")
         if prof_name:
-            if bat_script:
+            if os.path.exists(bat_script):
                 subprocess.Popen(f'start cmd /k ""{bat_script}" "{prof_name}""', shell=True, cwd=self.base_dir)
-            elif script:
+            elif os.path.exists(script):
                 subprocess.Popen(f'start cmd /k python "{script}" "{prof_name}"', shell=True, cwd=self.base_dir)
             else:
                 messagebox.showerror("エラー", "chrome_launcher.py または chrome_launcher.bat が見つかりません。")
         else:
-            if bat_script:
+            if os.path.exists(bat_script):
                 subprocess.Popen(f'start cmd /k "{bat_script}"', shell=True, cwd=self.base_dir)
-            elif script:
+            elif os.path.exists(script):
                 subprocess.Popen(f'start cmd /k python "{script}"', shell=True, cwd=self.base_dir)
             else:
                 messagebox.showerror("エラー", "chrome_launcher が見つかりません。")
@@ -1389,10 +1387,7 @@ if __name__ == "__main__":
         edit_account.main()
         sys.exit(0)
     elif len(sys.argv) > 1 and sys.argv[1] == "--cli-profile":
-        try:
-            import chrome_launcher as _prof_mod
-        except ImportError:
-            import profile_launcher as _prof_mod
+        import chrome_launcher as _prof_mod
         if len(sys.argv) > 2:
             sys.argv = [sys.argv[0]] + sys.argv[2:]
         else:
