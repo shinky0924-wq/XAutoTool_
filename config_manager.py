@@ -306,13 +306,13 @@ class ConfigManager:
             "block_media": True,
             "dm_passcode": "",
             "actions": {
-                "dm": {"enabled": True, "mode": "検索最新,URLリスト（リプライ）,URLリスト（フォロー）", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 3, "max_batch": 8, "ai_gen": False},
-                "like": {"enabled": True, "mode": "検索最新,HOMEおすすめ", "min_interval": 30.0, "max_interval": 90.0, "min_batch": 5, "max_batch": 10, "ai_gen": False},
-                "follow": {"enabled": True, "mode": "検索最新,URLリスト（フォロー）", "min_interval": 60.0, "max_interval": 180.0, "min_batch": 3, "max_batch": 7, "ai_gen": False},
-                "reply": {"enabled": False, "mode": "検索最新,URLリスト（リプライ）", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": False},
-                "quote": {"enabled": False, "mode": "検索話題のポスト検索,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": False},
-                "reply_ai": {"enabled": False, "mode": "検索最新,HOMEおすすめ,トレンド", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": True},
-                "quote_ai": {"enabled": False, "mode": "ニュース,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": True},
+                "dm": {"enabled": True, "mode": "検索最新,URLリスト（リプライ）,URLリスト（フォロー）", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 3, "max_batch": 8, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
+                "like": {"enabled": False, "mode": "検索最新,HOMEおすすめ", "min_interval": 30.0, "max_interval": 90.0, "min_batch": 5, "max_batch": 10, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
+                "follow": {"enabled": False, "mode": "検索最新,URLリスト（フォロー）", "min_interval": 60.0, "max_interval": 180.0, "min_batch": 3, "max_batch": 7, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
+                "reply": {"enabled": False, "mode": "検索最新,URLリスト（リプライ）", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
+                "quote": {"enabled": False, "mode": "検索話題のポスト検索,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
+                "reply_ai": {"enabled": False, "mode": "検索最新,HOMEおすすめ,トレンド", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": True, "like_enabled": False, "follow_enabled": False},
+                "quote_ai": {"enabled": False, "mode": "ニュース,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": True, "like_enabled": False, "follow_enabled": False},
             }
         }
 
@@ -386,6 +386,10 @@ class ConfigManager:
                                     col_map["max_batch"] = idx
                                 elif "ai生成" in h_clean or "aigen" in h_clean:
                                     col_map["ai_gen"] = idx
+                                elif "いいね" in h_clean or "like" in h_clean:
+                                    col_map["like_enabled"] = idx
+                                elif "フォロー" in h_clean or "follow" in h_clean:
+                                    col_map["follow_enabled"] = idx
                             continue
                         
                         if len(r) > 1 and r[1] is not None and str(r[1]).strip() != "":
@@ -442,8 +446,10 @@ class ConfigManager:
                                 idx_min_b = col_map.get("min_batch", idx_en + 3)
                                 idx_max_b = col_map.get("max_batch", idx_en + 4)
                                 idx_ai = col_map.get("ai_gen", idx_en + 5)
+                                idx_like = col_map.get("like_enabled")
+                                idx_follow = col_map.get("follow_enabled")
                             else:
-                                # ヘッダー未検出時：新9列フォーマット (>=8列 または 列2が数値かつ列1がモード文字) か旧フォーマットかを自動判別
+                                # ヘッダー未検出時：新11列フォーマット / 旧9列・旧8列フォーマットを自動判別
                                 has_mode_col = False
                                 if len(r) >= 8:
                                     has_mode_col = True
@@ -453,8 +459,11 @@ class ConfigManager:
                                         has_mode_col = True
                                 if has_mode_col:
                                     idx_mode, idx_en, idx_min_i, idx_max_i, idx_min_b, idx_max_b, idx_ai = 1, 2, 3, 4, 5, 6, 7
+                                    idx_like = 8 if len(r) >= 10 else None
+                                    idx_follow = 9 if len(r) >= 10 else None
                                 else:
                                     idx_mode, idx_en, idx_min_i, idx_max_i, idx_min_b, idx_max_b, idx_ai = None, 1, 2, 3, 4, 5, 6
+                                    idx_like, idx_follow = None, None
 
                             if idx_mode is not None:
                                 m_val = _parse_cell(idx_mode, "")
@@ -476,6 +485,10 @@ class ConfigManager:
                             except: pass
                             ai_str = _parse_cell(idx_ai, "1" if res["actions"][act_key]["ai_gen"] else "0").lower()
                             res["actions"][act_key]["ai_gen"] = ai_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
+                            like_str = _parse_cell(idx_like, "1" if res["actions"][act_key].get("like_enabled") else "0").lower()
+                            res["actions"][act_key]["like_enabled"] = like_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
+                            follow_str = _parse_cell(idx_follow, "1" if res["actions"][act_key].get("follow_enabled") else "0").lower()
+                            res["actions"][act_key]["follow_enabled"] = follow_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
                 wb.close()
             except Exception:
                 pass

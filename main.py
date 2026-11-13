@@ -713,13 +713,16 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             "quote_ai": "引用リツイートAI生成",
         }
         active_action_jobs = []
-        for act_key in ["follow", "like", "reply", "reply_ai", "dm", "quote", "quote_ai"]:
+        for act_key in ["dm", "reply", "reply_ai", "quote", "quote_ai", "follow", "like"]:
             a_cfg = actions_cfg.get(act_key, {})
             if a_cfg.get("enabled"):
                 act_mode_str = a_cfg.get("mode") or target_mode or "検索最新"
                 act_title = action_label_map.get(act_key, act_key.upper())
                 active_action_jobs.append((act_key, act_title, a_cfg))
-                log(f"      ・{act_title}: モード=[{act_mode_str}], 間隔={a_cfg.get('min_interval', 0):.0f}〜{a_cfg.get('max_interval', 0):.0f}秒, 連続={a_cfg.get('min_batch', 1)}〜{a_cfg.get('max_batch', 1)}件, AI生成={'ON' if (a_cfg.get('ai_gen') or act_key.endswith('_ai')) else 'OFF'}")
+                ai_flag_lbl = 'ON' if (a_cfg.get('ai_gen') or act_key.endswith('_ai')) else 'OFF'
+                like_flag_lbl = 'ON' if a_cfg.get('like_enabled') else 'OFF'
+                follow_flag_lbl = 'ON' if a_cfg.get('follow_enabled') else 'OFF'
+                log(f"      ・{act_title}: モード=[{act_mode_str}], 間隔={a_cfg.get('min_interval', 0):.0f}〜{a_cfg.get('max_interval', 0):.0f}秒, 連続={a_cfg.get('min_batch', 1)}〜{a_cfg.get('max_batch', 1)}件, AI生成={ai_flag_lbl}, いいね={like_flag_lbl}, フォロー={follow_flag_lbl}")
         if not active_action_jobs:
             log("      ・⚠️ 有効なアクションがありません（すべてOFF設定）")
         log(f"      ・DMパスコード: {'登録済み (暗号化DM自動認証有効)' if dm_passcode else '⚠️ 未登録'}")
@@ -956,7 +959,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 return format_template_message(raw_msg, resolved_disp, target_screen_name, preserve_unresolved=True)
 
             # 単一アクションをターゲット1件に実行
-            def execute_single_action_on_target(act_key: str, target_item: dict, target_idx: int, total_in_mode: int, current_success_count: int, target_batch_goal: int, use_ai: bool = False) -> tuple[bool, str]:
+            def execute_single_action_on_target(act_key: str, target_item: dict, target_idx: int, total_in_mode: int, current_success_count: int, target_batch_goal: int, use_ai: bool = False, do_like: bool = False, do_follow: bool = False) -> tuple[bool, str]:
                 nonlocal processed_count
                 check_pause_state(f"{act_key.upper()} ターゲット [{target_idx}/{total_in_mode}] 実行前")
                 target_screen_name = normalize_screen_name(target_item.get("アカウント名") or target_item.get("ターゲットURL") or target_item.get("ユーザー名") or "")
@@ -1010,6 +1013,30 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 browser_ctrl.ensure_page()
 
+                def run_paired_like_and_follow():
+                    if do_like:
+                        try:
+                            if db_mgr.is_already_sent(target_screen_name, action_type="LIKE"):
+                                log(f"   ⏩ [連動いいね] @{target_screen_name} は過去にいいね済みのためスキップ")
+                            else:
+                                check_pause_state(f"連動いいね @{target_screen_name} 実行前")
+                                l_st, l_det = browser_ctrl.like_recent_post(target_screen_name, tweet_url=target_tweet_url)
+                                log(f"   ❤️ [連動いいね結果] {l_st} ({l_det})")
+                                db_mgr.record_sent(target_screen_name, account_id, "LIKE", l_st, l_det)
+                        except Exception as l_err:
+                            log(f"   ⚠️ [連動いいね通知] @{target_screen_name} のいいね実行中にエラー: {l_err}")
+                    if do_follow:
+                        try:
+                            if db_mgr.is_already_sent(target_screen_name, action_type="FOLLOW"):
+                                log(f"   ⏩ [連動フォロー] @{target_screen_name} は過去にフォロー済みのためスキップ")
+                            else:
+                                check_pause_state(f"連動フォロー @{target_screen_name} 実行前")
+                                f_st, f_det = browser_ctrl.follow_user(target_screen_name)
+                                log(f"   👤 [連動フォロー結果] {f_st} ({f_det})")
+                                db_mgr.record_sent(target_screen_name, account_id, "FOLLOW", f_st, f_det)
+                        except Exception as f_err:
+                            log(f"   ⚠️ [連動フォロー通知] @{target_screen_name} のフォロー実行中にエラー: {f_err}")
+
                 try:
                     if act_key == "follow":
                         st, det = browser_ctrl.follow_user(target_screen_name)
@@ -1048,6 +1075,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         status_label = "リプライ完了" if st == "SUCCESS" else f"リプライ:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st == "SUCCESS":
+                            run_paired_like_and_follow()
                             processed_count += 1
                             return True, "SUCCESS"
                         return False, st
@@ -1075,6 +1103,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                         if st == "SUCCESS":
                             config_mgr.update_target_status(target_screen_name, "DM送信完了", target_path_override=acc_target_path)
+                            run_paired_like_and_follow()
                             processed_count += 1
                             return True, "SUCCESS"
                         elif st in ["INBOX_CLOSED", "DM_REJECTED", "LOCKED_ACCOUNT"]:
@@ -1101,6 +1130,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         status_label = "引用RT完了" if st == "SUCCESS" else f"引用RT:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st == "SUCCESS":
+                            run_paired_like_and_follow()
                             processed_count += 1
                             return True, "SUCCESS"
                         return False, st
@@ -1160,12 +1190,14 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 act_min_b = max(1, int(a_cfg.get("min_batch", 1)))
                 act_max_b = max(act_min_b, int(a_cfg.get("max_batch", act_min_b)))
                 use_ai = bool(a_cfg.get("ai_gen", False)) or act_key.endswith("_ai")
+                do_like = bool(a_cfg.get("like_enabled", False))
+                do_follow = bool(a_cfg.get("follow_enabled", False))
 
                 log("")
                 log(f"{'='*58}")
                 log(f"⚡ 【アクション実行開始: {act_title}】")
                 log(f"   設定モード ({len(act_modes)}個): {', '.join([lbl for _, lbl in act_modes])}")
-                log(f"   実行間隔: {act_min_int:.0f}〜{act_max_int:.0f}秒 / 連続処理目標: 最小{act_min_b}〜最大{act_max_b}件 / AI生成: {'ON' if use_ai else 'OFF'}")
+                log(f"   実行間隔: {act_min_int:.0f}〜{act_max_int:.0f}秒 / 連続処理目標: 最小{act_min_b}〜最大{act_max_b}件 / AI生成: {'ON' if use_ai else 'OFF'} / いいね: {'ON' if do_like else 'OFF'} / フォロー: {'ON' if do_follow else 'OFF'}")
                 log(f"{'='*58}")
 
                 for mode_idx, (m_type, m_label) in enumerate(act_modes, start=1):
@@ -1190,7 +1222,9 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             len(mode_targets),
                             current_success_count=mode_success_count,
                             target_batch_goal=batch_target_count,
-                            use_ai=use_ai
+                            use_ai=use_ai,
+                            do_like=do_like,
+                            do_follow=do_follow
                         )
                         if is_ok:
                             mode_success_count += 1
@@ -1219,11 +1253,13 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     act_max_b = max(act_min_b, int(a_cfg.get("max_batch", act_min_b)))
                     batch_target_count = random.randint(act_min_b, act_max_b)
                     use_ai = bool(a_cfg.get("ai_gen", False)) or act_key.endswith("_ai")
+                    do_like = bool(a_cfg.get("like_enabled", False))
+                    do_follow = bool(a_cfg.get("follow_enabled", False))
                     fb_success_count = 0
                     for t_idx, target in enumerate(existing_targets, start=1):
                         if fb_success_count >= batch_target_count:
                             break
-                        is_ok, _ = execute_single_action_on_target(act_key, target, t_idx, len(existing_targets), fb_success_count, batch_target_count, use_ai=use_ai)
+                        is_ok, _ = execute_single_action_on_target(act_key, target, t_idx, len(existing_targets), fb_success_count, batch_target_count, use_ai=use_ai, do_like=do_like, do_follow=do_follow)
                         if is_ok:
                             fb_success_count += 1
                             total_actions_performed += 1

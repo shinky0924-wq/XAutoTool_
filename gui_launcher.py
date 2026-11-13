@@ -661,8 +661,8 @@ class AppLauncherGUI:
             t_cnt = acc_set.get("target_count", 15)
 
             is_dm = "ON" if acts.get("dm", {}).get("enabled") else "OFF"
-            is_like = "ON" if acts.get("like", {}).get("enabled") else "OFF"
-            is_follow = "ON" if acts.get("follow", {}).get("enabled") else "OFF"
+            is_like = "ON" if (acts.get("like", {}).get("enabled") or any(acts.get(k, {}).get("like_enabled") for k in ["dm", "reply", "quote", "reply_ai", "quote_ai"] if acts.get(k, {}).get("enabled"))) else "OFF"
+            is_follow = "ON" if (acts.get("follow", {}).get("enabled") or any(acts.get(k, {}).get("follow_enabled") for k in ["dm", "reply", "quote", "reply_ai", "quote_ai"] if acts.get(k, {}).get("enabled"))) else "OFF"
             is_reply = "ON" if acts.get("reply", {}).get("enabled") or acts.get("reply_ai", {}).get("enabled") else "OFF"
             is_quote = "ON" if acts.get("quote", {}).get("enabled") or acts.get("quote_ai", {}).get("enabled") else "OFF"
 
