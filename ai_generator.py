@@ -49,6 +49,12 @@ class AIGenerator:
         "grok": "https://x.com/i/grok",
         "xai": "https://x.com/i/grok",
         "deepseek": "https://chat.deepseek.com/",
+        "duckai": "https://duck.ai/",
+        "duck": "https://duck.ai/",
+        "duckduckgo": "https://duck.ai/",
+        "qwen": "https://chat.qwen.ai/",
+        "mistral": "https://chat.mistral.ai/",
+        "lechat": "https://chat.mistral.ai/",
         "perplexity": "https://www.perplexity.ai/",
         "copilot": "https://copilot.microsoft.com/",
         "bing": "https://copilot.microsoft.com/",
@@ -59,6 +65,9 @@ class AIGenerator:
     WEB_ONLY_ENGINES = {
         "chatgpt", "openai", "gpt",
         "claude", "anthropic",
+        "duckai", "duck", "duckduckgo",
+        "qwen",
+        "mistral", "lechat",
         "perplexity",
         "copilot", "bing",
     }
@@ -100,6 +109,12 @@ class AIGenerator:
             return "perplexity"
         if "copilot.microsoft.com" in s or "bing.com/chat" in s:
             return "copilot"
+        if "duck.ai" in s or "duckduckgo.com" in s:
+            return "duckai"
+        if "chat.qwen.ai" in s or "qwen.ai" in s:
+            return "qwen"
+        if "chat.mistral.ai" in s or "mistral.ai" in s:
+            return "mistral"
         if ":11434" in s:
             return "ollama"
         if ":1234" in s:
@@ -117,6 +132,9 @@ class AIGenerator:
             "anthropic": "claude",
             "xai": "grok",
             "bing": "copilot",
+            "duck": "duckai",
+            "duckduckgo": "duckai",
+            "lechat": "mistral",
             "groq_cloud": "groq",
             "open_router": "openrouter",
             "local_ollama": "ollama",
@@ -1238,6 +1256,163 @@ class AIDedicatedWindowManager:
             return False, f"Copilot Web連携エラー: {e}"
 
     @classmethod
+    def _generate_via_duckai_web(cls, ai_page, prompt: str, custom_url: str = "") -> Tuple[bool, str]:
+        """Duck.ai (https://duck.ai/ - 登録不要・無料WebAI) 連携"""
+        try:
+            target = custom_url or "https://duck.ai/"
+            cur_url = ai_page.url or ""
+            if "duck.ai" not in cur_url and "duckduckgo.com" not in cur_url:
+                print(f"🌐 [AI専用ウィンドウ] Duck.ai ({target}) へ移動します...")
+                ai_page.goto(target, timeout=35000, wait_until="domcontentloaded")
+                time.sleep(2.5)
+
+            # 初回訪問時の「始める / 同意する」ウィザードがあれば自動クリック
+            for agree_sel in [
+                'button:has-text("同意して続行")',
+                'button:has-text("同意する")',
+                'button:has-text("始める")',
+                'button:has-text("I Agree")',
+                'button:has-text("Get Started")',
+                'button:has-text("Next")',
+                'button:has-text("次へ")',
+            ]:
+                try:
+                    btn = ai_page.locator(agree_sel)
+                    if btn.count() > 0 and btn.first.is_visible():
+                        btn.first.click(timeout=2500)
+                        time.sleep(1.0)
+                except Exception:
+                    continue
+
+            input_el = cls._wait_for_input_or_login(
+                ai_page,
+                input_selectors=[
+                    'textarea[name="user-prompt"]',
+                    'textarea[placeholder*="Chat"]',
+                    'textarea[placeholder*="メッセージ"]',
+                    'textarea',
+                ],
+                service_label="Duck.ai",
+                target_url=target,
+                login_markers=[],
+                new_chat_selectors=['button:has-text("新しいチャット")', 'button:has-text("New Chat")', 'button[aria-label*="New"]']
+            )
+            if input_el is None:
+                return False, "Duck.aiの入力欄が検出できませんでした"
+
+            return cls._submit_and_stream_response(
+                ai_page,
+                input_el,
+                prompt,
+                resp_selectors=[
+                    'div[data-testid="message-content"]',
+                    'div[class*="message"] .markdown',
+                    '.prose',
+                    'div[dir="auto"]',
+                ],
+                send_selectors=[
+                    'button[aria-label="Send"]',
+                    'button[aria-label*="送信"]',
+                    'button[type="submit"]',
+                ],
+                stop_selectors=[
+                    'button[aria-label*="Stop"]',
+                    'button[aria-label*="停止"]',
+                ],
+                service_label="Duck.ai Web"
+            )
+        except Exception as e:
+            return False, f"Duck.ai Web連携エラー: {e}"
+
+    @classmethod
+    def _generate_via_qwen_web(cls, ai_page, prompt: str, custom_url: str = "") -> Tuple[bool, str]:
+        """Qwen Chat (https://chat.qwen.ai/) 連携"""
+        try:
+            target = custom_url or "https://chat.qwen.ai/"
+            input_el = cls._wait_for_input_or_login(
+                ai_page,
+                input_selectors=[
+                    'textarea#chat-input',
+                    'textarea[placeholder*="Qwen"]',
+                    'textarea[placeholder*="Ask"]',
+                    'textarea',
+                    'div[contenteditable="true"]',
+                ],
+                service_label="Qwen Chat",
+                target_url=target,
+                login_markers=["login", "signin", "auth"]
+            )
+            if input_el is None:
+                return False, "Qwen Chatの入力欄が検出できませんでした"
+
+            return cls._submit_and_stream_response(
+                ai_page,
+                input_el,
+                prompt,
+                resp_selectors=[
+                    '.markdown-body',
+                    '.prose',
+                    'div[class*="response"]',
+                ],
+                send_selectors=[
+                    'button#send-message-button',
+                    'button[type="submit"]',
+                    'button[aria-label*="Send"]',
+                    'button[aria-label*="送信"]',
+                ],
+                stop_selectors=[
+                    'button[aria-label*="Stop"]',
+                    'button[aria-label*="停止"]',
+                ],
+                service_label="Qwen Chat Web"
+            )
+        except Exception as e:
+            return False, f"Qwen Chat Web連携エラー: {e}"
+
+    @classmethod
+    def _generate_via_mistral_web(cls, ai_page, prompt: str, custom_url: str = "") -> Tuple[bool, str]:
+        """Mistral Le Chat (https://chat.mistral.ai/) 連携"""
+        try:
+            target = custom_url or "https://chat.mistral.ai/"
+            input_el = cls._wait_for_input_or_login(
+                ai_page,
+                input_selectors=[
+                    'textarea[placeholder*="Ask"]',
+                    'textarea[placeholder*="Le Chat"]',
+                    'textarea',
+                    'div[contenteditable="true"]',
+                ],
+                service_label="Mistral Le Chat",
+                target_url=target,
+                login_markers=["login", "signin", "auth"]
+            )
+            if input_el is None:
+                return False, "Mistral Le Chatの入力欄が検出できませんでした"
+
+            return cls._submit_and_stream_response(
+                ai_page,
+                input_el,
+                prompt,
+                resp_selectors=[
+                    '.prose',
+                    '.markdown',
+                    'div[data-message-author-role="assistant"]',
+                ],
+                send_selectors=[
+                    'button[type="submit"]',
+                    'button[aria-label*="Send"]',
+                    'button[aria-label*="送信"]',
+                ],
+                stop_selectors=[
+                    'button[aria-label*="Stop"]',
+                    'button[aria-label*="停止"]',
+                ],
+                service_label="Mistral Le Chat Web"
+            )
+        except Exception as e:
+            return False, f"Mistral Le Chat Web連携エラー: {e}"
+
+    @classmethod
     def _generate_via_generic_web_ai(cls, ai_page, prompt: str, target_url: str) -> Tuple[bool, str]:
         """接続URLに直接指定された任意のWeb AIチャットサイトとの汎用連携"""
         try:
@@ -1373,6 +1548,12 @@ class AIDedicatedWindowManager:
                     ok, result_text = cls._generate_via_grok_web(ai_page, prompt, custom_web_url)
                 elif eff_eng == "deepseek":
                     ok, result_text = cls._generate_via_deepseek_web(ai_page, prompt, custom_web_url)
+                elif eff_eng == "duckai":
+                    ok, result_text = cls._generate_via_duckai_web(ai_page, prompt, custom_web_url)
+                elif eff_eng == "qwen":
+                    ok, result_text = cls._generate_via_qwen_web(ai_page, prompt, custom_web_url)
+                elif eff_eng == "mistral":
+                    ok, result_text = cls._generate_via_mistral_web(ai_page, prompt, custom_web_url)
                 elif eff_eng == "perplexity":
                     ok, result_text = cls._generate_via_perplexity_web(ai_page, prompt, custom_web_url)
                 elif eff_eng == "copilot":
