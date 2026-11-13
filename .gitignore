@@ -1,3 +1,7 @@
--e __pycache__/
+__pycache__/
 *.pyc
-
+build/
+dist/
+*.log
+.stop
+.pause

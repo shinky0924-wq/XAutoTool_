@@ -33,8 +33,9 @@ try:
 except Exception as e:
     print(f"⚠️ Playwright ブラウザ準備警告: {e}")
 
-# 2.5 必須スクリプトファイルの存在確認 & 自動同期 (profile_launcher.py の欠落を完全防止)
+# 2.5 必須スクリプトファイルの存在確認 & 自動同期 (chrome_launcher.py / profile_launcher.py)
 print("\n[2.5/5] スクリプトファイルの整合性確認...")
+target_chrome = os.path.join(base_dir, "chrome_launcher.py")
 target_launcher = os.path.join(base_dir, "profile_launcher.py")
 target_luncher = os.path.join(base_dir, "profile_luncher.py")
 
@@ -44,70 +45,25 @@ if not os.path.exists(target_launcher) and os.path.exists(target_luncher):
 elif not os.path.exists(target_luncher) and os.path.exists(target_launcher):
     shutil.copy2(target_launcher, target_luncher)
     print("   ✅ profile_luncher.py を自動同期しました")
-elif not os.path.exists(target_launcher) and not os.path.exists(target_luncher):
-    try:
-        launcher_code = '''# -*- coding: utf-8 -*-
-"""Chrome カスタムプロファイル起動ツール"""
-import os, sys, time, re, traceback
-
-def normalize_screen_name(val):
-    s = str(val or "").strip().lstrip("@").strip()
-    return s.split("?")[0].split("#")[0].rstrip("/").split("/")[-1].lstrip("@").strip()
-
-def main():
-    base = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
-    while True:
-        print("=" * 60)
-        print("Chrome カスタムプロファイル起動ツール")
-        print("=" * 60)
-        if len(sys.argv) > 1 and sys.argv[1].strip() and not sys.argv[1].startswith("-"):
-            p_name = sys.argv[1].strip()
-            sys.argv = [sys.argv[0]]
-        else:
-            try:
-                p_name = input("作成・使用するプロファイル名を入力してください: ").strip()
-            except Exception:
-                break
-        if not p_name or p_name.lower() in ["q", "exit", "quit"]:
-            break
-        clean = normalize_screen_name(p_name) or p_name
-        p_dir = os.path.join(base, "browser_profiles", clean)
-        os.makedirs(p_dir, exist_ok=True)
-        print(f"\n📁 プロファイル保存先: {p_dir}")
-        print(f"🌐 プロファイル [{clean}] のブラウザを起動しています... しばらくお待ちください。")
-        try:
-            from playwright.sync_api import sync_playwright
-            with sync_playwright() as p:
-                ctx = p.chromium.launch_persistent_context(
-                    p_dir, headless=False, viewport={"width": 1280, "height": 840},
-                    user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-                    locale="ja-JP", timezone_id="Asia/Tokyo"
-                )
-                page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                try: page.goto("https://x.com/home", timeout=45000)
-                except Exception:
-                    try: page.goto("https://x.com/i/flow/login", timeout=30000)
-                    except Exception: pass
-                print("✨ ブラウザが起動しました。ログイン完了後、ウィンドウを閉じてください。")
-                while ctx.pages and not page.is_closed(): time.sleep(1)
-                try: ctx.close()
-                except Exception: pass
-                print(f"🎉 プロファイル [{clean}] の保存が完了しました！")
-        except Exception as e:
-            print(f"エラー: {e}")
-        try:
-            if input("\n別のプロファイルを作成・起動しますか？ (終了は 'q'): ").strip().lower() in ["q", "exit", "quit"]: break
-        except Exception: break
-
-if __name__ == "__main__": main()
+elif os.path.exists(target_chrome) and (not os.path.exists(target_launcher) or not os.path.exists(target_luncher)):
+    stub_code = '''# -*- coding: utf-8 -*-
+from chrome_launcher import (
+    normalize_screen_name,
+    sanitize_profile_name,
+    get_base_dir,
+    launch_chrome_profile as launch_profile,
+    main,
+)
+if __name__ == "__main__":
+    main()
 '''
+    if not os.path.exists(target_launcher):
         with open(target_launcher, "w", encoding="utf-8") as f:
-            f.write(launcher_code)
+            f.write(stub_code)
+    if not os.path.exists(target_luncher):
         with open(target_luncher, "w", encoding="utf-8") as f:
-            f.write(launcher_code)
-        print("   ✅ profile_launcher.py を自動作成しました")
-    except Exception as e:
-        print(f"   ⚠️ profile_launcher自動生成警告: {e}")
+            f.write(stub_code)
+    print("   ✅ profile_launcher.py を自動同期しました")
 
 # 3. PyInstaller によるEXE化コンパイル
 print("\n[3/5] Pythonコードを単一EXE化コンパイル中 (PyInstaller)...")
@@ -144,7 +100,13 @@ if os.path.exists(os.path.join(out_dir, "profile_launcher.exe")):
     shutil.copy2(os.path.join(out_dir, "profile_launcher.exe"), os.path.join(out_dir, "profile_luncher.exe"))
 
 # (A-3) プロファイル起動バッチを他PC配布フォルダに同梱
-for bname in ["03_プロファイル起動_profile_launcher.bat", "profile_launcher.bat", "profile_luncher.bat"]:
+for bname in [
+    "chrome_launcher.bat",
+    "03_Chromeプロファイル起動_chrome_launcher.bat",
+    "03_プロファイル起動_profile_launcher.bat",
+    "profile_launcher.bat",
+    "profile_luncher.bat",
+]:
     bpath = os.path.join(base_dir, bname)
     if os.path.exists(bpath):
         shutil.copy2(bpath, os.path.join(out_dir, bname))
@@ -286,6 +248,8 @@ print(r"""
 📋 【他PC配布フォルダ内のファイル構成（超シンプル・たったの4ファイル+_internal）】
    ├── 🚀 ツール起動.bat        ← 他PCではこれをダブルクリックするだけ！
    ├── x_auto_dm_gui.exe       ← アプリ本体 (直接起動も可能)
+   ├── chrome_launcher.exe     ← 初回手動Chromeログイン用EXE
+   ├── chrome_launcher.bat     ← 初回手動Chromeログイン用バッチ
    ├── 03_プロファイル起動_profile_launcher.bat ← プロファイル作成
    ├── profile_launcher.exe    ← プロファイル作成EXE
    ├── アカウント情報.xlsx     ← アカウント設定

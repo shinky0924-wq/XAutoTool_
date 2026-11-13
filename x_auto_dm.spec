@@ -31,6 +31,7 @@ extra_py_files = [
     'main.py',
     'test_single.py',
     'edit_account.py',
+    'chrome_launcher.py',
     'profile_launcher.py',
     'profile_luncher.py',
 ]
@@ -45,6 +46,7 @@ a = Analysis(
         'main',
         'test_single',
         'edit_account',
+        'chrome_launcher',
         'profile_launcher',
         'profile_luncher',
         'browser_controller',
@@ -87,6 +89,52 @@ exe = EXE(
     icon=None
 )
 
+coll_exes = [exe]
+coll_binaries = list(a.binaries)
+coll_zipfiles = list(a.zipfiles)
+coll_datas = list(a.datas)
+
+# chrome_launcher.exe (軽量・正規Chrome手動プロファイル起動EXE)
+if os.path.isfile('chrome_launcher.py'):
+    a_chrome = Analysis(
+        ['chrome_launcher.py'],
+        pathex=[],
+        binaries=[],
+        datas=[],
+        hiddenimports=['winreg'],
+        hookspath=[],
+        hooksconfig={},
+        runtime_hooks=[],
+        excludes=['matplotlib', 'scipy', 'numpy', 'pandas', 'playwright', 'openpyxl', 'tkinter'],
+        win_no_prefer_redirects=False,
+        win_private_assemblies=False,
+        cipher=block_cipher,
+        noarchive=False,
+    )
+    pyz_chrome = PYZ(a_chrome.pure, a_chrome.zipped_data, cipher=block_cipher)
+    exe_chrome = EXE(
+        pyz_chrome,
+        a_chrome.scripts,
+        [],
+        exclude_binaries=True,
+        name='chrome_launcher',
+        debug=False,
+        bootloader_ignore_signals=False,
+        strip=False,
+        upx=True,
+        console=True,
+        disable_windowed_traceback=False,
+        argv_emulation=False,
+        target_arch=None,
+        codesign_identity=None,
+        entitlements_file=None,
+        icon=None
+    )
+    coll_exes.append(exe_chrome)
+    coll_binaries += a_chrome.binaries
+    coll_zipfiles += a_chrome.zipfiles
+    coll_datas += a_chrome.datas
+
 # プロファイルランチャーの単体EXE化 (存在する場合のみ安全に追加)
 prof_entry = None
 if os.path.isfile('profile_launcher.py'):
@@ -95,28 +143,23 @@ elif os.path.isfile('profile_luncher.py'):
     prof_entry = 'profile_luncher.py'
 
 if prof_entry:
-    prof_support_files = ['browser_controller.py', 'config_manager.py', 'db_manager.py']
-    prof_datas = [(f, '.') for f in prof_support_files if os.path.isfile(f)] + pw_datas + xl_datas
+    prof_support_files = ['chrome_launcher.py', 'browser_controller.py', 'config_manager.py', 'db_manager.py']
+    prof_datas = [(f, '.') for f in prof_support_files if os.path.isfile(f)]
     a_prof = Analysis(
         [prof_entry],
         pathex=[],
-        binaries=pw_binaries + xl_binaries,
+        binaries=[],
         datas=prof_datas,
         hiddenimports=[
+            'chrome_launcher',
             'profile_launcher',
             'profile_luncher',
-            'browser_controller',
-            'config_manager',
-            'db_manager',
-            'playwright',
-            'playwright.sync_api',
-            'openpyxl',
-            'sqlite3',
-        ] + pw_hidden + xl_hidden,
+            'winreg',
+        ],
         hookspath=[],
         hooksconfig={},
         runtime_hooks=[],
-        excludes=['matplotlib', 'scipy', 'numpy', 'pandas'],
+        excludes=['matplotlib', 'scipy', 'numpy', 'pandas', 'playwright', 'openpyxl', 'tkinter'],
         win_no_prefer_redirects=False,
         win_private_assemblies=False,
         cipher=block_cipher,
@@ -141,15 +184,10 @@ if prof_entry:
         entitlements_file=None,
         icon=None
     )
-    coll_exes = [exe, exe_prof]
-    coll_binaries = a.binaries + a_prof.binaries
-    coll_zipfiles = a.zipfiles + a_prof.zipfiles
-    coll_datas = a.datas + a_prof.datas
-else:
-    coll_exes = [exe]
-    coll_binaries = a.binaries
-    coll_zipfiles = a.zipfiles
-    coll_datas = a.datas
+    coll_exes.append(exe_prof)
+    coll_binaries += a_prof.binaries
+    coll_zipfiles += a_prof.zipfiles
+    coll_datas += a_prof.datas
 
 coll = COLLECT(
     *coll_exes,

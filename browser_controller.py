@@ -215,11 +215,11 @@ class XBrowserController:
 
         # 1. Google Chrome (PCにインストールされている場合、最も安定・高速・BAN耐性高)
         chrome_paths = [
-            r"C:Program FilesGoogleChromeApplicationchrome.exe",
-            r"C:Program Files (x86)GoogleChromeApplicationchrome.exe",
-            os.path.expandvars(r"%LocalAppData%GoogleChromeApplicationchrome.exe"),
-            os.path.expandvars(r"%ProgramFiles%GoogleChromeApplicationchrome.exe"),
-            os.path.expandvars(r"%ProgramFiles(x86)%GoogleChromeApplicationchrome.exe"),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
         ]
         if any(os.path.isfile(p) for p in chrome_paths):
             if "chrome" not in candidates:
@@ -227,10 +227,10 @@ class XBrowserController:
 
         # 2. Microsoft Edge (Windows 10/11標準搭載。Microsoft署名済みでセキュリティソフトに絶対ブロックされない)
         edge_paths = [
-            r"C:Program Files (x86)MicrosoftEdgeApplicationmsedge.exe",
-            r"C:Program FilesMicrosoftEdgeApplicationmsedge.exe",
-            os.path.expandvars(r"%ProgramFiles(x86)%MicrosoftEdgeApplicationmsedge.exe"),
-            os.path.expandvars(r"%ProgramFiles%MicrosoftEdgeApplicationmsedge.exe"),
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
         ]
         if any(os.path.isfile(p) for p in edge_paths):
             if "msedge" not in candidates:
@@ -282,11 +282,14 @@ class XBrowserController:
                         "user_data_dir": self.user_data_dir,
                         "headless": self.headless,
                         "args": args,
+                        "ignore_default_args": ["--enable-automation"],
                         "viewport": {"width": 1280, "height": 900},
-                        "user_agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+                        "locale": "ja-JP",
                     }
                     if ch:
                         launch_kwargs["channel"] = ch
+                    else:
+                        launch_kwargs["user_agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
                     
                     print(f"🌐 ブラウザ [{ch_label}] を起動試行中...", flush=True)
                     self.context = self.playwright.chromium.launch_persistent_context(**launch_kwargs)
@@ -313,9 +316,22 @@ class XBrowserController:
                     "3. ツール付属の『【修復】ブラウザ起動エラー解消.bat』を実行してブラウザ環境を修復してください。"
                 )
 
-            # storage_state.json が存在する場合はCookieを追加して完全復元
+            # storage_state.json が存在する場合:
+            # 手動Chromeログインで生成された正規の Cookies SQLite DB が新しい場合は上書きしない
             state_file = os.path.join(self.user_data_dir, "storage_state.json")
+            cookie_db_candidates = [
+                os.path.join(self.user_data_dir, "Default", "Network", "Cookies"),
+                os.path.join(self.user_data_dir, "Default", "Cookies"),
+            ]
+            cookie_mtimes = [os.path.getmtime(cp) for cp in cookie_db_candidates if os.path.isfile(cp) and os.path.getsize(cp) > 0]
+            should_restore_state = False
             if os.path.exists(state_file) and os.path.getsize(state_file) > 10:
+                if not cookie_mtimes:
+                    should_restore_state = True
+                elif os.path.getmtime(state_file) > max(cookie_mtimes):
+                    should_restore_state = True
+
+            if should_restore_state:
                 try:
                     import json
                     with open(state_file, "r", encoding="utf-8") as f:
@@ -339,6 +355,7 @@ class XBrowserController:
                     launch_kwargs = {
                         "headless": self.headless,
                         "args": args,
+                        "ignore_default_args": ["--enable-automation"],
                     }
                     if ch:
                         launch_kwargs["channel"] = ch
@@ -352,10 +369,13 @@ class XBrowserController:
             if self.browser is None:
                 raise RuntimeError(f"ブラウザの起動に失敗しました: {last_error}")
 
-            self.context = self.browser.new_context(
-                viewport={"width": 1280, "height": 900},
-                user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-            )
+            ctx_kwargs = {
+                "viewport": {"width": 1280, "height": 900},
+                "locale": "ja-JP",
+            }
+            if not self.active_channel:
+                ctx_kwargs["user_agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+            self.context = self.browser.new_context(**ctx_kwargs)
             self.page = self.context.new_page()
 
         # 2. メインページ生成完了後にのみ、別タブ・ポップアップ抑止リスナーを登録
@@ -1178,15 +1198,15 @@ class XBrowserController:
         # -------------------------------------------------------------
         print(f"🔑 [@{account_id}] ブラウザプロファイルの既存ログイン状態を確認中...")
         try:
-            page.goto("https://x.com/home", timeout=25000, wait_until="domcontentloaded")
-            for _ in range(8):
+            page.goto("https://x.com/home", timeout=30000, wait_until="domcontentloaded")
+            for idx in range(24):
                 time.sleep(0.5)
-                if self._is_logged_in():
+                if self._is_logged_in(allow_url_fallback=(idx >= 6)):
                     print(f"✅ [@{account_id}] プロファイルの既存セッションを確認しました！（ログイン維持 / 再認証不要）")
                     self.save_storage_state()
                     return True
                 cur_url = page.url.lower()
-                if "/login" in cur_url or "/flow/login" in cur_url or "mode=login" in cur_url:
+                if "/login" in cur_url or "/flow/login" in cur_url or "mode=login" in cur_url or "/onboarding" in cur_url:
                     break
         except Exception:
             pass
@@ -1265,55 +1285,60 @@ class XBrowserController:
             except Exception:
                 pass
 
-        print(f"🔑 [@{account_id}] ID・パスワードによる自動フォームログインを開始します...")
-        try:
-            # ログインページへ移動 (既にログイン/オンボーディング画面にいる場合はそのまま利用)
-            cur_url = page.url.lower()
-            if not ("/login" in cur_url or "mode=login" in cur_url or "/i/flow/" in cur_url):
-                page.goto("https://x.com/i/flow/login", timeout=35000, wait_until="domcontentloaded")
-            time.sleep(2.0)
+        if not clean_pass:
+            print(f"⚠️ [@{account_id}] プロファイルに有効なログインセッションがなく、auth_token・パスワードも未設定です。")
+            print(f"💡 【初回登録の方法】『chrome_launcher.exe』（または『chrome_launcher.bat』）を起動し、")
+            print(f"   プロファイル名に「{account_id}」を入力して正規 Google Chrome 上から手動ログインしてください。")
+            print(f"   （一度ログインしてChromeを閉じれば、2回目以降は再ログイン不要で自動稼働します）")
+        else:
+            print(f"🔑 [@{account_id}] ID・パスワードによる自動フォームログインを開始します...")
+            try:
+                # ログインページへ移動 (既にログイン/オンボーディング画面にいる場合はそのまま利用)
+                cur_url = page.url.lower()
+                if not ("/login" in cur_url or "mode=login" in cur_url or "/i/flow/" in cur_url):
+                    page.goto("https://x.com/i/flow/login", timeout=35000, wait_until="domcontentloaded")
+                time.sleep(2.0)
 
-            # ユーザー名 / メールアドレス入力欄を検出 (最大15秒ポーリング)
-            user_input = None
-            for _ in range(30):
-                user_input = self._find_login_input(page, is_password=False)
-                if user_input:
-                    break
-                time.sleep(0.5)
-
-            if user_input:
-                print(f"   📝 ユーザー名/アカウントID ({target_username}) を入力中...")
-                self._safe_fill_input(user_input, target_username)
-                time.sleep(0.6)
-
-                print("   👉 メールアドレスまたはユーザー名の下にある「続ける / 次へ」ボタンをクリックします...")
-                self._click_next_or_submit(page, is_login_submit=False, anchor_locator=user_input)
-                time.sleep(2.5)
-            else:
-                print("   ℹ️ ユーザー名入力欄は既に通過しているか、直接パスワード入力画面です。")
-
-            # 追加の身元確認要求 (電話番号/メールアドレス/アカウント名) が出た場合の自動入力
-            time.sleep(1.0)
-            pass_check = self._find_login_input(page, is_password=True)
-            if not pass_check:
-                challenge_input = self._find_login_input(page, is_password=False)
-                if challenge_input:
-                    print(f"   🔍 追加の身元確認画面を検出。アカウントID (@{account_id}) を自動入力します...")
-                    self._safe_fill_input(challenge_input, target_username)
+                # ユーザー名 / メールアドレス入力欄を検出 (最大15秒ポーリング)
+                user_input = None
+                for _ in range(30):
+                    user_input = self._find_login_input(page, is_password=False)
+                    if user_input:
+                        break
                     time.sleep(0.5)
-                    self._click_next_or_submit(page, is_login_submit=False, anchor_locator=challenge_input)
+
+                if user_input:
+                    print(f"   📝 ユーザー名/アカウントID ({target_username}) を入力中...")
+                    self._safe_fill_input(user_input, target_username)
+                    time.sleep(0.6)
+
+                    print("   👉 メールアドレスまたはユーザー名の下にある「続ける / 次へ」ボタンをクリックします...")
+                    self._click_next_or_submit(page, is_login_submit=False, anchor_locator=user_input)
                     time.sleep(2.5)
+                else:
+                    print("   ℹ️ ユーザー名入力欄は既に通過しているか、直接パスワード入力画面です。")
 
-            # パスワード入力欄を検出 (最大15秒ポーリング)
-            pass_input = None
-            for _ in range(30):
-                pass_input = self._find_login_input(page, is_password=True)
+                # 追加の身元確認要求 (電話番号/メールアドレス/アカウント名) が出た場合の自動入力
+                time.sleep(1.0)
+                pass_check = self._find_login_input(page, is_password=True)
+                if not pass_check:
+                    challenge_input = self._find_login_input(page, is_password=False)
+                    if challenge_input:
+                        print(f"   🔍 追加の身元確認画面を検出。アカウントID (@{account_id}) を自動入力します...")
+                        self._safe_fill_input(challenge_input, target_username)
+                        time.sleep(0.5)
+                        self._click_next_or_submit(page, is_login_submit=False, anchor_locator=challenge_input)
+                        time.sleep(2.5)
+
+                # パスワード入力欄を検出 (最大15秒ポーリング)
+                pass_input = None
+                for _ in range(30):
+                    pass_input = self._find_login_input(page, is_password=True)
+                    if pass_input:
+                        break
+                    time.sleep(0.5)
+
                 if pass_input:
-                    break
-                time.sleep(0.5)
-
-            if pass_input:
-                if clean_pass:
                     print(f"   🔑 パスワードを自動入力中...")
                     self._safe_fill_input(pass_input, clean_pass)
                     time.sleep(0.6)
@@ -1322,25 +1347,23 @@ class XBrowserController:
                     self._click_next_or_submit(page, is_login_submit=True, anchor_locator=pass_input)
                     time.sleep(3.0)
                 else:
-                    print(f"   ⚠️ アカウント情報.xlsx にパスワードが未設定です。ブラウザ画面でパスワードを手動入力してください...")
-            else:
-                print("   ℹ️ パスワード入力欄は検出されませんでした（既にログイン完了または追加認証待ち）。")
+                    print("   ℹ️ パスワード入力欄は検出されませんでした（既にログイン完了または追加認証待ち）。")
 
-            # 2FA / パスコード / 認証コードチェック
-            if self.is_passcode_prompt_active():
-                self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="ログイン認証コード")
-                time.sleep(2.5)
+                # 2FA / パスコード / 認証コードチェック
+                if self.is_passcode_prompt_active():
+                    self.handle_passcode_prompt(passcode=passcode, account_id=account_id, context_label="ログイン認証コード")
+                    time.sleep(2.5)
 
-            # ログイン確認ポーリング (最大15秒)
-            for _ in range(15):
-                if self._is_logged_in():
-                    print(f"🎉 [@{account_id}] ID・パスワードでのログインが成功しました！セッション情報をプロファイルに永続保存します。")
-                    self.save_storage_state()
-                    return True
-                time.sleep(1.0)
+                # ログイン確認ポーリング (最大15秒)
+                for _ in range(15):
+                    if self._is_logged_in():
+                        print(f"🎉 [@{account_id}] ID・パスワードでのログインが成功しました！セッション情報をプロファイルに永続保存します。")
+                        self.save_storage_state()
+                        return True
+                    time.sleep(1.0)
 
-        except Exception as e:
-            print(f"   ⚠️ ID・パスワード フォームログイン試行エラー: {e}")
+            except Exception as e:
+                print(f"   ⚠️ ID・パスワード フォームログイン試行エラー: {e}")
 
         # -------------------------------------------------------------
         # 4. 手動ログイン待ち受け救済 (ブラウザ画面上で手動ログインを待機)
@@ -1359,13 +1382,14 @@ class XBrowserController:
         print()
         print(f"❌ [@{account_id}] ログイン状態が確認できませんでした。")
         print("💡 【おすすめの解決方法】")
-        print("   1. 『アカウント情報.xlsx』の「アカウントPW」列に正しいパスワードが記入されているか確認してください。")
-        print(f"   2. または付属の『profile_launcher.bat』を実行し、プロファイル名に「{account_id}」を入力してブラウザ上で1度手動ログインを行ってください。")
-        print("      （一度ログインすればブラウザプロファイルに永続保存され、次回以降パスワード入力も不要になります）")
+        print(f"   1. 初回アカウント登録は『chrome_launcher.exe』（または『chrome_launcher.bat』）を起動し、")
+        print(f"      プロファイル名に「{account_id}」を入力して正規のGoogle Chromeで手動ログインしてください。")
+        print("      （一度ログインしてChromeを閉じれば、2回目以降は再ログイン不要で自動稼働します）")
+        print("   2. もし自動ログインを使う場合は『アカウント情報.xlsx』に auth_token または パスワード を記入してください。")
         print()
         return False
 
-    def _is_logged_in(self) -> bool:
+    def _is_logged_in(self, allow_url_fallback: bool = True) -> bool:
         """ログイン状態の厳密判定 (偽陽性・偽陰性を完全防止)"""
         try:
             page = self.ensure_page()
@@ -1391,8 +1415,8 @@ class XBrowserController:
             except Exception:
                 pass
 
-            # ホームURLかつリダイレクトされていない場合
-            if "x.com/home" in url or "twitter.com/home" in url:
+            # ホームURLかつリダイレクトされていない場合 (DOMロード猶予後のみ許可)
+            if allow_url_fallback and ("x.com/home" in url or "twitter.com/home" in url):
                 return True
         except:
             pass

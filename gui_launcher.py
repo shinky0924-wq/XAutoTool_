@@ -316,7 +316,7 @@ class AppLauncherGUI:
 
         self.btn_profile_launcher = tk.Button(
             row2,
-            text="👤 プロファイル起動 (profile_launcher)",
+            text="👤 Chromeプロファイル起動 (chrome_launcher)",
             font=("Meiryo", 8, "bold"),
             bg="#0284C7",
             fg="white",
@@ -413,7 +413,7 @@ class AppLauncherGUI:
         tk.Label(top_bar, text="「アカウント情報.xlsx」から自動読み込みされたアカウント一覧", font=("Meiryo", 9, "bold")).pack(side=tk.LEFT)
         ttk.Button(top_bar, text="📗 Excelを開く", command=lambda: self._open_file("アカウント情報.xlsx")).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="🔄 再読込", command=self.reload_all_configs).pack(side=tk.RIGHT, padx=3)
-        ttk.Button(top_bar, text="👤 プロファイル起動 (profile_launcher)", command=self._start_profile_launcher_process).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(top_bar, text="👤 Chromeプロファイル起動 (chrome_launcher)", command=self._start_profile_launcher_process).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="🔑 DMパスコード設定 (初回保存)", command=self._set_passcode_dialog).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="🌐 アカウント編集ブラウザ起動 (ウィンドウ保持)", command=self._start_edit_browser_process).pack(side=tk.RIGHT, padx=3)
 
@@ -1161,24 +1161,31 @@ class AppLauncherGUI:
         self._run_script_in_thread(script, "【アカウント編集用ブラウザ起動】")
 
     def _start_profile_launcher_process(self):
-        """プロファイル生成・起動ツール (profile_launcher / profile_luncher) を実行"""
-        script = os.path.join(self.base_dir, "profile_launcher.py")
-        if not os.path.exists(script):
-            script = os.path.join(self.base_dir, "profile_luncher.py")
-        bat_script = os.path.join(self.base_dir, "profile_launcher.bat")
-        if not os.path.exists(bat_script):
-            bat_script = os.path.join(self.base_dir, "profile_luncher.bat")
+        """正規 Chrome カスタムプロファイル起動ツール (chrome_launcher / profile_launcher) を実行"""
+        exe_launcher = os.path.join(self.base_dir, "chrome_launcher.exe")
+        script = ""
+        for cand in ("chrome_launcher.py", "profile_launcher.py", "profile_luncher.py"):
+            p = os.path.join(self.base_dir, cand)
+            if os.path.exists(p):
+                script = p
+                break
+        bat_script = ""
+        for cand in ("chrome_launcher.bat", "03_Chromeプロファイル起動_chrome_launcher.bat", "profile_launcher.bat", "profile_luncher.bat"):
+            p = os.path.join(self.base_dir, cand)
+            if os.path.exists(p):
+                bat_script = p
+                break
 
         default_name = ""
         try:
-            if hasattr(self, "accounts") and self.accounts:
-                default_name = normalize_screen_name(str(self.accounts[0].get("アカウントID", "")))
+            if hasattr(self, "accounts_data") and self.accounts_data:
+                default_name = normalize_screen_name(str(self.accounts_data[0].get("アカウントID", "")))
         except Exception:
             pass
 
         prof_name = simpledialog.askstring(
-            "Chrome カスタムプロファイル起動 (profile_launcher)",
-            "作成・使用するプロファイル名を入力してください:\n(例: @your_account / 空白のまま起動すると黒いコンソール画面で入力可能)",
+            "Chrome カスタムプロファイル起動 (chrome_launcher)",
+            "作成・使用するプロファイル名を入力してください:\n(例: wqwq1320 / 空白のまま起動すると黒いコンソール画面で入力可能)",
             initialvalue=default_name,
             parent=self.root
         )
@@ -1186,6 +1193,13 @@ class AppLauncherGUI:
             return
 
         prof_name = prof_name.strip()
+        if os.path.exists(exe_launcher):
+            if prof_name:
+                subprocess.Popen(f'start cmd /k ""{exe_launcher}" "{prof_name}""', shell=True, cwd=self.base_dir)
+            else:
+                subprocess.Popen(f'start cmd /k "{exe_launcher}"', shell=True, cwd=self.base_dir)
+            return
+
         if getattr(sys, 'frozen', False):
             exe_path = sys.executable
             if prof_name:
@@ -1195,19 +1209,19 @@ class AppLauncherGUI:
             return
 
         if prof_name:
-            if os.path.exists(bat_script):
+            if bat_script:
                 subprocess.Popen(f'start cmd /k ""{bat_script}" "{prof_name}""', shell=True, cwd=self.base_dir)
-            elif os.path.exists(script):
+            elif script:
                 subprocess.Popen(f'start cmd /k python "{script}" "{prof_name}"', shell=True, cwd=self.base_dir)
             else:
-                messagebox.showerror("エラー", "profile_launcher.py または profile_launcher.bat が見つかりません。")
+                messagebox.showerror("エラー", "chrome_launcher.py または chrome_launcher.bat が見つかりません。")
         else:
-            if os.path.exists(bat_script):
+            if bat_script:
                 subprocess.Popen(f'start cmd /k "{bat_script}"', shell=True, cwd=self.base_dir)
-            elif os.path.exists(script):
+            elif script:
                 subprocess.Popen(f'start cmd /k python "{script}"', shell=True, cwd=self.base_dir)
             else:
-                messagebox.showerror("エラー", "profile_launcher が見つかりません。")
+                messagebox.showerror("エラー", "chrome_launcher が見つかりません。")
 
     def _kill_process_tree(self, proc):
         """プロセスおよびその配下の全子プロセス（Playwright / Chrome / Node等）を根こそぎ完全終了"""
@@ -1351,12 +1365,15 @@ if __name__ == "__main__":
         edit_account.main()
         sys.exit(0)
     elif len(sys.argv) > 1 and sys.argv[1] == "--cli-profile":
-        import profile_launcher
+        try:
+            import chrome_launcher as _prof_mod
+        except ImportError:
+            import profile_launcher as _prof_mod
         if len(sys.argv) > 2:
             sys.argv = [sys.argv[0]] + sys.argv[2:]
         else:
             sys.argv = [sys.argv[0]]
-        profile_launcher.main()
+        _prof_mod.main()
         sys.exit(0)
     else:
         try:

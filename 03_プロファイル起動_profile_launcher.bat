@@ -4,6 +4,11 @@ setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 title Chrome カスタムプロファイル起動ツール
 
+if exist "chrome_launcher.exe" (
+    chrome_launcher.exe %*
+    pause
+    exit /b 0
+)
 if exist "profile_launcher.exe" (
     profile_launcher.exe %*
     pause
@@ -11,11 +16,6 @@ if exist "profile_launcher.exe" (
 )
 if exist "profile_luncher.exe" (
     profile_luncher.exe %*
-    pause
-    exit /b 0
-)
-if exist "x_auto_dm_gui.exe" (
-    x_auto_dm_gui.exe --cli-profile %*
     pause
     exit /b 0
 )
@@ -32,19 +32,34 @@ if not defined PY (
     if exist "C:\Python311\python.exe" set "PY=C:\Python311\python.exe"
 )
 
-if not defined PY (
-    echo ========================================================
-    echo  [ERROR] Python が見つかりませんでした。
-    echo ========================================================
-    pause
-    exit /b 1
+if defined PY (
+    set PYTHONIOENCODING=utf-8
+    set PYTHONUTF8=1
+    if exist "chrome_launcher.py" (
+        "%PY%" chrome_launcher.py %*
+        pause
+        exit /b 0
+    )
+    if exist "profile_launcher.py" (
+        "%PY%" profile_launcher.py %*
+        pause
+        exit /b 0
+    )
+    if exist "profile_luncher.py" (
+        "%PY%" profile_luncher.py %*
+        pause
+        exit /b 0
+    )
 )
 
-set PYTHONIOENCODING=utf-8
-set PYTHONUTF8=1
-if exist "profile_launcher.py" (
-    "%PY%" profile_launcher.py %*
-) else if exist "profile_luncher.py" (
-    "%PY%" profile_luncher.py %*
+if exist "x_auto_dm_gui.exe" (
+    x_auto_dm_gui.exe --cli-profile %*
+    pause
+    exit /b 0
 )
+
+echo ========================================================
+echo  [ERROR] chrome_launcher / Python が見つかりませんでした。
+echo ========================================================
 pause
+exit /b 1
