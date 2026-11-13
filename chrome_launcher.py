@@ -185,11 +185,9 @@ def launch_chrome_profile(profile_name: str):
     print(f"🌐 正規ブラウザ [{browser_label}] をカスタムプロファイルで起動します...")
     print(f"   実行パス: {chrome_exe}")
 
-    target_url = "https://x.com/i/flow/login"
     cmd = [
         chrome_exe,
         f"--user-data-dir={profile_dir}",
-        target_url,
     ]
 
     try:
@@ -201,7 +199,7 @@ def launch_chrome_profile(profile_name: str):
         print("=" * 64)
         print("  【初回登録の手順】")
         print("  1. 「Chrome にログイン」画面が出たら「ログアウト状態を保持」（またはログイン）を選択")
-        print("  2. 開いた X (Twitter) のページで、手動で【ID・パスワード・2FA】を入力してログイン")
+        print("  2. 起動した Chrome で、ご自身で検索等から X (Twitter) へアクセスし、手動でログイン")
         print("  3. X のホーム画面 (タイムライン) が表示されることを確認")
         print("  4. 確認できたら、ブラウザ右上の【✕ ボタン】で Chrome を完全に閉じてください")
         print("")
