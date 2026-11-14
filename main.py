@@ -33,7 +33,8 @@ from db_manager import (
     get_log_dir,
     get_account_log_path,
     AccountLogger,
-    sanitize_filename
+    sanitize_filename,
+    normalize_tweet_url
 )
 from browser_controller import XBrowserController
 
@@ -648,8 +649,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     parsed.append(("HOME_FOR_YOU", f"HOMEおすすめ ({part})"))
                 elif any(k in p_clean for k in ["フォロー", "follow"]) and "相互" not in p_clean:
                     parsed.append(("URL_FOLLOW", f"URLリスト（フォロー） ({part})"))
-                elif any(k in p_clean for k in ["話題", "top", "人気"]):
-                    parsed.append(("SEARCH_TOP", f"検索話題のポスト検索 ({part})"))
+                elif any(k in p_clean for k in ["話題の検索", "話題を検索"]) or p_clean in ["話題", "top", "人気", "foryou", "for_you"]:
+                    parsed.append(("EXPLORE_TOPICS", f"話題の検索 ({part})"))
+                elif "検索話題" in p_clean or (("検索" in p_clean or "キーワード" in p_clean) and any(k in p_clean for k in ["話題", "top", "人気", "おすすめ"])):
+                    parsed.append(("SEARCH_TOP", f"検索話題 ({part})"))
                 elif any(k in p_clean for k in ["ニュース", "news"]):
                     parsed.append(("NEWS", f"ニュース ({part})"))
                 elif any(k in p_clean for k in ["トレンド", "trend"]):
@@ -811,11 +814,17 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         is_rep = False
                     config_mgr.append_discovered_target(user, source_label, target_path_override=acc_target_path, tweet_url=t_url, display_name=d_name)
                     clean_u = normalize_screen_name(user)
-                    if clean_u and not any(t.get("アカウント名") == clean_u for t in dest_list):
+                    norm_t_url = normalize_tweet_url(t_url) if t_url else ""
+                    eff_t_url = norm_t_url or t_url
+                    if norm_t_url:
+                        is_dup_in_list = any(normalize_tweet_url(t.get("ツイートURL") or "").lower() == norm_t_url.lower() for t in dest_list)
+                    else:
+                        is_dup_in_list = any(t.get("アカウント名", "").lower() == clean_u.lower() and not t.get("ツイートURL") for t in dest_list)
+                    if clean_u and not is_dup_in_list:
                         dest_list.append({
                             "アカウント名": clean_u,
-                            "ターゲットURL": t_url if t_url else f"https://x.com/{clean_u}",
-                            "ツイートURL": t_url,
+                            "ターゲットURL": eff_t_url if eff_t_url else f"https://x.com/{clean_u}",
+                            "ツイートURL": eff_t_url,
                             "ツイート本文": t_text,
                             "親ツイート本文": p_text,
                             "is_reply": is_rep,
@@ -834,19 +843,25 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 collected = []
 
                 if m_type in ["SEARCH_LATEST", "SEARCH_TOP"]:
-                    stype_override = "おすすめ" if m_type == "SEARCH_TOP" else "最新"
+                    stype_override = "話題" if m_type == "SEARCH_TOP" else "最新"
                     if acc_search_keywords:
                         log(f"🔍 [{m_label}] ターゲット収集開始 (登録キーワード: {len(acc_search_keywords)}件 / 上限: {target_read_limit}件)...")
                         for kw_item in acc_search_keywords:
                             kw = kw_item.get("keyword")
-                            found = browser_ctrl.collect_targets_from_search(kw, search_type=stype_override, scroll_limit=scroll_limit, max_targets=target_read_limit)
+                            stype = "話題" if m_type == "SEARCH_TOP" else kw_item.get("search_type", stype_override)
+                            found = browser_ctrl.collect_targets_from_search(kw, search_type=stype, scroll_limit=scroll_limit, max_targets=target_read_limit)
                             append_collected_items(found, f"{m_label}:{kw}", collected)
                             if target_read_limit > 0 and len(collected) >= target_read_limit:
                                 break
                     else:
-                        log(f"   ℹ️ [{m_label}] 「検索キーワード」シートにキーワード未登録のため、標準「相互フォロー」で探索します。")
+                        log(f"   ℹ️ [{m_label}] 「検索キーワード」シートにキーワード未登録のため、「相互フォロー」で探索します。")
                         found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type=stype_override, scroll_limit=scroll_limit, max_targets=target_read_limit)
                         append_collected_items(found, f"{m_label}:相互フォロー", collected)
+
+                elif m_type == "EXPLORE_TOPICS":
+                    log(f"🔥 [話題の検索] X探索「話題を検索」タブからランダムにワードを選び、話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
+                    found = browser_ctrl.collect_targets_from_explore(tab_type="話題を検索", scroll_limit=scroll_limit, max_targets=target_read_limit)
+                    append_collected_items(found, "話題の検索", collected)
 
                 elif m_type == "HOME_FOR_YOU":
                     log(f"🏠 [HOMEおすすめ] タイムラインからターゲット収集開始 (上限: {target_read_limit}件)...")
@@ -881,12 +896,12 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         log(f"   ℹ️ [URLリスト（フォロー）] 「URLリスト_フォロー」シートに対象URLが未登録のためスキップします。")
 
                 elif m_type == "NEWS":
-                    log(f"📰 [ニュース] 探索タブからターゲット収集開始 (上限: {target_read_limit}件)...")
+                    log(f"📰 [ニュース] 探索タブからランダムにワードを選び、話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
                     found = browser_ctrl.collect_targets_from_explore(tab_type="ニュース", scroll_limit=scroll_limit, max_targets=target_read_limit)
                     append_collected_items(found, "ニュース", collected)
 
                 elif m_type == "TRENDS":
-                    log(f"📈 [トレンド] 探索タブからターゲット収集開始 (上限: {target_read_limit}件)...")
+                    log(f"📈 [トレンド] 探索タブからランダムにワードを選び、話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
                     found = browser_ctrl.collect_targets_from_explore(tab_type="トレンド", scroll_limit=scroll_limit, max_targets=target_read_limit)
                     append_collected_items(found, "トレンド", collected)
 
@@ -1000,6 +1015,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 raw_target_url = str(target_item.get("ターゲットURL") or target_item.get("url") or "").strip()
                 if not target_tweet_url and "/status/" in raw_target_url:
                     target_tweet_url = raw_target_url
+                target_tweet_url = normalize_tweet_url(target_tweet_url) or target_tweet_url
 
                 raw_acc_entry = str(target_item.get("アカウント名") or "").strip()
                 excel_disp = str(target_item.get("表示名") or target_item.get("お名前") or target_item.get("名前") or target_item.get("display_name") or "").strip()
@@ -1030,10 +1046,17 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     "quote_ai": "QUOTE",
                 }
                 db_action_type = db_action_map.get(act_key, act_key.upper())
+                is_url_scoped_action = db_action_type in ("REPLY", "QUOTE", "LIKE")
 
-                if db_mgr.is_already_sent(target_screen_name, action_type=db_action_type):
-                    log(f"   ⏩ [{db_action_type}] @{target_screen_name} は過去に実行済みのためスキップ")
-                    return False, "ALREADY_SENT"
+                if is_url_scoped_action:
+                    if target_tweet_url and "/status/" in target_tweet_url:
+                        if db_mgr.is_already_sent(target_screen_name, action_type=db_action_type, target_url=target_tweet_url):
+                            log(f"   ⏩ [{db_action_type}] 取得ポスト ({target_tweet_url}) は過去に実行済みのためスキップ")
+                            return False, "ALREADY_SENT"
+                else:
+                    if db_mgr.is_already_sent(target_screen_name, action_type=db_action_type):
+                        log(f"   ⏩ [{db_action_type}] @{target_screen_name} は過去に実行済みのためスキップ")
+                        return False, "ALREADY_SENT"
 
                 log("")
                 if target_tweet_url:
@@ -1043,16 +1066,39 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 browser_ctrl.ensure_page()
 
+                # ユーザー名のみ登録（ツイートURL未指定）の場合、最新ポストURLを取得してURL単位DBで重複判定する
+                if is_url_scoped_action and (not target_tweet_url or "/status/" not in target_tweet_url):
+                    try:
+                        fetched_u, fetched_txt = browser_ctrl.get_latest_tweet_info(target_screen_name)
+                        if fetched_u:
+                            target_tweet_url = normalize_tweet_url(fetched_u) or fetched_u
+                            if fetched_txt and not target_item.get("ツイート本文"):
+                                target_item["ツイート本文"] = fetched_txt
+                            if db_mgr.is_already_sent(target_screen_name, action_type=db_action_type, target_url=target_tweet_url):
+                                log(f"   ⏩ [{db_action_type}] @{target_screen_name} の最新ポスト ({target_tweet_url}) は過去に実行済みのためスキップ")
+                                return False, "ALREADY_SENT"
+                    except Exception:
+                        pass
+
                 def run_paired_like_and_follow():
                     if do_like:
                         try:
-                            if db_mgr.is_already_sent(target_screen_name, action_type="LIKE"):
-                                log(f"   ⏩ [連動いいね] @{target_screen_name} は過去にいいね済みのためスキップ")
+                            like_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
+                            if not like_url or "/status/" not in like_url:
+                                try:
+                                    f_like_u, _ = browser_ctrl.get_latest_tweet_info(target_screen_name)
+                                    if f_like_u:
+                                        like_url = normalize_tweet_url(f_like_u) or f_like_u
+                                except Exception:
+                                    pass
+                            if like_url and "/status/" in like_url and db_mgr.is_already_sent(target_screen_name, action_type="LIKE", target_url=like_url):
+                                log(f"   ⏩ [連動いいね] 対象ポスト ({like_url}) は過去にいいね済みのためスキップ")
                             else:
                                 check_pause_state(f"連動いいね @{target_screen_name} 実行前")
-                                l_st, l_det = browser_ctrl.like_recent_post(target_screen_name, tweet_url=target_tweet_url)
+                                l_st, l_det = browser_ctrl.like_recent_post(target_screen_name, tweet_url=like_url)
                                 log(f"   ❤️ [連動いいね結果] {l_st} ({l_det})")
-                                db_mgr.record_sent(target_screen_name, account_id, "LIKE", l_st, l_det)
+                                eff_like_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or like_url) or like_url
+                                db_mgr.record_sent(target_screen_name, account_id, "LIKE", l_st, l_det, target_url=eff_like_url)
                         except Exception as l_err:
                             log(f"   ⚠️ [連動いいね通知] @{target_screen_name} のいいね実行中にエラー: {l_err}")
                     if do_follow:
@@ -1072,7 +1118,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         st, det = browser_ctrl.follow_user(target_screen_name)
                         log(f"   👤 [フォロー結果] {st} ({det})")
                         get_target_name()
-                        db_mgr.record_sent(target_screen_name, account_id, "FOLLOW", st, det)
+                        db_mgr.record_sent(target_screen_name, account_id, "FOLLOW", st, det, target_url=target_tweet_url)
                         status_label = "フォロー済" if st in ["SUCCESS", "ALREADY_FOLLOWING"] else f"フォロー:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st in ["SUCCESS", "ALREADY_FOLLOWING"]:
@@ -1084,7 +1130,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         st, det = browser_ctrl.like_recent_post(target_screen_name, tweet_url=target_tweet_url)
                         log(f"   ❤️ [いいね結果] {st} ({det})")
                         get_target_name()
-                        db_mgr.record_sent(target_screen_name, account_id, "LIKE", st, det)
+                        eff_like_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
+                        db_mgr.record_sent(target_screen_name, account_id, "LIKE", st, det, target_url=eff_like_url)
                         status_label = "いいね済" if st in ["SUCCESS", "ALREADY_LIKED"] else f"いいね:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st in ["SUCCESS", "ALREADY_LIKED"]:
@@ -1103,7 +1150,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         log(f"   💬 [リプライ送信中] 「{preview_log[:35]}...」")
                         st, det = browser_ctrl.send_reply(target_screen_name, rep_msg, tweet_url=target_tweet_url)
                         log(f"   💬 [リプライ結果] {st} ({det})")
-                        db_mgr.record_sent(target_screen_name, account_id, "REPLY", st, rep_msg[:40])
+                        eff_rep_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
+                        if eff_rep_url:
+                            target_tweet_url = eff_rep_url
+                        db_mgr.record_sent(target_screen_name, account_id, "REPLY", st, rep_msg[:40], target_url=eff_rep_url)
                         status_label = "リプライ完了" if st == "SUCCESS" else f"リプライ:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st == "SUCCESS":
@@ -1131,7 +1181,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             log(f"      🔑 登録済みDMパスコード (**** {len(effective_pass)}桁) を適用して暗号化解除・送信を実行します")
                         st, det = browser_ctrl.send_direct_message(target_screen_name, dm_msg, passcode=effective_pass)
                         log(f"   ✉️ [DM結果] {st} ({det})")
-                        db_mgr.record_sent(target_screen_name, account_id, "DM", st, dm_msg[:40])
+                        db_mgr.record_sent(target_screen_name, account_id, "DM", st, dm_msg[:40], target_url=target_tweet_url)
 
                         if st == "SUCCESS":
                             config_mgr.update_target_status(target_screen_name, "DM送信完了", target_path_override=acc_target_path)
@@ -1160,7 +1210,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         log(f"   🔁 [引用RT実行中] 「{preview_log[:35]}...」")
                         st, det = browser_ctrl.quote_tweet(target_screen_name, q_msg, tweet_url=target_tweet_url)
                         log(f"   🔁 [引用RT結果] {st} ({det})")
-                        db_mgr.record_sent(target_screen_name, account_id, "QUOTE", st, q_msg[:40])
+                        eff_quote_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
+                        if eff_quote_url:
+                            target_tweet_url = eff_quote_url
+                        db_mgr.record_sent(target_screen_name, account_id, "QUOTE", st, q_msg[:40], target_url=eff_quote_url)
                         status_label = "引用RT完了" if st == "SUCCESS" else f"引用RT:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st == "SUCCESS":

@@ -534,25 +534,46 @@ class AppLauncherGUI:
 
         tk.Label(top_bar, text="💾 送信履歴 (dbフォルダ/アカウント名.DB)", font=("Meiryo", 9, "bold")).pack(side=tk.LEFT)
         
-        tk.Label(top_bar, text="表示DB:", font=("Meiryo", 9)).pack(side=tk.LEFT, padx=(12, 2))
-        self.cmb_db_account = ttk.Combobox(top_bar, state="readonly", width=22)
+        tk.Label(top_bar, text="表示DB:", font=("Meiryo", 9)).pack(side=tk.LEFT, padx=(10, 2))
+        self.cmb_db_account = ttk.Combobox(top_bar, state="readonly", width=20)
         self.cmb_db_account.pack(side=tk.LEFT, padx=2)
         self.cmb_db_account.bind("<<ComboboxSelected>>", lambda e: self._reload_db())
+
+        tk.Label(top_bar, text="アクション:", font=("Meiryo", 9)).pack(side=tk.LEFT, padx=(8, 2))
+        self.cmb_db_action = ttk.Combobox(
+            top_bar,
+            state="readonly",
+            width=20,
+            values=[
+                "すべて",
+                "DM (ユーザー単位)",
+                "フォロー (ユーザー単位)",
+                "リプライ (URL単位)",
+                "引用RT (URL単位)",
+                "いいね (URL単位)",
+            ],
+        )
+        self.cmb_db_action.set("すべて")
+        self.cmb_db_action.pack(side=tk.LEFT, padx=2)
+        self.cmb_db_action.bind("<<ComboboxSelected>>", lambda e: self._reload_db())
 
         ttk.Button(top_bar, text="🔄 再読込", command=self._reload_db).pack(side=tk.LEFT, padx=3)
         ttk.Button(top_bar, text="📁 dbフォルダを開く", command=self._open_db_folder).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="📁 logフォルダを開く", command=self._open_log_folder).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="🗑️ 選択履歴を削除", command=self._delete_selected_db).pack(side=tk.RIGHT, padx=3)
 
-        cols_db = ("ID", "ターゲット", "使用アカウント", "アクション", "ステータス", "送信日時", "文面抜粋")
+        cols_db = ("ID", "アクション", "ターゲット", "判定キー (ユーザー / 取得URL)", "使用アカウント", "ステータス", "送信日時", "文面抜粋")
         self.tree_db = ttk.Treeview(self.tab_db, columns=cols_db, show="headings")
         for c in cols_db:
             self.tree_db.heading(c, text=c)
             self.tree_db.column(c, width=90, anchor=tk.CENTER)
-        self.tree_db.column("ID", width=50)
-        self.tree_db.column("ターゲット", width=130, anchor=tk.W)
-        self.tree_db.column("文面抜粋", width=260, anchor=tk.W)
+        self.tree_db.column("ID", width=45)
+        self.tree_db.column("アクション", width=80)
+        self.tree_db.column("ターゲット", width=120, anchor=tk.W)
+        self.tree_db.column("判定キー (ユーザー / 取得URL)", width=250, anchor=tk.W)
+        self.tree_db.column("文面抜粋", width=220, anchor=tk.W)
 
+        self._db_row_meta = {}
         self.tree_db.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
     def _build_tools_tab(self):
@@ -918,6 +939,7 @@ class AppLauncherGUI:
     def _reload_db(self):
         for item in self.tree_db.get_children():
             self.tree_db.delete(item)
+        self._db_row_meta = {}
 
         # dbフォルダ内の全DB一覧を取得してコンボボックスを更新
         db_dir = get_db_dir(self.base_dir)
@@ -939,6 +961,17 @@ class AppLauncherGUI:
             selected = combo_values[0]
             self.cmb_db_account.set(selected)
 
+        action_label = self.cmb_db_action.get() if hasattr(self, "cmb_db_action") else "すべて"
+        action_filter_map = {
+            "すべて": "ALL",
+            "DM (ユーザー単位)": "DM",
+            "フォロー (ユーザー単位)": "FOLLOW",
+            "リプライ (URL単位)": "REPLY",
+            "引用RT (URL単位)": "QUOTE",
+            "いいね (URL単位)": "LIKE",
+        }
+        action_filter = action_filter_map.get(action_label, "ALL")
+
         # 読み込むDBファイルのリスト
         targets_to_read = []
         if selected == "全アカウント (統合表示)":
@@ -952,52 +985,91 @@ class AppLauncherGUI:
             if not os.path.exists(path):
                 continue
             try:
-                conn = sqlite3.connect(path)
-                cursor = conn.cursor()
-                cursor.execute("SELECT id, target_screen_name, account_id_used, action_type, status, created_at, snippet FROM sent_history ORDER BY id DESC LIMIT 200")
-                rows = cursor.fetchall()
-                conn.close()
-                for r in rows:
-                    all_rows.append(r)
+                if DatabaseManager is not None:
+                    mgr = DatabaseManager(path)
+                    rows = mgr.fetch_history(action_filter=action_filter, limit=250)
+                    all_rows.extend(rows)
+                else:
+                    conn = sqlite3.connect(path)
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, target_screen_name, account_id_used, action_type, status, created_at, snippet FROM sent_history ORDER BY id DESC LIMIT 200")
+                    for r in cursor.fetchall():
+                        all_rows.append({
+                            "id": r[0],
+                            "target_key": r[1],
+                            "target_screen_name": r[1],
+                            "target_url": "",
+                            "account_id_used": r[2],
+                            "action_type": r[3],
+                            "status": r[4],
+                            "created_at": r[5],
+                            "snippet": r[6],
+                            "db_path": path,
+                        })
+                    conn.close()
             except Exception as e:
                 self.log(f"⚠️ DB読込警告 ({os.path.basename(path)}): {e}")
 
-        # 日時降順でソートして表示
+        all_rows.sort(key=lambda x: (str(x.get("created_at", "")), int(x.get("id", 0))), reverse=True)
         for r in all_rows[:300]:
-            self.tree_db.insert("", tk.END, values=(r[0], r[1], r[2], r[3], r[4], r[5], r[6]))
+            act_disp = r.get("action_type", "")
+            tgt_name = r.get("target_screen_name", "")
+            tgt_disp = f"@{tgt_name.lstrip('@')}" if tgt_name else ""
+            key_disp = r.get("target_url") or r.get("target_key") or tgt_disp
+            if act_disp in ("DM", "FOLLOW"):
+                key_disp = tgt_disp or r.get("target_key", "")
+            iid = self.tree_db.insert("", tk.END, values=(
+                r.get("id", ""),
+                act_disp,
+                tgt_disp,
+                key_disp,
+                r.get("account_id_used", ""),
+                r.get("status", ""),
+                r.get("created_at", ""),
+                r.get("snippet", ""),
+            ))
+            self._db_row_meta[iid] = (r.get("db_path", ""), act_disp, r.get("id"))
 
     def _delete_selected_db(self):
         selected = self.tree_db.selection()
         if not selected:
             messagebox.showinfo("案内", "削除したい履歴を選択してください。")
             return
-        rec_id = self.tree_db.item(selected[0])["values"][0]
-        db_dir = get_db_dir(self.base_dir)
-        selected_file = self.cmb_db_account.get()
-        if selected_file and selected_file != "全アカウント (統合表示)":
-            db_path = os.path.join(db_dir, selected_file)
-            targets_to_del = [db_path]
-        else:
-            targets_to_del = [os.path.join(db_dir, f) for f in os.listdir(db_dir) if f.lower().endswith(".db")]
-            if os.path.exists(os.path.join(self.base_dir, "アカウント名.db")):
-                targets_to_del.append(os.path.join(self.base_dir, "アカウント名.db"))
-        
+        iid = selected[0]
+        meta = getattr(self, "_db_row_meta", {}).get(iid)
+        vals = self.tree_db.item(iid)["values"]
+        rec_id = vals[0]
+        act_type = vals[1] if len(vals) > 1 else ""
+
         deleted = False
-        for path in targets_to_del:
+        if meta and meta[0] and DatabaseManager is not None:
+            db_path, meta_act, meta_id = meta
             try:
-                conn = sqlite3.connect(path)
-                cursor = conn.cursor()
-                cursor.execute("DELETE FROM sent_history WHERE id = ?", (rec_id,))
-                if cursor.rowcount > 0:
-                    conn.commit()
-                    deleted = True
-                conn.close()
+                mgr = DatabaseManager(db_path)
+                deleted = mgr.delete_record(meta_act, int(meta_id))
             except Exception:
-                pass
-        
+                deleted = False
+        else:
+            db_dir = get_db_dir(self.base_dir)
+            selected_file = self.cmb_db_account.get()
+            if selected_file and selected_file != "全アカウント (統合表示)":
+                targets_to_del = [os.path.join(db_dir, selected_file)]
+            else:
+                targets_to_del = [os.path.join(db_dir, f) for f in os.listdir(db_dir) if f.lower().endswith(".db")]
+                if os.path.exists(os.path.join(self.base_dir, "アカウント名.db")):
+                    targets_to_del.append(os.path.join(self.base_dir, "アカウント名.db"))
+            for path in targets_to_del:
+                try:
+                    if DatabaseManager is not None and act_type:
+                        if DatabaseManager(path).delete_record(act_type, int(rec_id)):
+                            deleted = True
+                            break
+                except Exception:
+                    pass
+
         if deleted:
             self._reload_db()
-            self.log(f"🗑️ 履歴ID {rec_id} を削除しました（再送信可能になりました）。")
+            self.log(f"🗑️ [{act_type}] 履歴ID {rec_id} を削除しました（再実行可能になりました）。")
         else:
             messagebox.showwarning("案内", "該当レコードが見つかりませんでした。")
 

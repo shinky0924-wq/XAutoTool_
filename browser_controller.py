@@ -162,6 +162,7 @@ class XBrowserController:
         self.browser = None
         self.context = None
         self.page: Page = None
+        self.last_acted_tweet_url = ""
 
     def _cleanup_profile_locks(self):
         """プロファイルフォルダ内の残存ロックファイルをクリーンアップ (Windows lock/EBUSY対策)"""
@@ -2296,22 +2297,37 @@ class XBrowserController:
                             t_text = tel.first.inner_text().strip()
                     except Exception:
                         pass
-                t_url = ""
-                try:
-                    time_els = orig_tweet.locator('time')
-                    if time_els.count() > 0:
-                        pa = time_els.first.locator('xpath=ancestor::a[contains(@href, "/status/")]')
-                        if pa.count() > 0:
-                            th = pa.first.get_attribute("href")
-                            if th and "/status/" in th:
-                                clean_th = th.split("?")[0].split("#")[0]
-                                t_url = f"https://x.com{clean_th}" if clean_th.startswith("/") else clean_th
-                except Exception:
-                    pass
+                t_url = self._extract_tweet_url_from_article(orig_tweet)
                 return t_url, t_text
         except Exception as e:
             print(f"   ⚠️ 最新ツイート情報取得例外: {e}")
         return "", ""
+
+    def _extract_tweet_url_from_article(self, tweet_el) -> str:
+        """article要素から正規化したツイートURL (https://x.com/.../status/...) を抽出"""
+        if tweet_el is None:
+            return ""
+        try:
+            time_els = tweet_el.locator('time')
+            if time_els.count() > 0:
+                pa = time_els.first.locator('xpath=ancestor::a[contains(@href, "/status/")]')
+                if pa.count() > 0:
+                    th = pa.first.get_attribute("href")
+                    if th and "/status/" in th:
+                        clean_th = th.split("?")[0].split("#")[0]
+                        return f"https://x.com{clean_th}" if clean_th.startswith("/") else clean_th
+        except Exception:
+            pass
+        try:
+            links = tweet_el.locator('a[href*="/status/"]')
+            for idx in range(min(links.count(), 6)):
+                href = links.nth(idx).get_attribute("href") or ""
+                if "/status/" in href and "/analytics" not in href and "/photo/" not in href:
+                    clean_th = href.split("?")[0].split("#")[0]
+                    return f"https://x.com{clean_th}" if clean_th.startswith("/") else clean_th
+        except Exception:
+            pass
+        return ""
 
     def send_reply(self, target_screen_name: str, reply_text: str, tweet_url: str = "") -> tuple[str, str]:
         """
@@ -2322,6 +2338,7 @@ class XBrowserController:
         STATUS: 'SUCCESS' | 'NO_POSTS' | 'LOCKED_ACCOUNT' | 'FAILED'
         """
         page = self.ensure_page()
+        self.last_acted_tweet_url = ""
         clean_target = normalize_screen_name(target_screen_name)
         if not clean_target and not tweet_url:
             return "FAILED", "ターゲット情報不正"
@@ -2338,6 +2355,7 @@ class XBrowserController:
             print(f"💬 取得ツイートへのリプライ処理: {tweet_url}")
             target_tweet = self._find_tweet_on_status_page(tweet_url)
             if target_tweet:
+                self.last_acted_tweet_url = self._extract_tweet_url_from_article(target_tweet) or tweet_url.split("?")[0].split("#")[0]
                 reply_btn = target_tweet.locator('button[data-testid="reply"]')
                 inline_reply = page.locator('div[data-testid="tweetTextarea_0"], div[role="textbox"][data-testid="tweetTextarea_0"]')
 
@@ -2433,6 +2451,7 @@ class XBrowserController:
         if first_tweet is None:
             print("   ⏩ 通常ポスト（リプライ・リポスト除外後）が見つからないためスキップします。")
             return "NO_POSTS", "通常ポストなし（リプライ・リポストのみ）"
+        self.last_acted_tweet_url = self._extract_tweet_url_from_article(first_tweet) or ""
         reply_btn = first_tweet.locator('button[data-testid="reply"]')
         if reply_btn.count() == 0:
             print("   ⚠️ リプライボタンが見つかりません（返信制限の可能性）。")
@@ -2490,6 +2509,7 @@ class XBrowserController:
         - tweet_url が未指定または失敗時: プロフィール画面の最新ポストにいいね (フォールバック)
         """
         page = self.ensure_page()
+        self.last_acted_tweet_url = ""
         clean_target = normalize_screen_name(target_screen_name)
         if not clean_target and not tweet_url:
             return "FAILED", "ユーザー名不正"
@@ -2501,6 +2521,7 @@ class XBrowserController:
             print(f"❤️ 取得ツイートへのいいね処理: {tweet_url}")
             target_tweet = self._find_tweet_on_status_page(tweet_url)
             if target_tweet:
+                self.last_acted_tweet_url = self._extract_tweet_url_from_article(target_tweet) or tweet_url.split("?")[0].split("#")[0]
                 try:
                     target_tweet.scroll_into_view_if_needed(timeout=3000)
                     time.sleep(0.3)
@@ -2622,6 +2643,7 @@ class XBrowserController:
             # いいねボタン探索
             like_btn = tweet.locator('button[data-testid="like"], div[data-testid="like"], button[aria-label*="いいね"], button[aria-label*="Like"]')
             if like_btn.count() > 0:
+                self.last_acted_tweet_url = self._extract_tweet_url_from_article(tweet) or ""
                 target_btn = like_btn.first
                 try:
                     target_btn.scroll_into_view_if_needed(timeout=4000)
@@ -2797,6 +2819,7 @@ class XBrowserController:
         - tweet_url が未指定または失敗時: プロフィール画面の最新ポストを引用RT (フォールバック)
         """
         page = self.ensure_page()
+        self.last_acted_tweet_url = ""
         clean_target = normalize_screen_name(target_screen_name)
         if not clean_target and not tweet_url:
             return "FAILED", "ユーザー名不正"
@@ -2813,6 +2836,7 @@ class XBrowserController:
             print(f"🔁 取得ツイートへの引用リツイート処理: {tweet_url}")
             target_tweet = self._find_tweet_on_status_page(tweet_url)
             if target_tweet:
+                self.last_acted_tweet_url = self._extract_tweet_url_from_article(target_tweet) or tweet_url.split("?")[0].split("#")[0]
                 retweet_btn = target_tweet.locator('button[data-testid="retweet"]')
                 if retweet_btn.count() > 0:
                     r_box = retweet_btn.first.bounding_box()
@@ -2873,6 +2897,7 @@ class XBrowserController:
         first_tweet, _ = self._find_first_original_tweet_on_profile(page, clean_target, max_scan=8)
         if first_tweet is None:
             return "NO_POSTS", "通常ポストなし（リプライ・リポストのみ）"
+        self.last_acted_tweet_url = self._extract_tweet_url_from_article(first_tweet) or ""
         retweet_btn = first_tweet.locator('button[data-testid="retweet"]')
         if retweet_btn.count() == 0:
             return "FAILED", "RTボタンなし"
@@ -3028,11 +3053,30 @@ class XBrowserController:
             else:
                 time.sleep(random.uniform(0.04, 0.11))
 
+    def _ensure_top_tab_on_search(self, page: Page):
+        """検索・トレンド画面で「最新」ではなく「話題（Top）」タブが選択されていることを保証"""
+        try:
+            tabs = page.locator('a[role="tab"], div[role="tab"]').all()
+            for tab in tabs:
+                try:
+                    txt = (tab.inner_text() or "").strip()
+                    if txt in ["話題", "Top", "話題のポスト"] or txt.lower() in ["top", "popular"]:
+                        sel = (tab.get_attribute("aria-selected") or "").lower()
+                        if sel != "true":
+                            tab.click(timeout=4000)
+                            print("   👉 「話題（Top）」タブへ切り替えました（最新ではなく話題のポストを取得）")
+                            time.sleep(2.2)
+                        return
+                except Exception:
+                    continue
+        except Exception:
+            pass
+
     def collect_targets_from_search(self, keyword: str, search_type: str = "最新", scroll_limit: int = 5, max_targets: int = 0) -> list[dict]:
         """
         1. 検索キーワードからターゲットをスクロール収集
         - 最新: https://x.com/search?q={keyword}&f=live
-        - おすすめ: https://x.com/search?q={keyword}
+        - 話題の検索 / おすすめ: https://x.com/search?q={keyword} (話題のポスト / Topタブ)
 
         ★ 重要仕様:
         ・検索結果タイムライン (primaryColumn) 内に実際に出てきたツイートの投稿者および【そのツイート自身のURL (tweet_url)】を上から順番に抽出
@@ -3044,12 +3088,14 @@ class XBrowserController:
         page = self.ensure_page()
         clean_kw = str(keyword or "").strip()
         encoded_kw = urllib.parse.quote(clean_kw)
-        if search_type in ["最新", "live", "Live"]:
+        is_latest = search_type in ["最新", "live", "Live"]
+        if is_latest:
             url = f"https://x.com/search?q={encoded_kw}&f=live"
         else:
             url = f"https://x.com/search?q={encoded_kw}"
 
-        print(f"🔍 検索ページへ移動中 ({search_type}): {url}")
+        disp_stype = "最新" if is_latest else "話題のポスト(Top)"
+        print(f"🔍 検索ページへ移動中 ({disp_stype}): {url}")
         try:
             page.goto(url, timeout=40000, wait_until="domcontentloaded")
         except Exception as ge:
@@ -3078,6 +3124,9 @@ class XBrowserController:
                 page.wait_for_selector('article[data-testid="tweet"], div[data-testid="cellInnerDiv"]', timeout=10000)
             except Exception:
                 pass
+
+        if not is_latest:
+            self._ensure_top_tab_on_search(page)
 
         try:
             page.mouse.wheel(0, 300)
@@ -3656,16 +3705,32 @@ class XBrowserController:
 
     def collect_targets_from_explore(self, tab_type: str = "トレンド", scroll_limit: int = 5, max_targets: int = 0) -> list[dict]:
         """
-        話題・探索 (ニュース / トレンド) からターゲットを収集
+        話題・探索 (話題を検索 / ニュース / トレンド) からターゲットを収集
+        - 話題を検索: https://x.com/explore (「話題を検索 / For you」タブ)
         - ニュース: https://x.com/explore/tabs/news
         - トレンド: https://x.com/explore/tabs/trending
+        ★ ワード・トピック候補を毎回ランダムにシャッフルして選択し、最新ではなく「話題のポスト (Top)」を取得
         """
+        import re
         import urllib.parse
         page = self.ensure_page()
-        is_news = any(k in str(tab_type or "").lower() for k in ["ニュース", "news"])
-        tab_label = "ニュース" if is_news else "トレンド"
-        explore_url = "https://x.com/explore/tabs/news" if is_news else "https://x.com/explore/tabs/trending"
-        target_tab_texts = ["ニュース", "News"] if is_news else ["トレンド", "Trending"]
+        t_raw = str(tab_type or "").strip()
+        t_lower = t_raw.lower()
+        is_for_you = any(k in t_lower for k in ["話題", "for_you", "for you", "foryou"])
+        is_news = (not is_for_you) and any(k in t_lower for k in ["ニュース", "news"])
+
+        if is_for_you:
+            tab_label = "話題を検索"
+            explore_url = "https://x.com/explore"
+            target_tab_texts = ["話題を検索", "For you", "For You", "おすすめ"]
+        elif is_news:
+            tab_label = "ニュース"
+            explore_url = "https://x.com/explore/tabs/news"
+            target_tab_texts = ["ニュース", "News"]
+        else:
+            tab_label = "トレンド"
+            explore_url = "https://x.com/explore/tabs/trending"
+            target_tab_texts = ["トレンド", "Trending"]
 
         print(f"📰 {tab_label} ページへアクセス中: {explore_url}")
         try:
@@ -3689,9 +3754,13 @@ class XBrowserController:
                 try:
                     t_txt = (tab.inner_text() or "").strip()
                     if any(cand.lower() == t_txt.lower() or cand in t_txt for cand in target_tab_texts):
-                        tab.click(timeout=4000)
-                        print(f"   👉 タブ「{t_txt}」を選択しました")
-                        time.sleep(2.0)
+                        sel = (tab.get_attribute("aria-selected") or "").lower()
+                        if sel != "true":
+                            tab.click(timeout=4000)
+                            print(f"   👉 タブ「{t_txt}」を選択しました")
+                            time.sleep(2.2)
+                        else:
+                            print(f"   👉 タブ「{t_txt}」が表示されています")
                         break
                 except Exception:
                     continue
@@ -3709,49 +3778,109 @@ class XBrowserController:
             "i", "privacy", "tos", "help", "support", "x", "twitter", "safety", "verified", "elonmusk"
         }
 
-        for scroll_idx in range(min(3, max(1, scroll_limit))):
-            self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets)
-            if max_targets > 0 and len(discovered) >= max_targets:
-                break
-            if page.locator('article[data-testid="tweet"]').count() == 0 and scroll_idx == 0:
-                break
-            try:
-                page.mouse.wheel(0, random.randint(600, 1000))
-            except Exception:
-                pass
-            time.sleep(random.uniform(1.5, 2.5))
+        def _to_top_search_url(raw_href: str) -> str:
+            full_u = f"https://x.com{raw_href}" if raw_href.startswith("/") else raw_href
+            parsed_u = urllib.parse.urlparse(full_u)
+            if "/search" in parsed_u.path:
+                qs = urllib.parse.parse_qs(parsed_u.query, keep_blank_values=True)
+                qs.pop("f", None)  # f=live等を除外して「話題のポスト (Top)」を取得
+                new_q = urllib.parse.urlencode(qs, doseq=True)
+                return urllib.parse.urlunparse(parsed_u._replace(query=new_q))
+            return full_u
 
-        if max_targets == 0 or len(discovered) < max_targets:
-            candidate_urls = []
-            candidate_queries = []
-            try:
-                for a_el in page.locator('div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[href*="/search"], div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[href*="/i/trending/"], div[data-testid="primaryColumn"] div[data-testid="trend"] a').all():
-                    href = a_el.get_attribute("href")
-                    if href:
-                        full_u = f"https://x.com{href}" if href.startswith("/") else href
-                        if full_u not in candidate_urls:
-                            candidate_urls.append(full_u)
+        def _is_explore_metadata_line(ln: str) -> bool:
+            s = ln.strip()
+            if not s or len(s) < 2:
+                return True
+            if s.isdigit():
+                return True
+            if s in ["話題を検索", "For you", "トレンド", "Trending", "ニュース", "News", "スポーツ", "エンターテイメント", "さらに表示", "Show more", "プロモーション", "Promoted", "ライブ", "LIVE"]:
+                return True
+            if re.search(r'(?:^|[・·])\s*(?:トレンド|trending|ニュース|news|プロモーション|promoted)\s*$', s, re.I):
+                return True
+            if re.search(r'(?:\d+(?:時間|分|日|秒)前|件のポスト|\bposts?\b|^\d+[\s·・]*$)', s, re.I):
+                return True
+            if s.startswith("プロモーション") or s.startswith("Promoted by"):
+                return True
+            return False
 
-                if not candidate_urls:
-                    for tr in page.locator('div[data-testid="primaryColumn"] div[data-testid="trend"]').all():
-                        t_lines = [ln.strip() for ln in (tr.inner_text() or "").splitlines() if ln.strip()]
-                        for ln in t_lines:
-                            if any(skip in ln for skip in ["トレンド", "Trending", "件のポスト", "posts", "ニュース", "・"]) or ln.isdigit():
-                                continue
-                            if len(ln) >= 2 and ln not in candidate_queries:
-                                candidate_queries.append(ln)
-                                break
-                        if len(candidate_queries) >= 5:
-                            break
-                    for q in candidate_queries:
-                        candidate_urls.append(f"https://x.com/search?q={urllib.parse.quote(q)}&f=live")
-            except Exception:
-                pass
+        # 画面を少しスクロールして「話題を検索 / トレンド / ニュース」のワード候補を複数読み込む
+        try:
+            page.mouse.wheel(0, 500)
+            time.sleep(1.2)
+        except Exception:
+            pass
 
-            for idx_u, sub_url in enumerate(candidate_urls[:5], start=1):
+        candidates = []  # list[(label, url)]
+        seen_cand_urls = set()
+        seen_cand_labels = set()
+
+        try:
+            # 1. primaryColumn内のリンク (/search または /i/trending/) を収集
+            for a_el in page.locator('div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[href*="/search"], div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[href*="/i/trending/"], div[data-testid="primaryColumn"] div[data-testid="trend"] a').all():
+                href = a_el.get_attribute("href")
+                if href:
+                    top_u = _to_top_search_url(href)
+                    lbl = ""
+                    try:
+                        lines = [ln.strip() for ln in (a_el.inner_text() or "").splitlines() if not _is_explore_metadata_line(ln)]
+                        lbl = lines[0] if lines else ""
+                    except Exception:
+                        pass
+                    lbl_key = lbl.lower() if lbl else ""
+                    if top_u not in seen_cand_urls and (not lbl_key or lbl_key not in seen_cand_labels):
+                        seen_cand_urls.add(top_u)
+                        if lbl_key:
+                            seen_cand_labels.add(lbl_key)
+                        candidates.append((lbl or top_u, top_u))
+                if len(candidates) >= 25:
+                    break
+
+            # 2. div[data-testid="trend"] カードのテキストからワードを収集 (<a>がないReactクリックカード対応)
+            for tr in page.locator('div[data-testid="primaryColumn"] div[data-testid="trend"]').all():
+                t_lines = [ln.strip() for ln in (tr.inner_text() or "").splitlines() if ln.strip()]
+                for ln in t_lines:
+                    if _is_explore_metadata_line(ln):
+                        continue
+                    top_u = f"https://x.com/search?q={urllib.parse.quote(ln)}"
+                    lbl_key = ln.lower()
+                    if top_u not in seen_cand_urls and lbl_key not in seen_cand_labels:
+                        seen_cand_urls.add(top_u)
+                        seen_cand_labels.add(lbl_key)
+                        candidates.append((ln, top_u))
+                    break
+                if len(candidates) >= 25:
+                    break
+
+            # 3. 万一まだ候補がない場合 (ニュース等の特殊レイアウト) はcellInnerDiv内の見出し行から抽出
+            if not candidates:
+                for cell in page.locator('div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"]').all():
+                    if cell.locator('article[data-testid="tweet"]').count() > 0:
+                        continue
+                    c_lines = [ln.strip() for ln in (cell.inner_text() or "").splitlines() if ln.strip()]
+                    for ln in c_lines:
+                        if _is_explore_metadata_line(ln) or len(ln) > 60:
+                            continue
+                        top_u = f"https://x.com/search?q={urllib.parse.quote(ln)}"
+                        lbl_key = ln.lower()
+                        if top_u not in seen_cand_urls and lbl_key not in seen_cand_labels:
+                            seen_cand_urls.add(top_u)
+                            seen_cand_labels.add(lbl_key)
+                            candidates.append((ln, top_u))
+                        break
+                    if len(candidates) >= 20:
+                        break
+        except Exception:
+            pass
+
+        if candidates:
+            random.shuffle(candidates)
+            print(f"   🎲 [{tab_label}] 候補 {len(candidates)}件から検索ワードをランダム選択しました (抽選順先頭: 「{candidates[0][0][:35]}」)")
+
+            for idx_u, (cand_lbl, sub_url) in enumerate(candidates[:8], start=1):
                 if max_targets > 0 and len(discovered) >= max_targets:
                     break
-                print(f"   🔎 {tab_label}項目 [{idx_u}/{min(5, len(candidate_urls))}] から投稿者を取得中: {sub_url}")
+                print(f"   🔎 {tab_label}ランダム項目 [{idx_u}/{min(8, len(candidates))}] 「{cand_lbl[:30]}」の話題のポスト(Top)を取得中: {sub_url}")
                 try:
                     page.goto(sub_url, timeout=35000, wait_until="domcontentloaded")
                     time.sleep(2.2)
@@ -3760,7 +3889,8 @@ class XBrowserController:
                         if page.locator('article[data-testid="tweet"]').count() > 0:
                             break
                         time.sleep(0.8)
-                    for _ in range(min(2, max(1, scroll_limit))):
+                    self._ensure_top_tab_on_search(page)
+                    for _ in range(min(3, max(1, scroll_limit))):
                         self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets)
                         if max_targets > 0 and len(discovered) >= max_targets:
                             break
@@ -3771,6 +3901,26 @@ class XBrowserController:
                         time.sleep(1.5)
                 except Exception as se:
                     print(f"   ⚠️ {tab_label}項目取得通知: {se}")
+
+        # もしワード候補が見つからない／0件だった場合のみ探索画面上のポストからフォールバック収集
+        if not discovered:
+            try:
+                if page.url != explore_url:
+                    page.goto(explore_url, timeout=35000, wait_until="domcontentloaded")
+                    time.sleep(2.0)
+            except Exception:
+                pass
+            for scroll_idx in range(min(3, max(1, scroll_limit))):
+                self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets)
+                if max_targets > 0 and len(discovered) >= max_targets:
+                    break
+                if page.locator('article[data-testid="tweet"]').count() == 0 and scroll_idx == 0:
+                    break
+                try:
+                    page.mouse.wheel(0, random.randint(600, 1000))
+                except Exception:
+                    pass
+                time.sleep(random.uniform(1.5, 2.5))
 
         print(f"   📰 {tab_label}収集完了: 合計 {len(discovered)} 件抽出")
         return discovered[:max_targets] if max_targets > 0 else discovered

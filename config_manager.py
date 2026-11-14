@@ -310,7 +310,7 @@ class ConfigManager:
                 "like": {"enabled": False, "mode": "検索最新,HOMEおすすめ", "min_interval": 30.0, "max_interval": 90.0, "min_batch": 5, "max_batch": 10, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
                 "follow": {"enabled": False, "mode": "検索最新,URLリスト（フォロー）", "min_interval": 60.0, "max_interval": 180.0, "min_batch": 3, "max_batch": 7, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
                 "reply": {"enabled": False, "mode": "検索最新,URLリスト（リプライ）", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
-                "quote": {"enabled": False, "mode": "検索話題のポスト検索,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
+                "quote": {"enabled": False, "mode": "話題の検索,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
                 "reply_ai": {"enabled": False, "mode": "検索最新,HOMEおすすめ,トレンド", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": True, "like_enabled": False, "follow_enabled": False},
                 "quote_ai": {"enabled": False, "mode": "ニュース,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": True, "like_enabled": False, "follow_enabled": False},
             }

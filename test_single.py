@@ -34,7 +34,8 @@ from db_manager import (
     get_log_dir,
     get_account_log_path,
     AccountLogger,
-    sanitize_filename
+    sanitize_filename,
+    normalize_tweet_url
 )
 from config_manager import ConfigManager
 
@@ -231,7 +232,8 @@ def main():
             st, det = ctrl.like_recent_post(target_name, tweet_url=target_tweet_url)
             print(f"   ❤️ いいね結果: {st} ({det})")
             if st in ["SUCCESS", "ALREADY_LIKED"]:
-                db_mgr.record_sent(target_name, account_id, "LIKE", st, det)
+                eff_like_url = normalize_tweet_url(getattr(ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
+                db_mgr.record_sent(target_name, account_id, "LIKE", st, det, target_url=eff_like_url)
             time.sleep(2)
 
         if choice == "4" or choice == "5":

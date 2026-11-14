@@ -43,6 +43,45 @@ def normalize_screen_name(val: str) -> str:
         s = s.split("/")[0]
     return s.lstrip("@").strip()
 
+def normalize_tweet_url_and_id(url: str) -> tuple[str, str]:
+    """
+    X(Twitter)のポストURLを正規化し、(正規化URL, ツイートID) を返す。
+    例:
+    - "https://twitter.com/UserA/status/12345?s=20" -> ("https://x.com/UserA/status/12345", "12345")
+    - "https://x.com/UserA/status/12345/photo/1" -> ("https://x.com/UserA/status/12345", "12345")
+    - "https://x.com/i/web/status/12345" -> ("https://x.com/i/web/status/12345", "12345")
+    """
+    if not url:
+        return "", ""
+    raw = str(url).strip()
+    m = re.search(r'(?:https?://)?(?:www\.|mobile\.)?(?:x|twitter)\.com/(?:i/web|([^/?#]+))/status/(\d+)', raw, re.IGNORECASE)
+    if m:
+        handle = (m.group(1) or "").strip().lstrip("@")
+        tweet_id = m.group(2).strip()
+        if handle and handle.lower() != "i":
+            return f"https://x.com/{handle}/status/{tweet_id}", tweet_id
+        return f"https://x.com/i/web/status/{tweet_id}", tweet_id
+    return "", ""
+
+def normalize_tweet_url(url: str) -> str:
+    """正規化されたポストURLを返す（/status/を含まない場合は空文字）"""
+    norm, _ = normalize_tweet_url_and_id(url)
+    return norm
+
+def normalize_action_type(action_type: str) -> str:
+    a = str(action_type or "DM").strip().upper()
+    if a in ("REPLY", "REPLY_AI"):
+        return "REPLY"
+    if a in ("QUOTE", "QUOTE_AI", "QUOTE_RT", "QUOTE_RT_AI"):
+        return "QUOTE"
+    if a in ("LIKE",):
+        return "LIKE"
+    if a in ("FOLLOW",):
+        return "FOLLOW"
+    if a in ("DM",):
+        return "DM"
+    return a
+
 def sanitize_filename(name: str) -> str:
     """Windowsで使用不可能な記号を安全なアンダースコアに置換"""
     clean = normalize_screen_name(name)
@@ -228,6 +267,33 @@ class AccountLogger:
             pass
 
 class DatabaseManager:
+    """
+    アカウント名.DB のSQLite3管理
+    - アクションごとにテーブル分離:
+      - dm_history     (ユーザー単位: @ユーザー名)
+      - follow_history (ユーザー単位: @ユーザー名)
+      - reply_history  (取得URL単位: 正規化ポストURL / tweet_id)
+      - quote_history  (取得URL単位: 正規化ポストURL / tweet_id)
+      - like_history   (取得URL単位: 正規化ポストURL / tweet_id)
+    """
+    USER_SCOPED_ACTIONS = {"DM", "FOLLOW"}
+    URL_SCOPED_ACTIONS = {"REPLY", "QUOTE", "LIKE"}
+    ACTION_TABLE_MAP = {
+        "DM": "dm_history",
+        "FOLLOW": "follow_history",
+        "REPLY": "reply_history",
+        "QUOTE": "quote_history",
+        "LIKE": "like_history",
+    }
+    SUCCESS_STATUSES = (
+        "SUCCESS",
+        "ALREADY_FOLLOWING",
+        "ALREADY_LIKED",
+        "送信完了",
+        "フォロー済",
+        "いいね済",
+    )
+
     def __init__(self, db_path: str = "アカウント名.db"):
         self.db_path = db_path
         parent = os.path.dirname(os.path.abspath(self.db_path))
@@ -239,57 +305,224 @@ class DatabaseManager:
         return sqlite3.connect(self.db_path, timeout=10.0)
 
     def _init_db(self):
-        """テーブル初期化"""
+        """アクション別テーブルの初期化と旧 sent_history からの自動移行"""
         with self._get_connection() as conn:
             cursor = conn.cursor()
             cursor.execute("""
-                CREATE TABLE IF NOT EXISTS sent_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    target_screen_name TEXT NOT NULL,
-                    account_id_used TEXT,
-                    action_type TEXT NOT NULL,
-                    status TEXT NOT NULL,
-                    snippet TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    UNIQUE(target_screen_name, action_type)
+                CREATE TABLE IF NOT EXISTS db_meta (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
                 )
             """)
-            # 高速検索インデックス
-            cursor.execute("""
-                CREATE INDEX IF NOT EXISTS idx_target_action 
-                ON sent_history(target_screen_name, action_type)
-            """)
+            for table_name in self.ACTION_TABLE_MAP.values():
+                cursor.execute(f"""
+                    CREATE TABLE IF NOT EXISTS {table_name} (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        target_key TEXT NOT NULL COLLATE NOCASE,
+                        target_screen_name TEXT NOT NULL,
+                        target_url TEXT DEFAULT '',
+                        tweet_id TEXT DEFAULT '',
+                        account_id_used TEXT,
+                        action_type TEXT NOT NULL,
+                        status TEXT NOT NULL,
+                        snippet TEXT,
+                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                        UNIQUE(target_key)
+                    )
+                """)
+                cursor.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{table_name}_key
+                    ON {table_name}(target_key)
+                """)
+                cursor.execute(f"""
+                    CREATE INDEX IF NOT EXISTS idx_{table_name}_tid
+                    ON {table_name}(tweet_id)
+                """)
+
+            # 互換性および旧データの自動移行（1回のみ）
+            cursor.execute("SELECT value FROM db_meta WHERE key = 'migrated_action_tables_v2'")
+            migrated_row = cursor.fetchone()
+            if not migrated_row:
+                cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sent_history'")
+                if cursor.fetchone():
+                    cursor.execute("""
+                        SELECT target_screen_name, account_id_used, action_type, status, snippet, created_at
+                        FROM sent_history
+                        ORDER BY id ASC
+                    """)
+                    for row in cursor.fetchall():
+                        raw_target, acc_used, raw_act, st, snip, created_at = row
+                        act = normalize_action_type(raw_act)
+                        table_name = self.ACTION_TABLE_MAP.get(act)
+                        if not table_name:
+                            continue
+                        clean_name = normalize_screen_name(raw_target)
+                        if not clean_name:
+                            continue
+                        if act in self.USER_SCOPED_ACTIONS:
+                            t_key = clean_name.lower()
+                            t_url = f"https://x.com/{clean_name}"
+                            tid = ""
+                        else:
+                            norm_u, tid = normalize_tweet_url_and_id(raw_target)
+                            if norm_u and tid:
+                                t_key = norm_u.lower()
+                                t_url = norm_u
+                            else:
+                                # 旧DBはユーザー名のみ記録だったため、履歴表示用に保持しつつ新ツイートURLをブロックしないよう tid='' とする
+                                t_key = f"https://x.com/{clean_name.lower()}"
+                                t_url = f"https://x.com/{clean_name}"
+                                tid = ""
+                        cursor.execute(f"""
+                            INSERT OR IGNORE INTO {table_name}
+                            (target_key, target_screen_name, target_url, tweet_id, account_id_used, action_type, status, snippet, created_at)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (t_key, clean_name, t_url, tid, acc_used, act, st, snip, created_at))
+
+                cursor.execute("""
+                    INSERT OR REPLACE INTO db_meta (key, value)
+                    VALUES ('migrated_action_tables_v2', '1')
+                """)
+
             conn.commit()
 
-    def is_already_sent(self, target_screen_name: str, action_type: str = "DM") -> bool:
-        """指定ユーザーへの送信履歴があるかチェック (成功ステータスのみ対象)"""
-        clean_name = normalize_screen_name(target_screen_name).lower()
-        with self._get_connection() as conn:
-            cursor = conn.cursor()
-            cursor.execute("""
-                SELECT id FROM sent_history 
-                WHERE LOWER(target_screen_name) = ? AND action_type = ?
-                  AND status IN ('SUCCESS', 'ALREADY_FOLLOWING', 'ALREADY_LIKED', '送信完了', 'フォロー済', 'いいね済')
-            """, (clean_name, action_type))
-            row = cursor.fetchone()
-            return row is not None
+    def is_already_sent(self, target_screen_name: str, action_type: str = "DM", target_url: str = "") -> bool:
+        """
+        アクション種別に応じた重複実行チェック (成功ステータスのみ対象)
+        - DM / FOLLOW: ユーザー単位 (@ユーザー名)
+        - REPLY / QUOTE / LIKE: 取得URL単位 (正規化ポストURL / tweet_id)
+        """
+        act = normalize_action_type(action_type)
+        table_name = self.ACTION_TABLE_MAP.get(act)
+        if not table_name:
+            return False
 
-    def record_sent(self, target_screen_name: str, account_id: str, action_type: str, status: str, snippet: str = ""):
-        """送信履歴を登録（重複時は上書き更新）"""
-        clean_name = normalize_screen_name(target_screen_name)
+        placeholders = ",".join("?" for _ in self.SUCCESS_STATUSES)
         with self._get_connection() as conn:
             cursor = conn.cursor()
-            cursor.execute("""
-                INSERT INTO sent_history (target_screen_name, account_id_used, action_type, status, snippet, created_at)
-                VALUES (?, ?, ?, ?, ?, datetime('now', 'localtime'))
-                ON CONFLICT(target_screen_name, action_type) 
-                DO UPDATE SET 
+            if act in self.USER_SCOPED_ACTIONS:
+                clean_name = normalize_screen_name(target_screen_name).lower()
+                if not clean_name:
+                    return False
+                cursor.execute(f"""
+                    SELECT id FROM {table_name}
+                    WHERE LOWER(target_key) = ?
+                      AND status IN ({placeholders})
+                """, (clean_name, *self.SUCCESS_STATUSES))
+                return cursor.fetchone() is not None
+            else:
+                norm_url, tweet_id = normalize_tweet_url_and_id(target_url)
+                if not tweet_id and "/status/" in str(target_screen_name or ""):
+                    norm_url, tweet_id = normalize_tweet_url_and_id(target_screen_name)
+                if not tweet_id:
+                    # ツイートURLが未確定の段階（ユーザー名のみの登録など）ではここではブロックせず、
+                    # 実際の最新ツイートURLを取得したタイミングで再チェックする
+                    return False
+                cursor.execute(f"""
+                    SELECT id FROM {table_name}
+                    WHERE (tweet_id = ? OR LOWER(target_key) = ?)
+                      AND status IN ({placeholders})
+                """, (tweet_id, norm_url.lower(), *self.SUCCESS_STATUSES))
+                return cursor.fetchone() is not None
+
+    def record_sent(self, target_screen_name: str, account_id: str, action_type: str, status: str, snippet: str = "", target_url: str = ""):
+        """送信・実行履歴をアクション別テーブルに登録（重複時は上書き更新）"""
+        act = normalize_action_type(action_type)
+        table_name = self.ACTION_TABLE_MAP.get(act)
+        if not table_name:
+            return
+
+        norm_url, tweet_id = normalize_tweet_url_and_id(target_url)
+        if not norm_url and "/status/" in str(target_screen_name or ""):
+            norm_url, tweet_id = normalize_tweet_url_and_id(target_screen_name)
+
+        clean_name = normalize_screen_name(target_screen_name) or normalize_screen_name(norm_url)
+        if not clean_name and not norm_url:
+            return
+
+        if act in self.USER_SCOPED_ACTIONS:
+            target_key = clean_name.lower()
+            stored_url = norm_url or (f"https://x.com/{clean_name}" if clean_name else "")
+            stored_tid = tweet_id
+        else:
+            if norm_url and tweet_id:
+                target_key = norm_url.lower()
+                stored_url = norm_url
+                stored_tid = tweet_id
+            else:
+                target_key = f"https://x.com/{clean_name.lower()}"
+                stored_url = f"https://x.com/{clean_name}"
+                stored_tid = ""
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"""
+                INSERT INTO {table_name}
+                (target_key, target_screen_name, target_url, tweet_id, account_id_used, action_type, status, snippet, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, datetime('now', 'localtime'))
+                ON CONFLICT(target_key)
+                DO UPDATE SET
+                    target_screen_name = excluded.target_screen_name,
+                    target_url = excluded.target_url,
+                    tweet_id = excluded.tweet_id,
                     status = excluded.status,
                     account_id_used = excluded.account_id_used,
                     snippet = excluded.snippet,
                     created_at = datetime('now', 'localtime')
-            """, (clean_name, account_id, action_type, status, snippet))
+            """, (target_key, clean_name, stored_url, stored_tid, account_id, act, status, snippet))
             conn.commit()
+
+    def fetch_history(self, action_filter: str = "ALL", limit: int = 300) -> list[dict]:
+        """GUI・管理用に履歴レコード一覧を取得（アクション絞込対応）"""
+        f_act = str(action_filter or "ALL").strip().upper()
+        if f_act != "ALL":
+            f_act = normalize_action_type(f_act)
+
+        target_tables = (
+            [(act, tbl) for act, tbl in self.ACTION_TABLE_MAP.items() if f_act == "ALL" or act == f_act]
+        )
+        rows_out = []
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for act, tbl in target_tables:
+                try:
+                    cursor.execute(f"""
+                        SELECT id, target_key, target_screen_name, target_url, account_id_used, action_type, status, created_at, snippet
+                        FROM {tbl}
+                        ORDER BY id DESC
+                        LIMIT ?
+                    """, (limit,))
+                    for r in cursor.fetchall():
+                        rows_out.append({
+                            "id": r[0],
+                            "target_key": r[1] or "",
+                            "target_screen_name": r[2] or "",
+                            "target_url": r[3] or "",
+                            "account_id_used": r[4] or "",
+                            "action_type": r[5] or act,
+                            "status": r[6] or "",
+                            "created_at": r[7] or "",
+                            "snippet": r[8] or "",
+                            "db_path": self.db_path,
+                        })
+                except Exception:
+                    pass
+
+        rows_out.sort(key=lambda x: (str(x.get("created_at", "")), int(x.get("id", 0))), reverse=True)
+        return rows_out[:limit]
+
+    def delete_record(self, action_type: str, record_id: int) -> bool:
+        """指定アクションテーブルから特定IDの履歴を削除"""
+        act = normalize_action_type(action_type)
+        table_name = self.ACTION_TABLE_MAP.get(act)
+        if not table_name:
+            return False
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"DELETE FROM {table_name} WHERE id = ?", (int(record_id),))
+            deleted = cursor.rowcount > 0
+            conn.commit()
+            return deleted
 
     @staticmethod
     def list_account_dbs(base_dir: str) -> list[str]:
@@ -302,3 +535,4 @@ class DatabaseManager:
             if f.lower().endswith(".db"):
                 files.append(os.path.join(db_dir, f))
         return sorted(files)
+
