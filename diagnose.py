@@ -84,13 +84,13 @@ except Exception as e:
 print()
 print("[診断 6/6] ブラウザ環境の確認:")
 chrome_installed = any(os.path.isfile(os.path.expandvars(p)) for p in [
-    r"%ProgramFiles%GoogleChromeApplicationchrome.exe",
-    r"%ProgramFiles(x86)%GoogleChromeApplicationchrome.exe",
-    os.path.expandvars(r"%LocalAppData%GoogleChromeApplicationchrome.exe"),
+    r"%ProgramFiles%\Google\Chrome\Application\chrome.exe",
+    r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe",
+    os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
 ])
 edge_installed = any(os.path.isfile(os.path.expandvars(p)) for p in [
-    r"%ProgramFiles(x86)%MicrosoftEdgeApplicationmsedge.exe",
-    r"%ProgramFiles%MicrosoftEdgeApplicationmsedge.exe",
+    r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe",
+    r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe",
 ])
 if chrome_installed:
     print("   ✅ Google Chrome: 検出OK (推奨: 自動連携で最も安定・安全に動作)")

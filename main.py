@@ -39,10 +39,16 @@ from db_manager import (
 from browser_controller import XBrowserController
 
 def get_base_dir() -> str:
-    """PyInstaller EXE化実行環境および通常Python実行環境の両方で、ルート実行ディレクトリを安全に取得"""
+    """PyInstaller EXE化実行環境・_app/ 実行環境・通常Python実行環境でルートディレクトリを取得"""
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    env_dir = os.environ.get("X_AUTO_DM_BASE_DIR", "").strip().strip('"')
+    if env_dir and os.path.isdir(env_dir):
+        return os.path.normpath(env_dir)
+    d = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(d) == "_app":
+        return os.path.dirname(d)
+    return d
 
 PAUSE_FILE = os.path.join(get_base_dir(), ".pause")
 STOP_FILE = os.path.join(get_base_dir(), ".stop")
@@ -615,6 +621,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         target_mode = acc_settings.get("target_mode") or get_acc_val(acc, ["取得モード", "対象取得モード", "ターゲットモード", "検索モード", "モード", "抽出モード"], "").strip()
         scroll_limit = acc_settings.get("scroll_limit", 5)
         target_read_limit = acc_settings.get("target_count", 15)
+        reply_url_loop_limit = max(0, int(acc_settings.get("reply_url_loop_limit", 0)))
+        reply_parent_hop_limit = max(0, int(acc_settings.get("reply_parent_hop_limit", 15)))
         block_media = acc_settings.get("block_media", True)
         ai_engine = acc_settings.get("ai_engine", "gemini")
         ai_dedicated_window = bool(acc_settings.get("ai_dedicated_window", True))
@@ -702,7 +710,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         log(f"🚀 アカウント [{account_id}] ({acc_idx}/{total_acc_count}件目) のスロット{active_slot}セッションを開始します")
         log(f"   📂 ターゲット/設定ファイル: {os.path.basename(acc_target_path)} (個別動作設定シート適用)")
         log(f"   ⚡ メディア読込ブロック: {'ON (省メモリ・超高速)' if block_media else 'OFF (通常)'}")
-        log(f"   スクロール上限: {scroll_limit}回 / 読み込みターゲット件数上限: {target_read_limit}件")
+        log(f"   スクロール上限: {scroll_limit}回 / 読み込みターゲット件数上限: {target_read_limit}件 / URLリプライ巡回上限: {'全件' if reply_url_loop_limit == 0 else str(reply_url_loop_limit) + '件'} / 親ホップ上限: {reply_parent_hop_limit}回")
         log(f"   AIエンジン: {ai_engine}")
         log(f"   AI専用ウィンドウ連携: {'ON (専用ウィンドウ起動・連携)' if ai_dedicated_window else 'OFF (API直接生成)'}")
         log(f"   📋 アクション個別設定 (アカウント名.xlsx「動作設定」シート準拠):")
@@ -766,6 +774,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             # ログイン (Cookie優先・パスコード自動対応)
             login_success = browser_ctrl.login(account_id=clean_account_id, auth_token=auth_token, password=password, passcode=dm_passcode)
             if not login_success:
+                browser_ctrl.capture_error_screenshot("login_failed", clean_account_id)
                 log(f"❌ アカウント [{account_id}] のログインに失敗したため、次のアカウントへ移ります。")
                 browser_ctrl.close()
                 return min_sec, max_sec
@@ -793,8 +802,17 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 except Exception as ai_win_e:
                     log(f"   ⚠️ AI専用ウィンドウ先行起動通知: {ai_win_e}")
 
-            # --- モード別ターゲット収集 (同一アカウント内キャッシュあり) ---
+            # --- モード別ターゲット収集 (アクションDB単位のキャッシュあり) ---
             mode_targets_cache = {}
+            db_action_map = {
+                "follow": "FOLLOW",
+                "like": "LIKE",
+                "reply": "REPLY",
+                "reply_ai": "REPLY",
+                "dm": "DM",
+                "quote": "QUOTE",
+                "quote_ai": "QUOTE",
+            }
 
             def append_collected_items(found_items, source_label: str, dest_list: list):
                 for item in found_items:
@@ -833,62 +851,177 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             "表示名": d_name
                         })
 
-            def collect_targets_for_mode(m_type: str, m_label: str) -> list[dict]:
-                if m_type in mode_targets_cache:
-                    cached = mode_targets_cache[m_type]
-                    log(f"   ♻️ [{m_label}] 収集済みキャッシュから {len(cached)} 件のターゲットを再利用します")
+            def collect_targets_for_mode(m_type: str, m_label: str, act_key: str = "dm") -> list[dict]:
+                db_action_type = db_action_map.get(act_key, act_key.upper())
+                cache_key = (m_type, db_action_type)
+                if cache_key in mode_targets_cache:
+                    cached = mode_targets_cache[cache_key]
+                    log(f"   ♻️ [{m_label}/{db_action_type}] 収集済みキャッシュから {len(cached)} 件の完全新規ターゲットを再利用します")
                     return cached
 
                 check_pause_state(f"モード [{m_label}] ターゲット収集前")
                 collected = []
 
+                def should_skip_target(cand_user: str, cand_tweet_url: str = "") -> bool:
+                    clean_u = normalize_screen_name(cand_user)
+                    if not clean_u:
+                        return True
+                    if db_mgr.is_user_unavailable(clean_u):
+                        return True
+                    if db_mgr.is_registered_in_db(clean_u, action_type=db_action_type, target_url=cand_tweet_url):
+                        return True
+                    norm_u = normalize_tweet_url(cand_tweet_url) if cand_tweet_url else ""
+                    if norm_u:
+                        if any((t.get("ツイートURL") or "").lower() == norm_u.lower() for t in collected):
+                            return True
+                    if any((t.get("アカウント名") or "").lower() == clean_u.lower() for t in collected):
+                        return True
+                    return False
+
+                def remaining_limit() -> int:
+                    if target_read_limit <= 0:
+                        return 0
+                    return max(0, target_read_limit - len(collected))
+
                 if m_type in ["SEARCH_LATEST", "SEARCH_TOP"]:
                     stype_override = "話題" if m_type == "SEARCH_TOP" else "最新"
                     if acc_search_keywords:
-                        log(f"🔍 [{m_label}] ターゲット収集開始 (登録キーワード: {len(acc_search_keywords)}件 / 上限: {target_read_limit}件)...")
+                        log(f"🔍 [{m_label}] 完全新規ターゲット収集開始 (登録キーワード: {len(acc_search_keywords)}件 / DB未登録のみ上限: {target_read_limit}件)...")
                         for kw_item in acc_search_keywords:
+                            rem = remaining_limit()
+                            if target_read_limit > 0 and rem <= 0:
+                                break
                             kw = kw_item.get("keyword")
                             stype = "話題" if m_type == "SEARCH_TOP" else kw_item.get("search_type", stype_override)
-                            found = browser_ctrl.collect_targets_from_search(kw, search_type=stype, scroll_limit=scroll_limit, max_targets=target_read_limit)
+                            found = browser_ctrl.collect_targets_from_search(kw, search_type=stype, scroll_limit=scroll_limit, max_targets=rem, should_skip_fn=should_skip_target)
                             append_collected_items(found, f"{m_label}:{kw}", collected)
                             if target_read_limit > 0 and len(collected) >= target_read_limit:
                                 break
                     else:
                         log(f"   ℹ️ [{m_label}] 「検索キーワード」シートにキーワード未登録のため、「相互フォロー」で探索します。")
-                        found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type=stype_override, scroll_limit=scroll_limit, max_targets=target_read_limit)
+                        found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type=stype_override, scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
                         append_collected_items(found, f"{m_label}:相互フォロー", collected)
 
                 elif m_type == "EXPLORE_TOPICS":
-                    log(f"🔥 [話題の検索] X探索「話題を検索」タブからランダムにワードを選び、話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_explore(tab_type="話題を検索", scroll_limit=scroll_limit, max_targets=target_read_limit)
+                    log(f"🔥 [話題の検索] X探索「話題を検索」タブからランダムにワードを選び、DB未登録の話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
+                    found = browser_ctrl.collect_targets_from_explore(tab_type="話題を検索", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
                     append_collected_items(found, "話題の検索", collected)
 
                 elif m_type == "HOME_FOR_YOU":
-                    log(f"🏠 [HOMEおすすめ] タイムラインからターゲット収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_home(tab_type="おすすめ", scroll_limit=scroll_limit, max_targets=target_read_limit)
+                    log(f"🏠 [HOMEおすすめ] タイムラインからDB未登録ターゲット収集開始 (上限: {target_read_limit}件)...")
+                    found = browser_ctrl.collect_targets_from_home(tab_type="おすすめ", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
                     append_collected_items(found, "HOMEおすすめ", collected)
 
                 elif m_type == "HOME_FOLLOWING":
-                    log(f"🏠 [HOMEフォロー中] タイムラインからターゲット収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_home(tab_type="フォロー中", scroll_limit=scroll_limit, max_targets=target_read_limit)
+                    log(f"🏠 [HOMEフォロー中] タイムラインからDB未登録ターゲット収集開始 (上限: {target_read_limit}件)...")
+                    found = browser_ctrl.collect_targets_from_home(tab_type="フォロー中", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
                     append_collected_items(found, "HOMEフォロー中", collected)
 
                 elif m_type == "URL_REPLY":
                     if acc_reply_urls:
-                        log(f"💬 [URLリスト（リプライ）] ターゲット収集開始 (登録URL: {len(acc_reply_urls)}件 / 上限: {target_read_limit}件)...")
-                        for rurl in acc_reply_urls:
-                            found = browser_ctrl.collect_targets_from_replies(rurl, scroll_limit=scroll_limit, max_targets=target_read_limit)
+                        urls_to_visit = acc_reply_urls[:reply_url_loop_limit] if reply_url_loop_limit > 0 else list(acc_reply_urls)
+                        log(f"💬 [URLリスト（リプライ）] DB未登録ターゲット収集開始 (巡回URL: {len(urls_to_visit)}/{len(acc_reply_urls)}件 / 上限: {target_read_limit}件 / 親ホップ上限: {reply_parent_hop_limit}回)...")
+                        visited_reply_accounts = {clean_account_id.lower()} if clean_account_id else set()
+                        visited_parent_urls = set()
+                        pending_parent_urls = []
+                        pending_hop_accounts = []
+
+                        for r_idx, rurl in enumerate(urls_to_visit, start=1):
+                            rem = remaining_limit()
+                            if target_read_limit > 0 and rem <= 0:
+                                break
+                            owner_cand = normalize_screen_name(rurl).lower()
+                            if "/status/" not in rurl and owner_cand:
+                                visited_reply_accounts.add(owner_cand)
+                            discovered_parents = []
+                            log(f"   📍 登録URL [{r_idx}/{len(urls_to_visit)}]: {rurl}")
+                            found = browser_ctrl.collect_targets_from_replies(
+                                rurl,
+                                scroll_limit=scroll_limit,
+                                max_targets=rem,
+                                should_skip_fn=should_skip_target,
+                                exclude_owner=True,
+                                out_parent_candidates=discovered_parents,
+                            )
                             append_collected_items(found, f"URLリスト（リプライ）:{rurl}", collected)
+                            for pu in discovered_parents:
+                                p_norm = (normalize_tweet_url(pu) or pu).lower()
+                                if p_norm and p_norm not in visited_parent_urls and pu not in pending_parent_urls:
+                                    pending_parent_urls.append(pu)
                             if target_read_limit > 0 and len(collected) >= target_read_limit:
                                 break
+
+                        need_more = (target_read_limit > 0 and len(collected) < target_read_limit) or (target_read_limit <= 0 and len(collected) == 0)
+                        if need_more and reply_parent_hop_limit > 0 and pending_parent_urls:
+                            log(f"   🔄 [URLリスト（リプライ）] 登録URLで目標未達 ({len(collected)}/{target_read_limit}件) のため、親ポスト経由ホップ探索（最大{reply_parent_hop_limit}ホップ / 一時巡回）を開始します...")
+                            hop_count = 0
+                            while hop_count < reply_parent_hop_limit:
+                                if target_read_limit > 0 and len(collected) >= target_read_limit:
+                                    break
+                                check_pause_state(f"親ポスト連鎖ホップ ({hop_count + 1}/{reply_parent_hop_limit}) 前")
+
+                                while not pending_hop_accounts and pending_parent_urls:
+                                    p_url = pending_parent_urls.pop(0)
+                                    p_norm = (normalize_tweet_url(p_url) or p_url).lower()
+                                    if p_norm in visited_parent_urls:
+                                        continue
+                                    visited_parent_urls.add(p_norm)
+                                    repliers = browser_ctrl.collect_repliers_from_parent_post(
+                                        p_url,
+                                        exclude_users=visited_reply_accounts,
+                                        max_candidates=12,
+                                    )
+                                    for ru in repliers:
+                                        ru_low = normalize_screen_name(ru).lower()
+                                        if not ru_low or ru_low in visited_reply_accounts or db_mgr.is_user_unavailable(ru_low):
+                                            continue
+                                        if all(ru_low != normalize_screen_name(x).lower() for x in pending_hop_accounts):
+                                            pending_hop_accounts.append(ru)
+
+                                if not pending_hop_accounts:
+                                    log(f"   ℹ️ [親ポスト連鎖ホップ] これ以上辿れる未訪問の親ポスト・別リプライ主が無いため終了します ({hop_count}/{reply_parent_hop_limit}ホップ)。")
+                                    break
+
+                                next_u = pending_hop_accounts.pop(0)
+                                nu_low = normalize_screen_name(next_u).lower()
+                                if not nu_low or nu_low in visited_reply_accounts or db_mgr.is_user_unavailable(nu_low):
+                                    continue
+                                visited_reply_accounts.add(nu_low)
+                                hop_count += 1
+                                rem = remaining_limit()
+                                hop_url = f"https://x.com/{next_u}/with_replies"
+                                log(f"   🔁 [親ポスト連鎖ホップ {hop_count}/{reply_parent_hop_limit}] @{next_u}/with_replies から親ポスト側ターゲットを探索中...")
+                                hop_parents = []
+                                hop_found = browser_ctrl.collect_targets_from_replies(
+                                    hop_url,
+                                    scroll_limit=scroll_limit,
+                                    max_targets=rem,
+                                    should_skip_fn=should_skip_target,
+                                    exclude_owner=True,
+                                    out_parent_candidates=hop_parents,
+                                )
+                                append_collected_items(hop_found, f"親ホップ{hop_count}:@{next_u}", collected)
+                                for hpu in hop_parents:
+                                    hp_norm = (normalize_tweet_url(hpu) or hpu).lower()
+                                    if hp_norm and hp_norm not in visited_parent_urls and hpu not in pending_parent_urls:
+                                        pending_parent_urls.append(hpu)
+
+                                if target_read_limit > 0 and len(collected) >= target_read_limit:
+                                    log(f"   🎯 [親ポスト連鎖ホップ] 新規ターゲット上限 ({target_read_limit}件) に達したため、ホップ探索を完了します ({hop_count}/{reply_parent_hop_limit}ホップ)。")
+                                    break
+                                if target_read_limit <= 0 and len(collected) > 0:
+                                    break
                     else:
                         log(f"   ℹ️ [URLリスト（リプライ）] 「URLリスト_リプライ」シートに対象URLが未登録のためスキップします。")
 
                 elif m_type == "URL_FOLLOW":
                     if acc_follow_urls:
-                        log(f"👥 [URLリスト（フォロー）] ターゲット収集開始 (登録URL: {len(acc_follow_urls)}件 / 上限: {target_read_limit}件)...")
+                        log(f"👥 [URLリスト（フォロー）] DB未登録ターゲット収集開始 (登録URL: {len(acc_follow_urls)}件 / 上限: {target_read_limit}件)...")
                         for furl in acc_follow_urls:
-                            found = browser_ctrl.collect_targets_from_follow(furl, scroll_limit=scroll_limit, max_targets=target_read_limit)
+                            rem = remaining_limit()
+                            if target_read_limit > 0 and rem <= 0:
+                                break
+                            found = browser_ctrl.collect_targets_from_follow(furl, scroll_limit=scroll_limit, max_targets=rem, should_skip_fn=should_skip_target)
                             append_collected_items(found, f"URLリスト（フォロー）:{furl}", collected)
                             if target_read_limit > 0 and len(collected) >= target_read_limit:
                                 break
@@ -896,25 +1029,33 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         log(f"   ℹ️ [URLリスト（フォロー）] 「URLリスト_フォロー」シートに対象URLが未登録のためスキップします。")
 
                 elif m_type == "NEWS":
-                    log(f"📰 [ニュース] 探索タブからランダムにワードを選び、話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_explore(tab_type="ニュース", scroll_limit=scroll_limit, max_targets=target_read_limit)
+                    log(f"📰 [ニュース] 探索タブからランダムにワードを選び、DB未登録の話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
+                    found = browser_ctrl.collect_targets_from_explore(tab_type="ニュース", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
                     append_collected_items(found, "ニュース", collected)
 
                 elif m_type == "TRENDS":
-                    log(f"📈 [トレンド] 探索タブからランダムにワードを選び、話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_explore(tab_type="トレンド", scroll_limit=scroll_limit, max_targets=target_read_limit)
+                    log(f"📈 [トレンド] 探索タブからランダムにワードを選び、DB未登録の話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
+                    found = browser_ctrl.collect_targets_from_explore(tab_type="トレンド", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
                     append_collected_items(found, "トレンド", collected)
 
                 elif m_type == "LIST":
-                    log(f"📑 [リスト送信] Excel「{os.path.basename(acc_target_path)}」の未送信ターゲットを読込中...")
-                    collected = config_mgr.load_targets(limit=target_read_limit if target_read_limit > 0 else 0, target_path_override=acc_target_path)
+                    log(f"📑 [リスト送信] Excel「{os.path.basename(acc_target_path)}」からDB未登録ターゲットを読込中...")
+                    raw_list = config_mgr.load_targets(limit=0, target_path_override=acc_target_path)
+                    for item in raw_list:
+                        cu = normalize_screen_name(item.get("アカウント名") or item.get("ターゲットURL") or "")
+                        tu = normalize_tweet_url(item.get("ツイートURL") or item.get("ターゲットURL") or "")
+                        if should_skip_target(cu, tu):
+                            continue
+                        collected.append(item)
+                        if target_read_limit > 0 and len(collected) >= target_read_limit:
+                            break
 
                 elif m_type == "MUTUAL":
-                    log(f"🤝 [相互フォロー検索] ターゲット収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type="最新", scroll_limit=scroll_limit, max_targets=target_read_limit)
+                    log(f"🤝 [相互フォロー検索] DB未登録ターゲット収集開始 (上限: {target_read_limit}件)...")
+                    found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type="最新", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
                     append_collected_items(found, "相互フォロー検索", collected)
 
-                mode_targets_cache[m_type] = collected
+                mode_targets_cache[cache_key] = collected
                 return collected
 
             def generate_ai_or_template_text(kind: str, target_screen_name: str, resolved_disp: str, tweet_url: str, use_ai: bool, cached_tweet_text: str = "", cached_parent_text: str = "", is_reply_target: bool = False) -> str:
@@ -1036,27 +1177,22 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             pass
                     return target_display_name
 
-                db_action_map = {
-                    "follow": "FOLLOW",
-                    "like": "LIKE",
-                    "reply": "REPLY",
-                    "reply_ai": "REPLY",
-                    "dm": "DM",
-                    "quote": "QUOTE",
-                    "quote_ai": "QUOTE",
-                }
                 db_action_type = db_action_map.get(act_key, act_key.upper())
                 is_url_scoped_action = db_action_type in ("REPLY", "QUOTE", "LIKE")
 
+                if db_mgr.is_user_unavailable(target_screen_name):
+                    log(f"   ⏩ [{db_action_type}] @{target_screen_name} は凍結・存在しない(削除済み)アカウントとして共通ブラックリスト登録済みのためページを開かず0秒でスキップ")
+                    return False, "UNAVAILABLE_USER"
+
                 if is_url_scoped_action:
                     if target_tweet_url and "/status/" in target_tweet_url:
-                        if db_mgr.is_already_sent(target_screen_name, action_type=db_action_type, target_url=target_tweet_url):
-                            log(f"   ⏩ [{db_action_type}] 取得ポスト ({target_tweet_url}) は過去に実行済みのためスキップ")
-                            return False, "ALREADY_SENT"
+                        if db_mgr.is_registered_in_db(target_screen_name, action_type=db_action_type, target_url=target_tweet_url):
+                            log(f"   ⏩ [{db_action_type}] 取得ポスト ({target_tweet_url}) はDB登録済みのためスキップ")
+                            return False, "ALREADY_REGISTERED"
                 else:
-                    if db_mgr.is_already_sent(target_screen_name, action_type=db_action_type):
-                        log(f"   ⏩ [{db_action_type}] @{target_screen_name} は過去に実行済みのためスキップ")
-                        return False, "ALREADY_SENT"
+                    if db_mgr.is_registered_in_db(target_screen_name, action_type=db_action_type):
+                        log(f"   ⏩ [{db_action_type}] @{target_screen_name} はDB登録済みのためスキップ")
+                        return False, "ALREADY_REGISTERED"
 
                 log("")
                 if target_tweet_url:
@@ -1070,23 +1206,34 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 if is_url_scoped_action and (not target_tweet_url or "/status/" not in target_tweet_url):
                     try:
                         fetched_u, fetched_txt = browser_ctrl.get_latest_tweet_info(target_screen_name)
+                        unavail_reason = getattr(browser_ctrl, "last_unavailable_reason", "")
+                        if unavail_reason:
+                            log(f"   🚫 [{db_action_type}] @{target_screen_name} は {unavail_reason} のため共通ブラックリストへ登録してスキップ")
+                            db_mgr.record_sent(target_screen_name, account_id, db_action_type, "SUSPENDED", unavail_reason, target_url=target_tweet_url)
+                            return False, "SUSPENDED"
                         if fetched_u:
                             target_tweet_url = normalize_tweet_url(fetched_u) or fetched_u
                             if fetched_txt and not target_item.get("ツイート本文"):
                                 target_item["ツイート本文"] = fetched_txt
-                            if db_mgr.is_already_sent(target_screen_name, action_type=db_action_type, target_url=target_tweet_url):
-                                log(f"   ⏩ [{db_action_type}] @{target_screen_name} の最新ポスト ({target_tweet_url}) は過去に実行済みのためスキップ")
-                                return False, "ALREADY_SENT"
+                            if db_mgr.is_registered_in_db(target_screen_name, action_type=db_action_type, target_url=target_tweet_url):
+                                log(f"   ⏩ [{db_action_type}] @{target_screen_name} の最新ポスト ({target_tweet_url}) はDB登録済みのためスキップ")
+                                return False, "ALREADY_REGISTERED"
                     except Exception:
                         pass
 
                 def run_paired_like_and_follow():
+                    if db_mgr.is_user_unavailable(target_screen_name):
+                        log(f"   ⏩ [連動] @{target_screen_name} は凍結・存在しないアカウントのため連動処理をスキップ")
+                        return
                     if do_like:
                         try:
                             like_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
                             if not like_url or "/status/" not in like_url:
                                 try:
                                     f_like_u, _ = browser_ctrl.get_latest_tweet_info(target_screen_name)
+                                    if getattr(browser_ctrl, "last_unavailable_reason", ""):
+                                        db_mgr.record_sent(target_screen_name, account_id, "LIKE", "SUSPENDED", browser_ctrl.last_unavailable_reason)
+                                        return
                                     if f_like_u:
                                         like_url = normalize_tweet_url(f_like_u) or f_like_u
                                 except Exception:
@@ -1101,7 +1248,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 db_mgr.record_sent(target_screen_name, account_id, "LIKE", l_st, l_det, target_url=eff_like_url)
                         except Exception as l_err:
                             log(f"   ⚠️ [連動いいね通知] @{target_screen_name} のいいね実行中にエラー: {l_err}")
-                    if do_follow:
+                    if do_follow and not db_mgr.is_user_unavailable(target_screen_name):
                         try:
                             if db_mgr.is_already_sent(target_screen_name, action_type="FOLLOW"):
                                 log(f"   ⏩ [連動フォロー] @{target_screen_name} は過去にフォロー済みのためスキップ")
@@ -1124,6 +1271,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         if st in ["SUCCESS", "ALREADY_FOLLOWING"]:
                             processed_count += 1
                             return True, "SUCCESS"
+                        if st == "FAILED":
+                            browser_ctrl.capture_error_screenshot("follow_failed", clean_account_id, target_screen_name)
                         return False, st
 
                     elif act_key == "like":
@@ -1137,6 +1286,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         if st in ["SUCCESS", "ALREADY_LIKED"]:
                             processed_count += 1
                             return True, "SUCCESS"
+                        if st == "FAILED":
+                            browser_ctrl.capture_error_screenshot("like_failed", clean_account_id, target_screen_name)
                         return False, st
 
                     elif act_key in ["reply", "reply_ai"]:
@@ -1153,13 +1304,15 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         eff_rep_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
                         if eff_rep_url:
                             target_tweet_url = eff_rep_url
-                        db_mgr.record_sent(target_screen_name, account_id, "REPLY", st, rep_msg[:40], target_url=eff_rep_url)
+                        db_mgr.record_sent(target_screen_name, account_id, "REPLY", st, rep_msg[:40] if st == "SUCCESS" else det, target_url=eff_rep_url)
                         status_label = "リプライ完了" if st == "SUCCESS" else f"リプライ:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st == "SUCCESS":
                             run_paired_like_and_follow()
                             processed_count += 1
                             return True, "SUCCESS"
+                        if st == "FAILED":
+                            browser_ctrl.capture_error_screenshot("reply_failed", clean_account_id, target_screen_name)
                         return False, st
 
                     elif act_key == "dm":
@@ -1181,21 +1334,22 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             log(f"      🔑 登録済みDMパスコード (**** {len(effective_pass)}桁) を適用して暗号化解除・送信を実行します")
                         st, det = browser_ctrl.send_direct_message(target_screen_name, dm_msg, passcode=effective_pass)
                         log(f"   ✉️ [DM結果] {st} ({det})")
-                        db_mgr.record_sent(target_screen_name, account_id, "DM", st, dm_msg[:40], target_url=target_tweet_url)
+                        db_mgr.record_sent(target_screen_name, account_id, "DM", st, dm_msg[:40] if st == "SUCCESS" else det, target_url=target_tweet_url)
 
                         if st == "SUCCESS":
                             config_mgr.update_target_status(target_screen_name, "DM送信完了", target_path_override=acc_target_path)
                             run_paired_like_and_follow()
                             processed_count += 1
                             return True, "SUCCESS"
-                        elif st in ["INBOX_CLOSED", "DM_REJECTED", "LOCKED_ACCOUNT"]:
+                        elif st in ["INBOX_CLOSED", "DM_REJECTED", "LOCKED_ACCOUNT", "SUSPENDED"]:
                             is_inbox_closed = (st == "INBOX_CLOSED") or ("受信トレイ" in det) or ("Xナンバー" in det)
-                            status_label = "受信トレイ閉鎖(DM不可)" if is_inbox_closed else f"DMスキップ({det})"
+                            status_label = "アカウント凍結/削除済み" if st == "SUSPENDED" else ("受信トレイ閉鎖(DM不可)" if is_inbox_closed else f"DMスキップ({det})")
                             config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                             log(f"   ⏩ 【送信カウント除外】@{target_screen_name} は送信不可（{det}）のためスキップします（現在の成功: {current_success_count}/{target_batch_goal}件）")
                             time.sleep(random.uniform(1.8, 3.2))
                             return False, "SKIPPED_INBOX_CLOSED"
                         else:
+                            browser_ctrl.capture_error_screenshot("dm_failed", clean_account_id, target_screen_name)
                             config_mgr.update_target_status(target_screen_name, f"DMエラー({det})", target_path_override=acc_target_path)
                             return False, st
 
@@ -1213,17 +1367,23 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         eff_quote_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
                         if eff_quote_url:
                             target_tweet_url = eff_quote_url
-                        db_mgr.record_sent(target_screen_name, account_id, "QUOTE", st, q_msg[:40], target_url=eff_quote_url)
+                        db_mgr.record_sent(target_screen_name, account_id, "QUOTE", st, q_msg[:40] if st == "SUCCESS" else det, target_url=eff_quote_url)
                         status_label = "引用RT完了" if st == "SUCCESS" else f"引用RT:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st == "SUCCESS":
                             run_paired_like_and_follow()
                             processed_count += 1
                             return True, "SUCCESS"
+                        if st == "FAILED":
+                            browser_ctrl.capture_error_screenshot("quote_failed", clean_account_id, target_screen_name)
                         return False, st
 
                 except Exception as target_err:
                     log(f"   ⚠️ ターゲット @{target_screen_name} の処理中にエラーが発生したためスキップします: {target_err}")
+                    try:
+                        browser_ctrl.capture_error_screenshot(f"{act_key}_exception", clean_account_id, target_screen_name)
+                    except Exception:
+                        pass
                     try:
                         config_mgr.update_target_status(target_screen_name, f"エラースキップ({target_err})", target_path_override=acc_target_path)
                     except Exception:
@@ -1289,13 +1449,13 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 for mode_idx, (m_type, m_label) in enumerate(act_modes, start=1):
                     check_pause_state(f"{act_title} モード [{mode_idx}/{len(act_modes)}: {m_label}] 開始前")
-                    mode_targets = collect_targets_for_mode(m_type, m_label)
+                    mode_targets = collect_targets_for_mode(m_type, m_label, act_key=act_key)
                     if not mode_targets:
-                        log(f"ℹ️ [{act_title} / {m_label}] 有効なターゲットが0件でした。次のモードへ進みます。")
+                        log(f"ℹ️ [{act_title} / {m_label}] 完全新規の有効ターゲットが0件でした。次のモードへ進みます。")
                         continue
 
                     batch_target_count = random.randint(act_min_b, act_max_b)
-                    log(f"📋 [{act_title} / {m_label}] 取得ターゲット: {len(mode_targets)}件 / 目標連続処理数: {batch_target_count}件")
+                    log(f"📋 [{act_title} / {m_label}] 取得新規ターゲット: {len(mode_targets)}件 / 目標連続処理数: {batch_target_count}件")
 
                     mode_success_count = 0
                     for t_idx, target in enumerate(mode_targets, start=1):
@@ -1324,39 +1484,62 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
             # --- 全アクション終了後のフォールバック＆新規アカウント救済 ---
             if total_actions_performed == 0 and active_action_jobs:
-                log("")
-                log("⚠️ 【全モード完了確認】設定されたモードによる実行件数が0件でした。Excel内の未送信ターゲットまたは自動救済を確認します...")
-                existing_targets = config_mgr.load_targets(limit=target_read_limit if target_read_limit > 0 else 0, target_path_override=acc_target_path)
-                if not existing_targets:
-                    log("💡 【新規アカウント救済モード】標準キーワード「相互フォロー (最新)」からアクティブユーザーを探索します...")
-                    auto_found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type="最新", scroll_limit=scroll_limit, max_targets=target_read_limit)
-                    append_collected_items(auto_found, "自動救済:相互フォロー(最新)", existing_targets)
-
-                if existing_targets:
-                    act_key, act_title, a_cfg = active_action_jobs[0]
-                    act_min_int = float(a_cfg.get("min_interval", 60.0))
-                    act_max_int = float(a_cfg.get("max_interval", 180.0))
-                    act_min_b = max(1, int(a_cfg.get("min_batch", 1)))
-                    act_max_b = max(act_min_b, int(a_cfg.get("max_batch", act_min_b)))
-                    batch_target_count = random.randint(act_min_b, act_max_b)
-                    use_ai = bool(a_cfg.get("ai_gen", False)) or act_key.endswith("_ai")
-                    do_like = bool(a_cfg.get("like_enabled", False))
-                    do_follow = bool(a_cfg.get("follow_enabled", False))
-                    fb_success_count = 0
-                    for t_idx, target in enumerate(existing_targets, start=1):
-                        if fb_success_count >= batch_target_count:
-                            break
-                        is_ok, _ = execute_single_action_on_target(act_key, target, t_idx, len(existing_targets), fb_success_count, batch_target_count, use_ai=use_ai, do_like=do_like, do_follow=do_follow)
-                        if is_ok:
-                            fb_success_count += 1
-                            total_actions_performed += 1
-                            if fb_success_count < batch_target_count and t_idx < len(existing_targets):
-                                wait_between_targets(random.uniform(act_min_int, act_max_int), act_title, fb_success_count, batch_target_count, act_min_int, act_max_int)
+                configured_mode_types = {
+                    mt
+                    for (_, _, acfg) in active_action_jobs
+                    for (mt, _) in parse_mode_list(acfg.get("mode") or target_mode or "検索最新")
+                }
+                if configured_mode_types and configured_mode_types.issubset({"URL_REPLY", "URL_FOLLOW"}):
+                    log("")
+                    log("ℹ️ 【URLリスト専用終了】URLリスト系モードのみが指定されており、新規ターゲットが見つからなかったため（相互フォロー検索等の自動救済は行わず）このまま安全終了します。")
                 else:
-                    log("ℹ️ 有効なターゲットが見つかりませんでした。安全に今回のアカウント処理を終了します。")
+                    log("")
+                    log("⚠️ 【全モード完了確認】設定されたモードによる実行件数が0件でした。Excel内の未送信・DB未登録ターゲットまたは自動救済を確認します...")
+                    act_key_fb = active_action_jobs[0][0]
+                    fb_db_act = db_action_map.get(act_key_fb, "DM")
+                    fb_skip_fn = lambda u, tu="": db_mgr.is_user_unavailable(u) or db_mgr.is_registered_in_db(u, action_type=fb_db_act, target_url=tu)
+                    raw_existing = config_mgr.load_targets(limit=0, target_path_override=acc_target_path)
+                    existing_targets = [
+                        it for it in raw_existing
+                        if not fb_skip_fn(normalize_screen_name(it.get("アカウント名") or it.get("ターゲットURL") or ""), normalize_tweet_url(it.get("ツイートURL") or it.get("ターゲットURL") or ""))
+                    ]
+                    if target_read_limit > 0:
+                        existing_targets = existing_targets[:target_read_limit]
+                    if not existing_targets:
+                        log("💡 【新規アカウント救済モード】標準キーワード「相互フォロー (最新)」からDB未登録のアクティブユーザーを探索します...")
+                        auto_found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type="最新", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=fb_skip_fn)
+                        append_collected_items(auto_found, "自動救済:相互フォロー(最新)", existing_targets)
+
+                    if existing_targets:
+                        act_key, act_title, a_cfg = active_action_jobs[0]
+                        act_min_int = float(a_cfg.get("min_interval", 60.0))
+                        act_max_int = float(a_cfg.get("max_interval", 180.0))
+                        act_min_b = max(1, int(a_cfg.get("min_batch", 1)))
+                        act_max_b = max(act_min_b, int(a_cfg.get("max_batch", act_min_b)))
+                        batch_target_count = random.randint(act_min_b, act_max_b)
+                        use_ai = bool(a_cfg.get("ai_gen", False)) or act_key.endswith("_ai")
+                        do_like = bool(a_cfg.get("like_enabled", False))
+                        do_follow = bool(a_cfg.get("follow_enabled", False))
+                        fb_success_count = 0
+                        for t_idx, target in enumerate(existing_targets, start=1):
+                            if fb_success_count >= batch_target_count:
+                                break
+                            is_ok, _ = execute_single_action_on_target(act_key, target, t_idx, len(existing_targets), fb_success_count, batch_target_count, use_ai=use_ai, do_like=do_like, do_follow=do_follow)
+                            if is_ok:
+                                fb_success_count += 1
+                                total_actions_performed += 1
+                                if fb_success_count < batch_target_count and t_idx < len(existing_targets):
+                                    wait_between_targets(random.uniform(act_min_int, act_max_int), act_title, fb_success_count, batch_target_count, act_min_int, act_max_int)
+                    else:
+                        log("ℹ️ 有効なターゲットが見つかりませんでした。安全に今回のアカウント処理を終了します。")
 
         except Exception as e:
             log(f"⚠️ アカウント [{account_id}] の処理中に予期せぬエラーが発生しました: {e}。このアカウントを安全にスキップし、次のアカウントへ進みます。")
+            try:
+                if browser_ctrl:
+                    browser_ctrl.capture_error_screenshot("account_exception", clean_account_id)
+            except Exception:
+                pass
             traceback.print_exc()
         finally:
             check_pause_state("ブラウザ終了前")
@@ -1445,6 +1628,7 @@ def main():
     print("=" * 65)
 
     base_dir = get_base_dir()
+    os.makedirs(os.path.join(base_dir, "スクショフォルダ"), exist_ok=True)
     account_config_path = os.path.join(base_dir, "アカウント情報.xlsx")
     default_target_path = os.path.join(base_dir, "アカウント名.xlsx")
     if not os.path.exists(default_target_path):

@@ -34,7 +34,12 @@ def main():
     print("  🌐 X(Twitter) アカウント編集・設定確認モード (ウィンドウ保持)")
     print("=" * 60)
 
-    base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        env_dir = os.environ.get("X_AUTO_DM_BASE_DIR", "").strip().strip('"')
+        d = os.path.dirname(os.path.abspath(__file__))
+        base_dir = os.path.normpath(env_dir) if (env_dir and os.path.isdir(env_dir)) else (os.path.dirname(d) if os.path.basename(d) == "_app" else d)
     acc_path = os.path.join(base_dir, "アカウント情報.xlsx")
     target_path = os.path.join(base_dir, "アカウント名.xlsx")
     config_mgr = ConfigManager(acc_path, target_path)
@@ -125,10 +130,15 @@ def main():
                 except Exception:
                     break
         else:
+            browser_ctrl.capture_error_screenshot("edit_login_failed", account_id)
             print("❌ ログインに失敗しました。認証情報をご確認ください。")
             time.sleep(5)
     except Exception as e:
         print(f"エラー: {e}")
+        try:
+            browser_ctrl.capture_error_screenshot("edit_exception", account_id)
+        except Exception:
+            pass
     finally:
         browser_ctrl.close()
         print("アカウント編集セッションを終了しました。")

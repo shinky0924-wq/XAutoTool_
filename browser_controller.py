@@ -13,6 +13,7 @@ import re
 import time
 import random
 import math
+import subprocess
 
 # Windows CP932 / Emoji UnicodeEncodeError 対策
 if sys.platform == "win32":
@@ -29,7 +30,8 @@ def _setup_bundled_browsers():
     if "PLAYWRIGHT_BROWSERS_PATH" in os.environ and os.path.exists(os.environ["PLAYWRIGHT_BROWSERS_PATH"]):
         return
     base_dir = os.path.dirname(os.path.abspath(__file__))
-    app_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else base_dir
+    env_dir = os.environ.get("X_AUTO_DM_BASE_DIR", "").strip().strip('"')
+    app_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else (os.path.normpath(env_dir) if (env_dir and os.path.isdir(env_dir)) else base_dir)
     candidates = [
         os.path.join(app_dir, "_internal", "ms-playwright"),
         os.path.join(app_dir, "browsers"),
@@ -38,6 +40,7 @@ def _setup_bundled_browsers():
         os.path.join(base_dir, "browsers"),
         os.path.join(os.path.dirname(app_dir), "_internal", "ms-playwright"),
         os.path.join(os.path.dirname(app_dir), "browsers"),
+        os.path.join(os.path.dirname(base_dir), "_internal", "ms-playwright"),
     ]
     for c in candidates:
         if os.path.isdir(c):
@@ -163,6 +166,57 @@ class XBrowserController:
         self.context = None
         self.page: Page = None
         self.last_acted_tweet_url = ""
+        self.last_unavailable_reason = ""
+        self.last_error_screenshot = ""
+
+    def get_screenshot_dir(self) -> str:
+        """スクショフォルダのパスを取得し、無ければ自動作成"""
+        base = self.base_dir or os.path.dirname(os.path.abspath(__file__))
+        for folder_name in ["スクショフォルダ", "screenshots", "screenshot", "error_screenshots"]:
+            p = os.path.join(base, folder_name)
+            if os.path.isdir(p):
+                return p
+        default_p = os.path.join(base, "スクショフォルダ")
+        os.makedirs(default_p, exist_ok=True)
+        return default_p
+
+    def capture_error_screenshot(self, label: str = "error", account_id: str = "", target_id: str = "") -> str:
+        """エラー発生時のブラウザ画面を スクショフォルダ へPNG保存"""
+        try:
+            ss_dir = self.get_screenshot_dir()
+            acc = normalize_screen_name(account_id or self.current_account_id or "") or "account"
+            tgt = normalize_screen_name(target_id or "")
+            safe_acc = re.sub(r'[\\/*?:"<>|\s]+', '_', acc).strip('_') or "account"
+            safe_lbl = re.sub(r'[\\/*?:"<>|\s]+', '_', str(label or "error")).strip('_') or "error"
+            safe_tgt = re.sub(r'[\\/*?:"<>|\s]+', '_', tgt).strip('_') if tgt else ""
+            ts = time.strftime("%Y%m%d_%H%M%S")
+            parts = [ts, safe_acc, safe_lbl]
+            if safe_tgt:
+                parts.append(safe_tgt)
+            fname = "_".join(parts)[:140] + ".png"
+            save_path = os.path.join(ss_dir, fname)
+
+            target_page = self.page
+            if target_page is None or target_page.is_closed():
+                target_page = None
+                if self.context is not None:
+                    for p in reversed(self.context.pages):
+                        try:
+                            if not p.is_closed():
+                                target_page = p
+                                break
+                        except Exception:
+                            pass
+            if target_page is None:
+                return ""
+
+            target_page.screenshot(path=save_path, timeout=5000)
+            self.last_error_screenshot = save_path
+            print(f"   📸 [エラースクショ保存] {os.path.join('スクショフォルダ', fname)}", flush=True)
+            return save_path
+        except Exception as ss_err:
+            print(f"   ⚠️ [スクショ保存失敗] {ss_err}", flush=True)
+            return ""
 
     def _cleanup_profile_locks(self):
         """プロファイルフォルダ内の残存ロックファイルをクリーンアップ (Windows lock/EBUSY対策)"""
@@ -187,7 +241,8 @@ class XBrowserController:
         try:
             # 該当プロファイルフォルダ名を含むプロセスのみピンポイントで解放（ユーザー自身の個人ブラウザには一切干渉しない）
             ps_cmd = f'Get-CimInstance Win32_Process -Filter "Name=\'chrome.exe\' OR Name=\'msedge.exe\'" | Where-Object {{ $_.CommandLine -like \'*{prof_name}*\' }} | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}'
-            subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd], capture_output=True, timeout=3)
+            cflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd], capture_output=True, timeout=3, creationflags=cflags)
         except Exception:
             pass
 
@@ -213,11 +268,11 @@ class XBrowserController:
 
         # 1. Google Chrome (PCにインストールされている場合、最も安定・高速・BAN耐性高)
         chrome_paths = [
-            r"C:Program FilesGoogleChromeApplicationchrome.exe",
-            r"C:Program Files (x86)GoogleChromeApplicationchrome.exe",
-            os.path.expandvars(r"%LocalAppData%GoogleChromeApplicationchrome.exe"),
-            os.path.expandvars(r"%ProgramFiles%GoogleChromeApplicationchrome.exe"),
-            os.path.expandvars(r"%ProgramFiles(x86)%GoogleChromeApplicationchrome.exe"),
+            r"C:\Program Files\Google\Chrome\Application\chrome.exe",
+            r"C:\Program Files (x86)\Google\Chrome\Application\chrome.exe",
+            os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+            os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
         ]
         if any(os.path.isfile(p) for p in chrome_paths):
             if "chrome" not in candidates:
@@ -225,10 +280,10 @@ class XBrowserController:
 
         # 2. Microsoft Edge (Windows 10/11標準搭載。Microsoft署名済みでセキュリティソフトに絶対ブロックされない)
         edge_paths = [
-            r"C:Program Files (x86)MicrosoftEdgeApplicationmsedge.exe",
-            r"C:Program FilesMicrosoftEdgeApplicationmsedge.exe",
-            os.path.expandvars(r"%ProgramFiles(x86)%MicrosoftEdgeApplicationmsedge.exe"),
-            os.path.expandvars(r"%ProgramFiles%MicrosoftEdgeApplicationmsedge.exe"),
+            r"C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe",
+            r"C:\Program Files\Microsoft\Edge\Application\msedge.exe",
+            os.path.expandvars(r"%ProgramFiles(x86)%\Microsoft\Edge\Application\msedge.exe"),
+            os.path.expandvars(r"%ProgramFiles%\Microsoft\Edge\Application\msedge.exe"),
         ]
         if any(os.path.isfile(p) for p in edge_paths):
             if "msedge" not in candidates:
@@ -1379,6 +1434,7 @@ class XBrowserController:
         print("      （一度ログインしてChromeを閉じれば、2回目以降は再ログイン不要で自動稼働します）")
         print("   2. もし自動ログインを使う場合は『アカウント情報.xlsx』に auth_token または パスワード を記入してください。")
         print()
+        self.capture_error_screenshot("login_failed", account_id=account_id)
         return False
 
     def _is_logged_in(self, allow_url_fallback: bool = True) -> bool:
@@ -1414,11 +1470,45 @@ class XBrowserController:
             pass
         return False
 
+    def _detect_unavailable_account_reason(self, page: Page) -> str:
+        """現在の画面が「アカウント凍結」「存在しない（削除済み）」等の恒久利用不可状態かを高速判定"""
+        if page is None:
+            return ""
+        try:
+            loc = page.locator('[data-testid="emptyState"], [data-testid="error-detail"]')
+            texts = []
+            cnt = min(loc.count(), 4)
+            for idx in range(cnt):
+                try:
+                    el = loc.nth(idx)
+                    if el.is_visible():
+                        texts.append(el.inner_text() or "")
+                except Exception:
+                    pass
+            if not texts:
+                # ステータス画面・プロフィール画面でemptyStateが出ない場合のフォールバック判定
+                primary = page.locator('div[data-testid="primaryColumn"]')
+                if primary.count() > 0:
+                    try:
+                        texts.append(primary.first.inner_text()[:800] or "")
+                    except Exception:
+                        pass
+            combined = " ".join(texts)
+            comb_lower = combined.lower()
+            if any(k in combined for k in ("アカウントは凍結されています", "凍結されたアカウント")) or "account suspended" in comb_lower or "account is suspended" in comb_lower:
+                return "アカウント凍結済み"
+            if any(k in combined for k in ("このアカウントは存在しません", "アカウントが存在しません", "存在しません")) or "this account doesn't exist" in comb_lower or "this account doesn’t exist" in comb_lower:
+                return "アカウントが存在しないか削除済み"
+        except Exception:
+            pass
+        return ""
+
     def wait_for_profile_ready(self, target_screen_name: str, timeout: float = 20.0) -> bool:
         """
         プロフィールのReactハイドレーション・ヘッダーボタン（フォロー/DM等）の描画完了を確実に待機 (表示ラグ完全吸収)
         """
         page = self.ensure_page()
+        self.last_unavailable_reason = ""
         clean_target = normalize_screen_name(target_screen_name)
         if not clean_target:
             return False
@@ -1453,11 +1543,16 @@ class XBrowserController:
                 continue
 
             # A. 存在しない / 凍結 / 制限アカウントの即時チェック
+            unavail_reason = self._detect_unavailable_account_reason(page)
+            if unavail_reason:
+                self.last_unavailable_reason = unavail_reason
+                print(f"   🚫 アカウント利用不可検知: {unavail_reason} (@{clean_target})")
+                return False
             try:
                 empty_state = page.locator('[data-testid="emptyState"], [data-testid="error-detail"]')
                 if empty_state.count() > 0 and empty_state.first.is_visible():
                     err_txt = empty_state.first.inner_text()
-                    if any(kw in err_txt for kw in ["存在しません", "凍結", "制限", "ブロック"]):
+                    if any(kw in err_txt for kw in ["制限", "ブロック"]):
                         print(f"   ⚠️ アカウント利用不可（{err_txt[:30]}）")
                         return False
             except Exception:
@@ -1610,6 +1705,10 @@ class XBrowserController:
         
         # 0. プロフィールの描画完了を待機 (ラグ対策: ボタンが完全に表示されるまで待機)
         self.wait_for_profile_ready(clean_target, timeout=20.0)
+        unavail = self.last_unavailable_reason or self._detect_unavailable_account_reason(page)
+        if unavail:
+            print(f"   🚫 @{clean_target} は利用不可のためDMスキップ ({unavail})")
+            return "SUSPENDED", unavail
 
         # テンプレート変数 ({name}, {名前}, {アカウント名}, {full_name}, {表示名}, {id}) の自動解決 (IDではなく実際のアカウント名に置換)
         if any(tag in message_text for tag in ["{name}", "{名前}", "{アカウント名}", "{full_name}", "{表示名}", "{id}", "{mention}"]):
@@ -1687,6 +1786,9 @@ class XBrowserController:
             time.sleep(0.4)
 
         if not dm_button:
+            unavail_after = self.last_unavailable_reason or self._detect_unavailable_account_reason(page)
+            if unavail_after:
+                return "SUSPENDED", unavail_after
             if is_locked:
                 print("   🚫 鍵アカウント（非公開）のためDMボタンが存在しません。")
                 return "DM_REJECTED", "鍵アカウント（非公開アカウント）"
@@ -2012,6 +2114,7 @@ class XBrowserController:
     def _find_tweet_on_status_page(self, tweet_url: str):
         """ステータス詳細URLへアクセスし、対象ツイートのarticle要素を取得"""
         page = self.ensure_page()
+        self.last_unavailable_reason = ""
         try:
             current_url = page.url.lower().split("?")[0].rstrip("/")
             clean_dest = tweet_url.lower().split("?")[0].rstrip("/")
@@ -2029,6 +2132,11 @@ class XBrowserController:
                             break
                     except Exception:
                         pass
+                unavail = self._detect_unavailable_account_reason(page)
+                if unavail:
+                    self.last_unavailable_reason = unavail
+                    print(f"   🚫 ステータス画面で利用不可アカウント検知: {unavail}")
+                    return None
                 time.sleep(0.4)
 
             # 12秒待っても見つからず、かつエラー画面が出ている場合のみページ内再試行
@@ -2038,6 +2146,9 @@ class XBrowserController:
                 tweet_articles = page.locator('article[data-testid="tweet"]')
 
             if tweet_articles.count() == 0:
+                unavail = self._detect_unavailable_account_reason(page)
+                if unavail:
+                    self.last_unavailable_reason = unavail
                 return None
 
             status_id = tweet_url.split("/status/")[-1].split("?")[0].split("/")[0]
@@ -2278,6 +2389,8 @@ class XBrowserController:
         try:
             page = self.ensure_page()
             self.wait_for_profile_ready(clean_target, timeout=18.0)
+            if self.last_unavailable_reason:
+                return "", ""
             tweet_articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]')
             if tweet_articles.count() == 0:
                 tweet_articles = page.locator('article[data-testid="tweet"]')
@@ -2407,6 +2520,8 @@ class XBrowserController:
                 else:
                     print("   ⚠️ 取得ツイートのリプライ入力欄起動に失敗しました。")
             else:
+                if self.last_unavailable_reason:
+                    return "SUSPENDED", self.last_unavailable_reason
                 print("   ⚠️ 取得ツイートが見つかりませんでした。")
             print("   👉 プロフィール画面からの最新ツイートリプライへフォールバックします...")
 
@@ -2418,6 +2533,9 @@ class XBrowserController:
 
         # 0. プロフィールの描画完了を待機 (ラグ対策)
         self.wait_for_profile_ready(clean_target, timeout=20.0)
+        unavail = self.last_unavailable_reason or self._detect_unavailable_account_reason(page)
+        if unavail:
+            return "SUSPENDED", unavail
 
         # 鍵垢チェック
         if page.locator('svg[data-testid="icon-lock"]').count() > 0 and page.locator('button[data-testid$="-follow"]').count() > 0:
@@ -2558,6 +2676,8 @@ class XBrowserController:
                 else:
                     print("   ⚠️ 取得ツイートにいいねボタンが見つかりません。")
             else:
+                if self.last_unavailable_reason:
+                    return "SUSPENDED", self.last_unavailable_reason
                 print("   ⚠️ 取得ツイートの読み込みに失敗しました（削除または非公開の可能性）。")
             print("   👉 プロフィール画面からの最新ツイートいいねへフォールバックします...")
 
@@ -2569,6 +2689,9 @@ class XBrowserController:
 
         # 0. プロフィールの描画完了を待機 (ラグ対策: ボタンが完全に表示されるまで待機)
         self.wait_for_profile_ready(clean_target, timeout=20.0)
+        unavail = self.last_unavailable_reason or self._detect_unavailable_account_reason(page)
+        if unavail:
+            return "SUSPENDED", unavail
 
         # 1. 鍵アカウント（非公開アカウント）かつ未フォローのチェック
         is_locked = page.locator('svg[data-testid="icon-lock"]').count() > 0
@@ -2684,10 +2807,13 @@ class XBrowserController:
         self.wait_for_profile_ready(clean_target, timeout=20.0)
 
         # 1. 存在しないアカウント / 凍結チェック
+        unavail = self.last_unavailable_reason or self._detect_unavailable_account_reason(page)
+        if unavail:
+            return "SUSPENDED", unavail
         try:
             body_text = page.locator('body').inner_text()
-            if "このアカウントは存在しません" in body_text or "アカウントは凍結されています" in body_text:
-                return "FAILED", "アカウントが存在しないか凍結"
+            if "このアカウントは存在しません" in body_text or "アカウントは凍結されています" in body_text or "Account suspended" in body_text or "doesn't exist" in body_text.lower():
+                return "SUSPENDED", "アカウントが存在しないか凍結"
         except Exception:
             pass
 
@@ -2867,6 +2993,8 @@ class XBrowserController:
                 else:
                     print("   ⚠️ 取得ツイートにリツイートボタンが見つかりません。")
             else:
+                if self.last_unavailable_reason:
+                    return "SUSPENDED", self.last_unavailable_reason
                 print("   ⚠️ 取得ツイートが見つかりませんでした。")
             print("   👉 プロフィール画面からの最新ツイート引用RTへフォールバックします...")
 
@@ -2878,6 +3006,9 @@ class XBrowserController:
 
         # 0. プロフィールの描画完了を待機 (ラグ対策)
         self.wait_for_profile_ready(clean_target, timeout=20.0)
+        unavail = self.last_unavailable_reason or self._detect_unavailable_account_reason(page)
+        if unavail:
+            return "SUSPENDED", unavail
 
         try:
             current_url = page.url.lower().rstrip("/")
@@ -3072,7 +3203,7 @@ class XBrowserController:
         except Exception:
             pass
 
-    def collect_targets_from_search(self, keyword: str, search_type: str = "最新", scroll_limit: int = 5, max_targets: int = 0) -> list[dict]:
+    def collect_targets_from_search(self, keyword: str, search_type: str = "最新", scroll_limit: int = 5, max_targets: int = 0, should_skip_fn=None) -> list[dict]:
         """
         1. 検索キーワードからターゲットをスクロール収集
         - 最新: https://x.com/search?q={keyword}&f=live
@@ -3082,7 +3213,7 @@ class XBrowserController:
         ・検索結果タイムライン (primaryColumn) 内に実際に出てきたツイートの投稿者および【そのツイート自身のURL (tweet_url)】を上から順番に抽出
         ・右サイドバーのおすすめユーザーや @elonmusk 等の無関係な推薦アカウントは一切除外
         ・プロモーション（広告）ツイートは除外
-        ・max_targets (Excelの「ターゲット件数」) が指定されている場合、上限に達した時点でスクロールを即時完了
+        ・should_skip_fn が指定されている場合、DB登録済み・凍結済みの対象は件数にカウントせずスキップし、完全新規のみで max_targets を収集
         """
         import urllib.parse
         page = self.ensure_page()
@@ -3135,7 +3266,8 @@ class XBrowserController:
             pass
 
         discovered = []
-        seen = set()
+        seen_users = set()
+        seen_dom = set()
         system_names = {
             "home", "explore", "notifications", "messages", "search", "settings", 
             "i", "privacy", "tos", "help", "support", "x", "twitter", "safety", "verified"
@@ -3145,6 +3277,8 @@ class XBrowserController:
             system_names.add("elonmusk")
 
         has_tried_top_fallback = False
+        no_new_dom_scrolls = 0
+        total_db_skipped = 0
 
         for scroll_idx in range(scroll_limit):
             # メインタイムライン (primaryColumn) 内のツイートのみを取得（サイドバーは完全除外）
@@ -3155,6 +3289,8 @@ class XBrowserController:
                 tweet_articles = page.locator('article[data-testid="tweet"]').all()
 
             skipped_filter_cnt = 0
+            scroll_db_skipped = 0
+            dom_before = len(seen_dom)
             for tweet in tweet_articles:
                 try:
                     # 通常モード除外: 広告・リポスト・誰かへの返信をスキップし本人の通常ポストのみ対象
@@ -3181,10 +3317,10 @@ class XBrowserController:
                         if href and href.startswith("/") and not href.startswith("/i/") and "/status/" not in href and "/search" not in href and "/hashtag/" not in href:
                             username = href.strip("/").split("/")[0].split("?")[0]
                             cand_u = normalize_screen_name(username)
-                            if cand_u and cand_u.lower() not in seen and cand_u.lower() not in system_names:
+                            if cand_u and cand_u.lower() not in system_names:
                                 clean_u = cand_u
                                 break
-                    if not clean_u:
+                    if not clean_u or clean_u.lower() in seen_users:
                         continue
 
                     # ★ ユーザー要件対応: 取得したツイート自身のパーマリンクURL抽出
@@ -3215,6 +3351,16 @@ class XBrowserController:
                     except Exception:
                         pass
 
+                    dom_key = (tweet_url or clean_u).lower()
+                    if dom_key in seen_dom:
+                        continue
+                    seen_dom.add(dom_key)
+
+                    if should_skip_fn and should_skip_fn(clean_u, tweet_url):
+                        scroll_db_skipped += 1
+                        total_db_skipped += 1
+                        continue
+
                     disp_name = ""
                     if user_box.count() > 0:
                         try:
@@ -3239,7 +3385,7 @@ class XBrowserController:
                         except Exception:
                             pass
 
-                    seen.add(clean_u.lower())
+                    seen_users.add(clean_u.lower())
                     discovered.append({
                         "screen_name": clean_u,
                         "tweet_url": tweet_url,
@@ -3253,14 +3399,27 @@ class XBrowserController:
                 except Exception:
                     continue
 
-            skip_note = f" (リプライ/リポスト/広告 {skipped_filter_cnt}件除外)" if skipped_filter_cnt > 0 else ""
-            print(f"   スクロール [{scroll_idx + 1}/{scroll_limit}]: 検索結果タイムラインから現在 {len(discovered)} 件抽出 (上から順){skip_note}")
+            skip_notes = []
+            if skipped_filter_cnt > 0:
+                skip_notes.append(f"リプライ/リポスト/広告 {skipped_filter_cnt}件除外")
+            if scroll_db_skipped > 0:
+                skip_notes.append(f"DB登録済・不可 {scroll_db_skipped}件スキップ")
+            skip_note = f" ({' / '.join(skip_notes)})" if skip_notes else ""
+            print(f"   スクロール [{scroll_idx + 1}/{scroll_limit}]: 新規ターゲット {len(discovered)} 件抽出 (上から順){skip_note}")
             if max_targets > 0 and len(discovered) >= max_targets:
-                print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件) に達したため、収集を完了します。")
+                print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件・完全新規) に達したため、収集を完了します。")
                 break
 
-            # もし「最新」タブで2回スクロールしても0件の場合、Top (おすすめ) 検索へ自動切り替え
-            if not has_tried_top_fallback and scroll_idx >= 1 and len(discovered) == 0 and search_type in ["最新", "live", "Live"]:
+            if len(seen_dom) == dom_before:
+                no_new_dom_scrolls += 1
+                if no_new_dom_scrolls >= 3:
+                    print(f"   ℹ️ これ以上新しいポストが読み込まれないため、検索収集を終了します (新規 {len(discovered)}件 / DBスキップ累計 {total_db_skipped}件)。")
+                    break
+            else:
+                no_new_dom_scrolls = 0
+
+            # もし「最新」タブで2回スクロールしても0件かつDBスキップも0件の場合、Top (おすすめ) 検索へ自動切り替え
+            if not has_tried_top_fallback and scroll_idx >= 1 and len(discovered) == 0 and total_db_skipped == 0 and search_type in ["最新", "live", "Live"]:
                 has_tried_top_fallback = True
                 top_url = f"https://x.com/search?q={encoded_kw}"
                 print(f"   ℹ️ 最新タブで0件のため、Top (おすすめ) 検索タブ ({top_url}) へ切り替えて探索します...")
@@ -3279,18 +3438,29 @@ class XBrowserController:
 
         return discovered[:max_targets] if max_targets > 0 else discovered
 
-    def collect_targets_from_replies(self, replies_url: str, scroll_limit: int = 5, max_targets: int = 0) -> list[dict]:
+    def collect_targets_from_replies(
+        self,
+        replies_url: str,
+        scroll_limit: int = 5,
+        max_targets: int = 0,
+        should_skip_fn=None,
+        exclude_owner: bool = True,
+        out_parent_candidates: list = None,
+    ) -> list[dict]:
         """
-        2. リプライURLからターゲットをスクロール収集 (例: https://x.com/Panda_ko7/with_replies)
-        メインタイムライン上のリプライ投稿者および【そのリプライツイートのURL】を上から順に抽出
+        2. リプライURLからターゲットをスクロール収集 (例: https://x.com/tplt0rN3nM15069/with_replies)
+        - /with_replies URL の場合（exclude_owner=True）: 登録アカウント本人（返信主側）は除外し、親ポスト側（@ririka__hana 等）のみを抽出
+        - out_parent_candidates が渡された場合: ホップ用の親ポストURL候補（DBスキップ済み含む）を順序付きで追記
         """
         page = self.ensure_page()
+        self.last_unavailable_reason = ""
         print(f"💬 リプライURLへアクセス中: {replies_url}")
         try:
             page.goto(replies_url, timeout=35000, wait_until="domcontentloaded")
         except Exception as ge:
             print(f"   ⚠️ リプライページアクセス通知: {ge}")
-        # リプライツイートの描画完了を待機（最大12秒）
+
+        # リプライツイートの描画完了を待機（最大12秒・凍結/存在しないアカウントは即終了）
         print("   ⏳ リプライ一覧の描画完了を待機中...")
         tweets_found = False
         start_wait = time.time()
@@ -3301,20 +3471,32 @@ class XBrowserController:
                     break
             except Exception:
                 pass
-            time.sleep(1.0)
+            unavail = self._detect_unavailable_account_reason(page)
+            if unavail:
+                self.last_unavailable_reason = unavail
+                print(f"   🚫 リプライ一覧ページ利用不可のためスキップ: {unavail} ({replies_url})")
+                return []
+            time.sleep(0.8)
 
         if not tweets_found and self.check_error_screen(page):
             self.recover_if_stuck(replies_url, "リプライ一覧の読み込みエラー")
             page = self.ensure_page()
 
         discovered = []
-        seen = set()
+        seen_users = set()
+        seen_dom = set()
         system_names = {"home", "explore", "notifications", "messages", "search", "settings", "i", "privacy", "tos", "elonmusk"}
 
         root_status_id = ""
         root_post_text = ""
+        owner_user = normalize_screen_name(replies_url).lower()
+        is_profile_replies = "/status/" not in replies_url and bool(owner_user)
         if "/status/" in replies_url:
             root_status_id = replies_url.split("/status/")[-1].split("?")[0].split("/")[0]
+
+        no_new_dom_scrolls = 0
+        total_db_skipped = 0
+        fallback_owner_status_urls = []
 
         for scroll_idx in range(scroll_limit):
             tweet_articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]').all()
@@ -3340,6 +3522,8 @@ class XBrowserController:
                     except Exception:
                         pass
 
+            scroll_db_skipped = 0
+            dom_before = len(seen_dom)
             for tweet in tweet_articles:
                 try:
                     user_box = tweet.locator('div[data-testid="User-Name"]')
@@ -3351,13 +3535,13 @@ class XBrowserController:
                         if href and href.startswith("/") and not href.startswith("/i/") and "/status/" not in href:
                             username = href.strip("/").split("/")[0].split("?")[0]
                             cand_u = normalize_screen_name(username)
-                            if cand_u and cand_u.lower() not in seen and cand_u.lower() not in system_names:
+                            if cand_u and cand_u.lower() not in system_names:
                                 clean_u = cand_u
                                 break
                     if not clean_u:
                         continue
 
-                    # ★ ユーザー要件対応: リプライツイート自身のURLを抽出
+                    # ツイートURLを抽出
                     tweet_url = ""
                     try:
                         time_els = tweet.locator('time')
@@ -3378,8 +3562,32 @@ class XBrowserController:
                     except Exception:
                         pass
 
-                    # ステータスURL収集時は親ポスト自身（返信している人ではない）をスキップ
+                    # ステータスURL収集時は親ポスト自身をスキップ
                     if root_status_id and tweet_url and f"/status/{root_status_id}" in tweet_url:
+                        continue
+
+                    # /with_replies ページ上の「登録アカウント本人（返信側）」のツイートはターゲットから除外（親ポスト側のみ狙う）
+                    if exclude_owner and is_profile_replies and clean_u.lower() == owner_user:
+                        if out_parent_candidates is not None and tweet_url and tweet_url not in fallback_owner_status_urls:
+                            fallback_owner_status_urls.append(tweet_url)
+                        continue
+
+                    dom_key = (tweet_url or clean_u).lower()
+                    if dom_key in seen_dom:
+                        continue
+                    seen_dom.add(dom_key)
+
+                    # ★ 親ポスト側（@ririka__hana 等）のURLを、DBスキップ判定より前にホップ候補として記録
+                    if out_parent_candidates is not None and tweet_url and "/status/" in tweet_url:
+                        if tweet_url not in out_parent_candidates:
+                            out_parent_candidates.append(tweet_url)
+
+                    if clean_u.lower() in seen_users:
+                        continue
+
+                    if should_skip_fn and should_skip_fn(clean_u, tweet_url):
+                        scroll_db_skipped += 1
+                        total_db_skipped += 1
                         continue
 
                     disp_name = ""
@@ -3405,24 +3613,33 @@ class XBrowserController:
                     except Exception:
                         pass
 
-                    seen.add(clean_u.lower())
+                    seen_users.add(clean_u.lower())
                     discovered.append({
                         "screen_name": clean_u,
                         "tweet_url": tweet_url,
                         "display_name": disp_name,
                         "tweet_text": tweet_text,
                         "parent_tweet_text": root_post_text,
-                        "is_reply": True
+                        "is_reply": False if is_profile_replies else True
                     })
                     if max_targets > 0 and len(discovered) >= max_targets:
                         break
                 except Exception:
                     continue
 
-            print(f"   リプライ収集 [{scroll_idx + 1}/{scroll_limit}]: 現在 {len(discovered)} 件抽出 (上から順)")
+            db_note = f" (DB登録済・不可 {scroll_db_skipped}件スキップ)" if scroll_db_skipped > 0 else ""
+            print(f"   リプライ収集 [{scroll_idx + 1}/{scroll_limit}]: 新規ターゲット {len(discovered)} 件抽出 (親ポスト側のみ){db_note}")
             if max_targets > 0 and len(discovered) >= max_targets:
-                print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件) に達したため、収集を完了します。")
+                print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件・完全新規) に達したため、収集を完了します。")
                 break
+
+            if len(seen_dom) == dom_before:
+                no_new_dom_scrolls += 1
+                if no_new_dom_scrolls >= 3:
+                    print(f"   ℹ️ これ以上新しいリプライが読み込まれないため終了します (新規 {len(discovered)}件 / DBスキップ累計 {total_db_skipped}件)。")
+                    break
+            else:
+                no_new_dom_scrolls = 0
 
             try:
                 page.mouse.wheel(0, random.randint(600, 1100))
@@ -3430,9 +3647,94 @@ class XBrowserController:
                 pass
             time.sleep(random.uniform(1.8, 3.0))
 
+        # もし親ポスト記事が画面上に直列表示されなかったスレッド用フォールバック
+        if out_parent_candidates is not None and not out_parent_candidates and fallback_owner_status_urls:
+            for fu in fallback_owner_status_urls[:5]:
+                if fu not in out_parent_candidates:
+                    out_parent_candidates.append(fu)
+
         return discovered[:max_targets] if max_targets > 0 else discovered
 
-    def collect_targets_from_follow(self, follow_url: str, scroll_limit: int = 5, max_targets: int = 0) -> list[dict]:
+    def collect_repliers_from_parent_post(self, parent_tweet_url: str, exclude_users: set = None, max_candidates: int = 12) -> list[str]:
+        """
+        親ポストURLを開き、そこにリプライしている別アカウント（次の /with_replies 候補）一覧を上から順に取得
+        """
+        if not parent_tweet_url or "/status/" not in parent_tweet_url:
+            return []
+        page = self.ensure_page()
+        excluded = {normalize_screen_name(u).lower() for u in (exclude_users or set()) if normalize_screen_name(u)}
+        parent_author = normalize_screen_name(parent_tweet_url).lower()
+        if parent_author:
+            excluded.add(parent_author)
+        system_names = {"home", "explore", "notifications", "messages", "search", "settings", "i", "privacy", "tos", "elonmusk"}
+
+        print(f"   🔗 親ポストを開いて別リプライ主を探索中: {parent_tweet_url}")
+        try:
+            page.goto(parent_tweet_url, timeout=30000, wait_until="domcontentloaded")
+        except Exception as e:
+            print(f"   ⚠️ 親ポストアクセス警告: {e}")
+            return []
+
+        start_w = time.time()
+        tweet_loc = page.locator('article[data-testid="tweet"]')
+        while time.time() - start_w < 10.0:
+            if tweet_loc.count() > 0:
+                break
+            if self._detect_unavailable_account_reason(page):
+                return []
+            time.sleep(0.6)
+
+        if tweet_loc.count() == 0:
+            return []
+
+        parent_sid = parent_tweet_url.split("/status/")[-1].split("?")[0].split("/")[0]
+        candidates = []
+        seen_cand = set()
+
+        for scroll_pass in range(2):
+            articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]').all()
+            if not articles:
+                articles = page.locator('article[data-testid="tweet"]').all()
+
+            for art in articles:
+                try:
+                    # 親ポスト本体自身（先頭の会話元）はスキップ
+                    if parent_sid and art.locator(f'a[href*="/status/{parent_sid}"] time').count() > 0:
+                        continue
+                    user_box = art.locator('div[data-testid="User-Name"]')
+                    if user_box.count() == 0:
+                        continue
+                    cand_u = ""
+                    for link in user_box.locator('a[role="link"]').all():
+                        href = link.get_attribute("href")
+                        if href and href.startswith("/") and not href.startswith("/i/") and "/status/" not in href:
+                            u_raw = href.strip("/").split("/")[0].split("?")[0]
+                            cu = normalize_screen_name(u_raw)
+                            if cu and cu.lower() not in system_names:
+                                cand_u = cu
+                                break
+                    if not cand_u:
+                        continue
+                    cu_low = cand_u.lower()
+                    if cu_low in excluded or cu_low in seen_cand:
+                        continue
+                    seen_cand.add(cu_low)
+                    candidates.append(cand_u)
+                    if len(candidates) >= max_candidates:
+                        return candidates
+                except Exception:
+                    continue
+
+            if scroll_pass == 0:
+                try:
+                    page.mouse.wheel(0, 750)
+                    time.sleep(1.5)
+                except Exception:
+                    break
+
+        return candidates
+
+    def collect_targets_from_follow(self, follow_url: str, scroll_limit: int = 5, max_targets: int = 0, should_skip_fn=None) -> list[dict]:
         """
         3. フォロー・フォロワーURLからターゲットをスクロール収集 (例: https://x.com/dekasegood03/following)
         メインカラム上のユーザーセルのみを上から順に抽出
@@ -3461,21 +3763,34 @@ class XBrowserController:
             page = self.ensure_page()
 
         discovered = []
-        seen = set()
+        seen_users = set()
+        seen_dom = set()
         system_names = {"home", "explore", "notifications", "messages", "search", "settings", "i", "privacy", "tos", "elonmusk"}
+        no_new_dom_scrolls = 0
+        total_db_skipped = 0
 
         for scroll_idx in range(scroll_limit):
             user_cells = page.locator('div[data-testid="primaryColumn"] button[data-testid="UserCell"] a, div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[role="link"]').all()
             if not user_cells:
                 user_cells = page.locator('button[data-testid="UserCell"] a, div[data-testid="cellInnerDiv"] a[role="link"]').all()
 
+            scroll_db_skipped = 0
+            dom_before = len(seen_dom)
             for link in user_cells:
                 try:
                     href = link.get_attribute("href")
                     if href and href.startswith("/") and not href.startswith("/i/") and "/status/" not in href:
                         username = href.strip("/").split("/")[0].split("?")[0]
                         clean_u = normalize_screen_name(username)
-                        if clean_u and clean_u.lower() not in seen and clean_u.lower() not in system_names:
+                        if clean_u and clean_u.lower() not in system_names and clean_u.lower() not in seen_users:
+                            u_key = clean_u.lower()
+                            if u_key in seen_dom:
+                                continue
+                            seen_dom.add(u_key)
+                            if should_skip_fn and should_skip_fn(clean_u, ""):
+                                scroll_db_skipped += 1
+                                total_db_skipped += 1
+                                continue
                             disp_name = ""
                             try:
                                 cell_parent = link.locator('xpath=ancestor::*[@data-testid="UserCell"]')
@@ -3488,7 +3803,7 @@ class XBrowserController:
                                             break
                             except Exception:
                                 pass
-                            seen.add(clean_u.lower())
+                            seen_users.add(u_key)
                             discovered.append({
                                 "screen_name": clean_u,
                                 "tweet_url": "",
@@ -3501,10 +3816,19 @@ class XBrowserController:
                 except Exception:
                     continue
 
-            print(f"   フォロー一覧収集 [{scroll_idx + 1}/{scroll_limit}]: 現在 {len(discovered)} 件抽出 (上から順)")
+            db_note = f" (DB登録済・不可 {scroll_db_skipped}件スキップ)" if scroll_db_skipped > 0 else ""
+            print(f"   フォロー一覧収集 [{scroll_idx + 1}/{scroll_limit}]: 新規ターゲット {len(discovered)} 件抽出 (上から順){db_note}")
             if max_targets > 0 and len(discovered) >= max_targets:
-                print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件) に達したため、収集を完了します。")
+                print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件・完全新規) に達したため、収集を完了します。")
                 break
+
+            if len(seen_dom) == dom_before:
+                no_new_dom_scrolls += 1
+                if no_new_dom_scrolls >= 3:
+                    print(f"   ℹ️ これ以上新しいユーザーが読み込まれないため終了します (新規 {len(discovered)}件 / DBスキップ累計 {total_db_skipped}件)。")
+                    break
+            else:
+                no_new_dom_scrolls = 0
 
             try:
                 page.mouse.wheel(0, random.randint(700, 1300))
@@ -3520,10 +3844,14 @@ class XBrowserController:
         seen: set,
         system_names: set,
         discovered: list,
-        max_targets: int = 0
+        max_targets: int = 0,
+        should_skip_fn=None,
+        seen_dom: set = None,
+        skip_stats: dict = None
     ) -> int:
         """現在表示中のメインタイムラインからツイート投稿者とツイートURLを順番に抽出して discovered に追加"""
         added_count = 0
+        dom_set = seen_dom if seen_dom is not None else seen
         tweet_articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]').all()
         if not tweet_articles:
             tweet_articles = page.locator('main[role="main"] article[data-testid="tweet"]').all()
@@ -3554,10 +3882,10 @@ class XBrowserController:
                     if href and href.startswith("/") and not href.startswith("/i/") and "/status/" not in href and "/search" not in href and "/hashtag/" not in href and "/explore" not in href:
                         username = href.strip("/").split("/")[0].split("?")[0]
                         cand_u = normalize_screen_name(username)
-                        if cand_u and cand_u.lower() not in seen and cand_u.lower() not in system_names:
+                        if cand_u and cand_u.lower() not in system_names:
                             clean_u = cand_u
                             break
-                if not clean_u:
+                if not clean_u or clean_u.lower() in seen:
                     continue
 
                 tweet_url = ""
@@ -3586,6 +3914,16 @@ class XBrowserController:
                                 break
                 except Exception:
                     pass
+
+                dom_key = (tweet_url or clean_u).lower()
+                if dom_key in dom_set:
+                    continue
+                dom_set.add(dom_key)
+
+                if should_skip_fn and should_skip_fn(clean_u, tweet_url):
+                    if skip_stats is not None:
+                        skip_stats["db_skipped"] = skip_stats.get("db_skipped", 0) + 1
+                    continue
 
                 disp_name = ""
                 if user_box.count() > 0:
@@ -3627,7 +3965,7 @@ class XBrowserController:
                 continue
         return added_count
 
-    def collect_targets_from_home(self, tab_type: str = "おすすめ", scroll_limit: int = 5, max_targets: int = 0) -> list[dict]:
+    def collect_targets_from_home(self, tab_type: str = "おすすめ", scroll_limit: int = 5, max_targets: int = 0, should_skip_fn=None) -> list[dict]:
         """
         HOMEタイムライン (おすすめ / フォロー中) からターゲットをスクロール収集
         """
@@ -3684,17 +4022,31 @@ class XBrowserController:
 
         discovered = []
         seen = set()
+        seen_dom = set()
+        skip_stats = {"db_skipped": 0}
         system_names = {
             "home", "explore", "notifications", "messages", "search", "settings",
             "i", "privacy", "tos", "help", "support", "x", "twitter", "safety", "verified", "elonmusk"
         }
+        no_new_dom_scrolls = 0
 
         for scroll_idx in range(scroll_limit):
-            self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets)
-            print(f"   {tab_label}収集 [{scroll_idx + 1}/{scroll_limit}]: 現在 {len(discovered)} 件抽出")
+            dom_before = len(seen_dom)
+            prev_db_skip = skip_stats["db_skipped"]
+            self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets, should_skip_fn=should_skip_fn, seen_dom=seen_dom, skip_stats=skip_stats)
+            scroll_db_skipped = skip_stats["db_skipped"] - prev_db_skip
+            db_note = f" (DB登録済・不可 {scroll_db_skipped}件スキップ)" if scroll_db_skipped > 0 else ""
+            print(f"   {tab_label}収集 [{scroll_idx + 1}/{scroll_limit}]: 新規ターゲット {len(discovered)} 件抽出{db_note}")
             if max_targets > 0 and len(discovered) >= max_targets:
-                print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件) に達したため、収集を完了します。")
+                print(f"   🎯 Excel「ターゲット件数」上限 ({max_targets} 件・完全新規) に達したため、収集を完了します。")
                 break
+            if len(seen_dom) == dom_before:
+                no_new_dom_scrolls += 1
+                if no_new_dom_scrolls >= 3:
+                    print(f"   ℹ️ これ以上新しいポストが読み込まれないため終了します (新規 {len(discovered)}件 / DBスキップ累計 {skip_stats['db_skipped']}件)。")
+                    break
+            else:
+                no_new_dom_scrolls = 0
             try:
                 page.mouse.wheel(0, random.randint(700, 1200))
             except Exception:
@@ -3703,7 +4055,7 @@ class XBrowserController:
 
         return discovered[:max_targets] if max_targets > 0 else discovered
 
-    def collect_targets_from_explore(self, tab_type: str = "トレンド", scroll_limit: int = 5, max_targets: int = 0) -> list[dict]:
+    def collect_targets_from_explore(self, tab_type: str = "トレンド", scroll_limit: int = 5, max_targets: int = 0, should_skip_fn=None) -> list[dict]:
         """
         話題・探索 (話題を検索 / ニュース / トレンド) からターゲットを収集
         - 話題を検索: https://x.com/explore (「話題を検索 / For you」タブ)
@@ -3773,6 +4125,8 @@ class XBrowserController:
 
         discovered = []
         seen = set()
+        seen_dom = set()
+        skip_stats = {"db_skipped": 0}
         system_names = {
             "home", "explore", "notifications", "messages", "search", "settings",
             "i", "privacy", "tos", "help", "support", "x", "twitter", "safety", "verified", "elonmusk"
@@ -3875,12 +4229,13 @@ class XBrowserController:
 
         if candidates:
             random.shuffle(candidates)
+            max_topics = min(12, len(candidates))
             print(f"   🎲 [{tab_label}] 候補 {len(candidates)}件から検索ワードをランダム選択しました (抽選順先頭: 「{candidates[0][0][:35]}」)")
 
-            for idx_u, (cand_lbl, sub_url) in enumerate(candidates[:8], start=1):
+            for idx_u, (cand_lbl, sub_url) in enumerate(candidates[:max_topics], start=1):
                 if max_targets > 0 and len(discovered) >= max_targets:
                     break
-                print(f"   🔎 {tab_label}ランダム項目 [{idx_u}/{min(8, len(candidates))}] 「{cand_lbl[:30]}」の話題のポスト(Top)を取得中: {sub_url}")
+                print(f"   🔎 {tab_label}ランダム項目 [{idx_u}/{max_topics}] 「{cand_lbl[:30]}」の話題のポスト(Top)を取得中: {sub_url}")
                 try:
                     page.goto(sub_url, timeout=35000, wait_until="domcontentloaded")
                     time.sleep(2.2)
@@ -3890,10 +4245,18 @@ class XBrowserController:
                             break
                         time.sleep(0.8)
                     self._ensure_top_tab_on_search(page)
-                    for _ in range(min(3, max(1, scroll_limit))):
-                        self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets)
+                    no_new_sub = 0
+                    for _ in range(min(5, max(1, scroll_limit))):
+                        dom_before = len(seen_dom)
+                        self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets, should_skip_fn=should_skip_fn, seen_dom=seen_dom, skip_stats=skip_stats)
                         if max_targets > 0 and len(discovered) >= max_targets:
                             break
+                        if len(seen_dom) == dom_before:
+                            no_new_sub += 1
+                            if no_new_sub >= 2:
+                                break
+                        else:
+                            no_new_sub = 0
                         try:
                             page.mouse.wheel(0, random.randint(600, 1000))
                         except Exception:
@@ -3911,7 +4274,7 @@ class XBrowserController:
             except Exception:
                 pass
             for scroll_idx in range(min(3, max(1, scroll_limit))):
-                self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets)
+                self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets, should_skip_fn=should_skip_fn, seen_dom=seen_dom, skip_stats=skip_stats)
                 if max_targets > 0 and len(discovered) >= max_targets:
                     break
                 if page.locator('article[data-testid="tweet"]').count() == 0 and scroll_idx == 0:
@@ -3922,7 +4285,7 @@ class XBrowserController:
                     pass
                 time.sleep(random.uniform(1.5, 2.5))
 
-        print(f"   📰 {tab_label}収集完了: 合計 {len(discovered)} 件抽出")
+        print(f"   📰 {tab_label}収集完了: 完全新規 {len(discovered)} 件抽出 (DB登録済・不可 {skip_stats['db_skipped']}件スキップ)")
         return discovered[:max_targets] if max_targets > 0 else discovered
 
     def close(self):

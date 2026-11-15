@@ -71,7 +71,12 @@ class ConfigManager:
             if account_config_path and os.path.isfile(account_config_path):
                 base_dir = os.path.dirname(os.path.abspath(account_config_path))
             else:
-                base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+                if getattr(sys, 'frozen', False):
+                    base_dir = os.path.dirname(sys.executable)
+                else:
+                    env_dir = os.environ.get("X_AUTO_DM_BASE_DIR", "").strip().strip('"')
+                    d = os.path.dirname(os.path.abspath(__file__))
+                    base_dir = os.path.normpath(env_dir) if (env_dir and os.path.isdir(env_dir)) else (os.path.dirname(d) if os.path.basename(d) == "_app" else d)
 
         self.base_dir = base_dir
         self.account_config_path = account_config_path or os.path.join(self.base_dir, "アカウント情報.xlsx")
@@ -299,6 +304,8 @@ class ConfigManager:
             "target_max_sec": 150.0,
             "scroll_limit": 15,
             "target_count": 15,
+            "reply_url_loop_limit": 0,
+            "reply_parent_hop_limit": 15,
             "ai_engine": "gemini",
             "ai_dedicated_window": True,
             "ai_api_key": "",
@@ -332,6 +339,12 @@ class ConfigManager:
                     except: pass
                 elif any(m in kc for m in ["ターゲット件数", "ターゲット数", "読み込み件数", "読込件数"]):
                     try: res["target_count"] = int(float(str(v).strip()))
+                    except: pass
+                elif "ホップ上限" in kc or "parenthop" in kc:
+                    try: res["reply_parent_hop_limit"] = max(0, int(float(str(v).strip())))
+                    except: pass
+                elif "url巡回上限" in kc or "巡回上限" in kc or "urllooplimit" in kc:
+                    try: res["reply_url_loop_limit"] = max(0, int(float(str(v).strip())))
                     except: pass
                 elif "aiエンジン" in kc:
                     res["ai_engine"] = str(v).strip()
@@ -409,6 +422,12 @@ class ConfigManager:
                                 except: pass
                             elif "ターゲット件数" in col0_clean:
                                 try: res["target_count"] = int(float(val1))
+                                except: pass
+                            elif "ホップ上限" in col0_clean or "parenthop" in col0_clean:
+                                try: res["reply_parent_hop_limit"] = max(0, int(float(val1)))
+                                except: pass
+                            elif "url巡回上限" in col0_clean or "巡回上限" in col0_clean or "urllooplimit" in col0_clean:
+                                try: res["reply_url_loop_limit"] = max(0, int(float(val1)))
                                 except: pass
                             elif "aiエンジン" in col0_clean:
                                 res["ai_engine"] = val1

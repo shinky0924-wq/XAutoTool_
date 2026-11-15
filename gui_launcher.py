@@ -9,22 +9,182 @@ X(Twitter) 自動DMツール Pro - 統合単一ウィンドウ GUIアプリ (gui
 import os
 import sys
 import re
+import time
+import io
+import traceback
 import subprocess
 import threading
 import sqlite3
-import tkinter as tk
-from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
-from config_manager import ConfigManager
+import multiprocessing
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if SCRIPT_DIR and SCRIPT_DIR not in sys.path:
+    sys.path.insert(0, SCRIPT_DIR)
+
+
+def _resolve_base_dir() -> str:
+    if getattr(sys, 'frozen', False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    env_dir = os.environ.get("X_AUTO_DM_BASE_DIR", "").strip().strip('"')
+    if env_dir and os.path.isdir(env_dir):
+        return os.path.normpath(env_dir)
+    if os.path.basename(SCRIPT_DIR) == "_app":
+        return os.path.dirname(SCRIPT_DIR)
+    return SCRIPT_DIR
+
+
+BASE_DIR = _resolve_base_dir()
+if BASE_DIR and BASE_DIR not in sys.path:
+    sys.path.insert(0, BASE_DIR)
+try:
+    os.chdir(BASE_DIR)
+except Exception:
+    pass
+
+
+class _SafeNullStream(io.TextIOBase):
+    """PyInstaller console=False 環境で sys.stdout/sys.stderr が None のときの AttributeError 防止"""
+    def write(self, s):
+        return len(s) if isinstance(s, str) else 0
+
+    def flush(self):
+        pass
+
+    def isatty(self):
+        return False
+
+
+if sys.stdout is None:
+    sys.stdout = _SafeNullStream()
+if sys.stderr is None:
+    sys.stderr = _SafeNullStream()
 
 # Windows CP932 / Emoji UnicodeEncodeError 対策
 if sys.platform == "win32":
     try:
-        if sys.stdout is not None:
+        if hasattr(sys.stdout, "reconfigure"):
             sys.stdout.reconfigure(encoding="utf-8", errors="replace")
-        if sys.stderr is not None:
+        if hasattr(sys.stderr, "reconfigure"):
             sys.stderr.reconfigure(encoding="utf-8", errors="replace")
     except Exception:
         pass
+
+
+def _report_startup_crash(title: str, err: Exception):
+    err_trace = traceback.format_exc()
+    log_path = os.path.join(BASE_DIR, "launch_error.log")
+    try:
+        with open(log_path, "w", encoding="utf-8") as f:
+            f.write(err_trace)
+    except Exception:
+        pass
+    msg = (
+        f"アプリケーション起動中にエラーが発生しました:\n\n{err}\n\n"
+        f"詳細ログ: {log_path}\n"
+        "※ 「【エラー確認用】コマンドプロンプトで起動.bat」でも確認できます。"
+    )
+    shown = False
+    try:
+        messagebox.showerror(title, msg)
+        shown = True
+    except Exception:
+        pass
+    if not shown and sys.platform == "win32":
+        try:
+            import ctypes
+            ctypes.windll.user32.MessageBoxW(0, msg, title, 0x10)
+        except Exception:
+            pass
+
+
+def ensure_gui_without_console(entry_script: str):
+    """console付き python.exe で起動された場合、pythonw.exe へ自動切替して黒いCMD画面との2重起動を防ぐ"""
+    if sys.platform != "win32" or getattr(sys, "frozen", False):
+        return
+    if any(a.startswith("--cli") or a in ("--no-relaunch", "--keep-console") for a in sys.argv[1:]):
+        return
+    exe_base = os.path.basename(sys.executable).lower()
+    if "pythonw" in exe_base:
+        return
+
+    pyw_hits = []
+    same_swap = re.sub(r'python(\d*(?:\.\d+)?)\.exe$', r'pythonw\1.exe', sys.executable, flags=re.IGNORECASE)
+    if same_swap.lower() != sys.executable.lower() and os.path.lexists(same_swap):
+        pyw_hits.append(same_swap)
+
+    base_exe = getattr(sys, "_base_executable", "") or ""
+    if base_exe:
+        base_swap = re.sub(r'python(\d*(?:\.\d+)?)\.exe$', r'pythonw\1.exe', base_exe, flags=re.IGNORECASE)
+        if base_swap.lower() != base_exe.lower() and os.path.lexists(base_swap) and base_swap not in pyw_hits:
+            pyw_hits.append(base_swap)
+
+    cand_dirs = [
+        os.path.dirname(sys.executable),
+        os.path.dirname(base_exe) if base_exe else "",
+        sys.exec_prefix or "",
+        getattr(sys, "base_exec_prefix", "") or "",
+        os.path.join(os.environ.get("LOCALAPPDATA", ""), "Microsoft", "WindowsApps"),
+    ]
+    cand_names = ["pythonw.exe", "pythonw3.12.exe", "pythonw3.13.exe", "pythonw3.11.exe", "pythonw3.10.exe", "pythonw3.14.exe"]
+    for d in cand_dirs:
+        if not d:
+            continue
+        for n in cand_names:
+            p = os.path.join(d, n)
+            if os.path.lexists(p) and p not in pyw_hits:
+                pyw_hits.append(p)
+
+    for pyw in pyw_hits:
+        try:
+            chk = subprocess.run(
+                [pyw, "-c", "import sys, tkinter; sys.exit(0)"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000),
+                timeout=5,
+            )
+            if chk.returncode != 0:
+                continue
+        except Exception:
+            continue
+        try:
+            flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+            env = os.environ.copy()
+            env.setdefault("X_AUTO_DM_BASE_DIR", BASE_DIR)
+            subprocess.Popen(
+                [pyw, entry_script, "--no-relaunch"] + sys.argv[1:],
+                cwd=BASE_DIR,
+                env=env,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=flags,
+            )
+            os._exit(0)
+        except Exception:
+            pass
+
+    try:
+        import ctypes
+        hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+        ctypes.windll.kernel32.FreeConsole()
+    except Exception:
+        pass
+
+
+try:
+    import tkinter as tk
+    from tkinter import ttk, messagebox, scrolledtext, filedialog, simpledialog
+    from config_manager import ConfigManager
+except Exception as _boot_err:
+    if __name__ == "__main__":
+        _report_startup_crash("起動初期化エラー", _boot_err)
+        sys.exit(1)
+    raise
 
 def normalize_screen_name(val: str) -> str:
     if not val:
@@ -80,6 +240,16 @@ def get_log_dir(base_dir: str) -> str:
     os.makedirs(p, exist_ok=True)
     return p
 
+def get_screenshot_dir(base_dir: str) -> str:
+    """スクショフォルダのパスを取得し、無ければ自動作成"""
+    for folder_name in ["スクショフォルダ", "screenshots", "screenshot", "error_screenshots"]:
+        p = os.path.join(base_dir, folder_name)
+        if os.path.isdir(p):
+            return p
+    p = os.path.join(base_dir, "スクショフォルダ")
+    os.makedirs(p, exist_ok=True)
+    return p
+
 def get_account_db_path(base_dir: str, account_name: str) -> str:
     """アカウント名に応じた個別DBパス (dbフォルダ/アカウント名.DB) を取得"""
     db_dir = get_db_dir(base_dir)
@@ -106,16 +276,17 @@ class AppLauncherGUI:
     def get_log_dir(self) -> str:
         return get_log_dir(self.base_dir)
 
+    def get_screenshot_dir(self) -> str:
+        return get_screenshot_dir(self.base_dir)
+
     def __init__(self, root):
         self.root = root
         self.root.title("X(Twitter) 自動DM・リプライ・送信ツール Pro 【統合コントロールセンター】")
         self.root.geometry("1020x750")
         self.root.minsize(920, 620)
 
-        if getattr(sys, 'frozen', False):
-            self.base_dir = os.path.dirname(sys.executable)
-        else:
-            self.base_dir = os.path.dirname(os.path.abspath(__file__))
+        self.base_dir = BASE_DIR
+        self.script_dir = SCRIPT_DIR
         self.running_process = None
         acc_path = os.path.join(self.base_dir, "アカウント情報.xlsx")
         name_path = os.path.join(self.base_dir, "アカウント名.xlsx")
@@ -528,6 +699,14 @@ class AppLauncherGUI:
         else:
             subprocess.run(["xdg-open", log_dir])
 
+    def _open_screenshot_folder(self):
+        ss_dir = get_screenshot_dir(self.base_dir)
+        os.makedirs(ss_dir, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(ss_dir)
+        else:
+            subprocess.run(["xdg-open", ss_dir])
+
     def _build_db_tab(self):
         top_bar = tk.Frame(self.tab_db, padx=8, pady=6)
         top_bar.pack(fill=tk.X)
@@ -560,6 +739,7 @@ class AppLauncherGUI:
         ttk.Button(top_bar, text="🔄 再読込", command=self._reload_db).pack(side=tk.LEFT, padx=3)
         ttk.Button(top_bar, text="📁 dbフォルダを開く", command=self._open_db_folder).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="📁 logフォルダを開く", command=self._open_log_folder).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(top_bar, text="📸 スクショフォルダを開く", command=self._open_screenshot_folder).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="🗑️ 選択履歴を削除", command=self._delete_selected_db).pack(side=tk.RIGHT, padx=3)
 
         cols_db = ("ID", "アクション", "ターゲット", "判定キー (ユーザー / 取得URL)", "使用アカウント", "ステータス", "送信日時", "文面抜粋")
@@ -1074,11 +1254,11 @@ class AppLauncherGUI:
             messagebox.showwarning("案内", "該当レコードが見つかりませんでした。")
 
     def _start_main_process(self):
-        script = os.path.join(self.base_dir, "main.py")
+        script = os.path.join(self.script_dir, "main.py")
         self._run_script_in_thread(script, "【本番自動実行】")
 
     def _start_test_process(self):
-        script = os.path.join(self.base_dir, "test_single.py")
+        script = os.path.join(self.script_dir, "test_single.py")
         self._run_script_in_thread(script, "【単体テスト】")
 
     def _start_setup_process(self):
@@ -1089,7 +1269,15 @@ class AppLauncherGUI:
                 "初回セットアップは不要です（そのままご利用いただけます）。"
             )
             return
-        self._run_command_in_thread([sys.executable, "-m", "pip", "install", "-r", "requirements.txt"], "【pip インストール】", next_cmd=[sys.executable, "-m", "playwright", "install", "chromium"])
+        req_file = os.path.join(self.script_dir, "requirements.txt")
+        if not os.path.exists(req_file):
+            req_file = os.path.join(self.base_dir, "requirements.txt")
+        py_exe = sys.executable
+        if sys.platform == "win32" and py_exe.lower().endswith("pythonw.exe"):
+            cand = os.path.join(os.path.dirname(py_exe), "python.exe")
+            if os.path.isfile(cand):
+                py_exe = cand
+        self._run_command_in_thread([py_exe, "-m", "pip", "install", "-r", req_file], "【pip インストール】", next_cmd=[py_exe, "-m", "playwright", "install", "chromium"])
 
     def _start_build_dist_process(self):
         if getattr(sys, 'frozen', False):
@@ -1099,9 +1287,11 @@ class AppLauncherGUI:
                 "このフォルダごと（またはZIP圧縮して）他のPCへコピーするだけでそのまま動作します。"
             )
             return
-        script = os.path.join(self.base_dir, "build_dist_package.py")
+        script = os.path.join(self.script_dir, "build_dist_package.py")
         if not os.path.exists(script):
-            messagebox.showinfo("案内", "build_dist_package.py が見つかりません。")
+            script = os.path.join(self.base_dir, "build_dist_package.py")
+        if not os.path.exists(script):
+            messagebox.showinfo("案内", "build_dist_package.py が見つかりません（配布パッケージ内では実行不要です）。")
             return
         self._run_command_in_thread([sys.executable, script], "【他PC配布用パッケージ自動作成】")
 
@@ -1129,6 +1319,7 @@ class AppLauncherGUI:
                 env["PYTHONIOENCODING"] = "utf-8"
                 env["PYTHONUTF8"] = "1"
                 env["LAUNCHER_PID"] = str(os.getpid())
+                env["X_AUTO_DM_BASE_DIR"] = self.base_dir
                 env["TOOL_MAX_CONCURRENT"] = str(getattr(self, "var_concurrency", tk.IntVar(value=1)).get())
                 
                 # 他PC実行（PyInstaller EXE化環境）自動判定
@@ -1188,6 +1379,7 @@ class AppLauncherGUI:
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
                 env["PYTHONUTF8"] = "1"
+                env["X_AUTO_DM_BASE_DIR"] = self.base_dir
                 self.running_process = subprocess.Popen(
                     cmd,
                     cwd=self.base_dir,
@@ -1264,7 +1456,7 @@ class AppLauncherGUI:
             self.log("   ※ 完了したら「▶️ 処理を再開 (編集完了)」ボタンをクリックすると処理を再開します。")
 
     def _start_edit_browser_process(self):
-        script = os.path.join(self.base_dir, "edit_account.py")
+        script = os.path.join(self.script_dir, "edit_account.py")
         if not getattr(sys, 'frozen', False) and not os.path.exists(script):
             messagebox.showinfo("案内", "edit_account.py が見つかりません。")
             return
@@ -1300,20 +1492,27 @@ class AppLauncherGUI:
             )
             return
 
-        script = os.path.join(self.base_dir, "chrome_launcher.py")
+        script = os.path.join(self.script_dir, "chrome_launcher.py")
         bat_script = os.path.join(self.base_dir, "chrome_launcher.bat")
+        py_console = sys.executable
+        if sys.platform == "win32" and py_console.lower().endswith("pythonw.exe"):
+            cand = os.path.join(os.path.dirname(py_console), "python.exe")
+            if os.path.isfile(cand):
+                py_console = cand
+        child_env = os.environ.copy()
+        child_env["X_AUTO_DM_BASE_DIR"] = self.base_dir
         if prof_name:
             if os.path.exists(bat_script):
-                subprocess.Popen(f'start cmd /k ""{bat_script}" "{prof_name}""', shell=True, cwd=self.base_dir)
+                subprocess.Popen(f'start cmd /k ""{bat_script}" "{prof_name}""', shell=True, cwd=self.base_dir, env=child_env)
             elif os.path.exists(script):
-                subprocess.Popen(f'start cmd /k python "{script}" "{prof_name}"', shell=True, cwd=self.base_dir)
+                subprocess.Popen(f'start cmd /k ""{py_console}" "{script}" "{prof_name}""', shell=True, cwd=self.base_dir, env=child_env)
             else:
                 messagebox.showerror("エラー", "chrome_launcher.py または chrome_launcher.bat が見つかりません。")
         else:
             if os.path.exists(bat_script):
-                subprocess.Popen(f'start cmd /k "{bat_script}"', shell=True, cwd=self.base_dir)
+                subprocess.Popen(f'start cmd /k "{bat_script}"', shell=True, cwd=self.base_dir, env=child_env)
             elif os.path.exists(script):
-                subprocess.Popen(f'start cmd /k python "{script}"', shell=True, cwd=self.base_dir)
+                subprocess.Popen(f'start cmd /k ""{py_console}" "{script}""', shell=True, cwd=self.base_dir, env=child_env)
             else:
                 messagebox.showerror("エラー", "chrome_launcher が見つかりません。")
 
@@ -1331,7 +1530,7 @@ class AppLauncherGUI:
         try:
             pid = proc.pid
             if sys.platform == "win32":
-                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=5)
+                subprocess.run(["taskkill", "/F", "/T", "/PID", str(pid)], capture_output=True, timeout=5, creationflags=subprocess.CREATE_NO_WINDOW)
             else:
                 proc.terminate()
                 proc.kill()
@@ -1446,44 +1645,46 @@ class AppLauncherGUI:
             messagebox.showwarning("ファイル未発見", f"{filename} が見つかりません。")
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "--cli-main":
-        import main
-        main.main()
-        sys.exit(0)
-    elif len(sys.argv) > 1 and sys.argv[1] == "--cli-test":
-        import test_single
-        test_single.main()
-        sys.exit(0)
-    elif len(sys.argv) > 1 and sys.argv[1] == "--cli-edit":
-        import edit_account
-        edit_account.main()
-        sys.exit(0)
-    elif len(sys.argv) > 1 and sys.argv[1] == "--cli-profile":
-        import chrome_launcher as _prof_mod
-        if len(sys.argv) > 2:
-            sys.argv = [sys.argv[0]] + sys.argv[2:]
+    multiprocessing.freeze_support()
+    try:
+        if len(sys.argv) > 1 and sys.argv[1] == "--cli-main":
+            import main
+            main.main()
+            sys.exit(0)
+        elif len(sys.argv) > 1 and sys.argv[1] == "--cli-test":
+            import test_single
+            test_single.main()
+            sys.exit(0)
+        elif len(sys.argv) > 1 and sys.argv[1] == "--cli-edit":
+            import edit_account
+            edit_account.main()
+            sys.exit(0)
+        elif len(sys.argv) > 1 and sys.argv[1] == "--cli-profile":
+            import chrome_launcher as _prof_mod
+            if len(sys.argv) > 2:
+                sys.argv = [sys.argv[0]] + sys.argv[2:]
+            else:
+                sys.argv = [sys.argv[0]]
+            _prof_mod.main()
+            sys.exit(0)
         else:
-            sys.argv = [sys.argv[0]]
-        _prof_mod.main()
-        sys.exit(0)
-    else:
-        try:
+            ensure_gui_without_console(os.path.abspath(__file__))
             root = tk.Tk()
             app = AppLauncherGUI(root)
+            try:
+                get_screenshot_dir(app.base_dir)
+            except Exception:
+                pass
+            build_info = os.path.join(app.base_dir, "BUILD_INFO.txt")
+            if os.path.isfile(build_info):
+                try:
+                    with open(build_info, "r", encoding="utf-8") as bf:
+                        first_line = bf.readline().strip()
+                    if first_line:
+                        app.log(f"ℹ️ ビルド情報: {first_line}")
+                except Exception:
+                    pass
             root.mainloop()
-        except Exception as e:
-            import traceback
-            err_trace = traceback.format_exc()
-            try:
-                with open("launch_error.log", "w", encoding="utf-8") as f:
-                    f.write(err_trace)
-            except Exception:
-                pass
-            try:
-                messagebox.showerror(
-                    "起動エラー",
-                    f"アプリケーション起動中にエラーが発生しました:\n\n{e}\n\n※ 詳細は launch_error.log または「【エラー診断】起動テスト_画面が消える時はこれ.bat」で確認できます。"
-                )
-            except Exception:
-                pass
-            sys.exit(1)
+    except Exception as e:
+        _report_startup_crash("起動エラー", e)
+        sys.exit(1)

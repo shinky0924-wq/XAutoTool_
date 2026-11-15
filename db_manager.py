@@ -127,6 +127,16 @@ def get_account_log_path(base_dir: str, account_name: str) -> str:
     safe_name = sanitize_filename(account_name)
     return os.path.join(log_dir, f"{safe_name}.log")
 
+def get_screenshot_dir(base_dir: str) -> str:
+    """スクショフォルダのパスを取得し、無ければ自動作成"""
+    for folder_name in ["スクショフォルダ", "screenshots", "screenshot", "error_screenshots"]:
+        p = os.path.join(base_dir, folder_name)
+        if os.path.isdir(p):
+            return p
+    default_p = os.path.join(base_dir, "スクショフォルダ")
+    os.makedirs(default_p, exist_ok=True)
+    return default_p
+
 def get_saved_passcodes(base_dir: str) -> dict:
     """保存されたアカウント別DMパスコード一覧を取得（初回入力のみで永続再利用・表記ゆれ完全吸収）"""
     db_dir = get_db_dir(base_dir)
@@ -314,6 +324,13 @@ class DatabaseManager:
                     value TEXT
                 )
             """)
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS unavailable_users (
+                    username_key TEXT PRIMARY KEY COLLATE NOCASE,
+                    reason TEXT DEFAULT '',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
             for table_name in self.ACTION_TABLE_MAP.values():
                 cursor.execute(f"""
                     CREATE TABLE IF NOT EXISTS {table_name} (
@@ -345,8 +362,11 @@ class DatabaseManager:
             if not migrated_row:
                 cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='sent_history'")
                 if cursor.fetchone():
-                    cursor.execute("""
-                        SELECT target_screen_name, account_id_used, action_type, status, snippet, created_at
+                    cursor.execute("PRAGMA table_info(sent_history)")
+                    hist_cols = {c[1] for c in cursor.fetchall()}
+                    snip_col = "snippet" if "snippet" in hist_cols else ("sent_message_snippet" if "sent_message_snippet" in hist_cols else "''")
+                    cursor.execute(f"""
+                        SELECT target_screen_name, account_id_used, action_type, status, {snip_col}, created_at
                         FROM sent_history
                         ORDER BY id ASC
                     """)
@@ -384,7 +404,73 @@ class DatabaseManager:
                     VALUES ('migrated_action_tables_v2', '1')
                 """)
 
+            # 既存の凍結・存在しない・削除済み記録を unavailable_users へ同期（旧DB移行データも含めて同期）
+            for table_name in self.ACTION_TABLE_MAP.values():
+                cursor.execute(f"""
+                    SELECT target_screen_name, status, snippet FROM {table_name}
+                    WHERE status IN ('SUSPENDED', 'UNAVAILABLE')
+                       OR snippet LIKE '%凍結%'
+                       OR snippet LIKE '%存在しない%'
+                       OR snippet LIKE '%存在しません%'
+                       OR snippet LIKE '%削除済み%'
+                       OR LOWER(snippet) LIKE '%suspended%'
+                       OR LOWER(snippet) LIKE '%doesn''t exist%'
+                """)
+                for r_name, r_st, r_snip in cursor.fetchall():
+                    cn = normalize_screen_name(r_name).lower()
+                    if cn:
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO unavailable_users (username_key, reason)
+                            VALUES (?, ?)
+                        """, (cn, f"{r_st}: {r_snip or ''}"[:120]))
+
             conn.commit()
+
+    def is_user_unavailable(self, target_screen_name: str) -> bool:
+        """凍結・存在しない・削除済みアカウントとして共通ブラックリストに記録済みのユーザーかを判定"""
+        clean_name = normalize_screen_name(target_screen_name).lower()
+        if not clean_name:
+            return False
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT 1 FROM unavailable_users WHERE LOWER(username_key) = ?", (clean_name,))
+            return cursor.fetchone() is not None
+
+    def is_registered_in_db(self, target_screen_name: str, action_type: str = "DM", target_url: str = "") -> bool:
+        """
+        指定アクションテーブルに「すでに何らかの履歴が登録されているか」を判定（成功・拒否・凍結・スキップ等を問わず完全新規判定用）
+        - DM / FOLLOW: ユーザー単位 (@ユーザー名)
+        - REPLY / QUOTE / LIKE: 取得URL単位 (正規化ポストURL / tweet_id)
+        """
+        act = normalize_action_type(action_type)
+        table_name = self.ACTION_TABLE_MAP.get(act)
+        if not table_name:
+            return False
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if act in self.USER_SCOPED_ACTIONS:
+                clean_name = normalize_screen_name(target_screen_name).lower()
+                if not clean_name:
+                    return False
+                cursor.execute(f"""
+                    SELECT id FROM {table_name}
+                    WHERE LOWER(target_key) = ?
+                    LIMIT 1
+                """, (clean_name,))
+                return cursor.fetchone() is not None
+            else:
+                norm_url, tweet_id = normalize_tweet_url_and_id(target_url)
+                if not tweet_id and "/status/" in str(target_screen_name or ""):
+                    norm_url, tweet_id = normalize_tweet_url_and_id(target_screen_name)
+                if not tweet_id:
+                    return False
+                cursor.execute(f"""
+                    SELECT id FROM {table_name}
+                    WHERE tweet_id = ? OR LOWER(target_key) = ?
+                    LIMIT 1
+                """, (tweet_id, norm_url.lower()))
+                return cursor.fetchone() is not None
 
     def is_already_sent(self, target_screen_name: str, action_type: str = "DM", target_url: str = "") -> bool:
         """
@@ -470,6 +556,20 @@ class DatabaseManager:
                     snippet = excluded.snippet,
                     created_at = datetime('now', 'localtime')
             """, (target_key, clean_name, stored_url, stored_tid, account_id, act, status, snippet))
+
+            st_upper = str(status or "").upper()
+            snip_str = str(snippet or "")
+            snip_lower = snip_str.lower()
+            if clean_name and (
+                st_upper in ("SUSPENDED", "UNAVAILABLE")
+                or any(kw in snip_str for kw in ("凍結", "存在しない", "存在しません", "削除済み"))
+                or any(kw in snip_lower for kw in ("suspended", "doesn't exist", "doesn’t exist"))
+            ):
+                cursor.execute("""
+                    INSERT OR REPLACE INTO unavailable_users (username_key, reason, created_at)
+                    VALUES (?, ?, datetime('now', 'localtime'))
+                """, (clean_name.lower(), f"{status}: {snip_str}"[:120]))
+
             conn.commit()
 
     def fetch_history(self, action_filter: str = "ALL", limit: int = 300) -> list[dict]:
@@ -519,8 +619,14 @@ class DatabaseManager:
             return False
         with self._get_connection() as conn:
             cursor = conn.cursor()
+            cursor.execute(f"SELECT target_screen_name FROM {table_name} WHERE id = ?", (int(record_id),))
+            row = cursor.fetchone()
             cursor.execute(f"DELETE FROM {table_name} WHERE id = ?", (int(record_id),))
             deleted = cursor.rowcount > 0
+            if deleted and row and row[0]:
+                cn = normalize_screen_name(row[0]).lower()
+                if cn:
+                    cursor.execute("DELETE FROM unavailable_users WHERE LOWER(username_key) = ?", (cn,))
             conn.commit()
             return deleted
 

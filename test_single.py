@@ -78,7 +78,12 @@ def main():
     print("  X 自動DMツール 【単体テスト・安全動作確認モード】")
     print("=" * 60)
 
-    base_dir = os.path.dirname(sys.executable) if getattr(sys, 'frozen', False) else os.path.dirname(os.path.abspath(__file__))
+    if getattr(sys, 'frozen', False):
+        base_dir = os.path.dirname(sys.executable)
+    else:
+        env_dir = os.environ.get("X_AUTO_DM_BASE_DIR", "").strip().strip('"')
+        d = os.path.dirname(os.path.abspath(__file__))
+        base_dir = os.path.normpath(env_dir) if (env_dir and os.path.isdir(env_dir)) else (os.path.dirname(d) if os.path.basename(d) == "_app" else d)
     account_config_path = os.path.join(base_dir, "アカウント情報.xlsx")
     target_list_path = os.path.join(base_dir, "アカウント名.xlsx")
     if not os.path.exists(target_list_path):
@@ -208,6 +213,7 @@ def main():
         print("🔑 ログインを試行中...")
         logged_in = ctrl.login(account_id=account_id, auth_token=auth_token, password=password, passcode=dm_passcode)
         if not logged_in:
+            ctrl.capture_error_screenshot("test_login_failed", account_id)
             print("❌ ログインに失敗しました。auth_token やパスワードを確認してください。")
             return
         
@@ -234,6 +240,8 @@ def main():
             if st in ["SUCCESS", "ALREADY_LIKED"]:
                 eff_like_url = normalize_tweet_url(getattr(ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
                 db_mgr.record_sent(target_name, account_id, "LIKE", st, det, target_url=eff_like_url)
+            elif st == "FAILED":
+                ctrl.capture_error_screenshot("test_like_failed", account_id, target_name)
             time.sleep(2)
 
         if choice == "4" or choice == "5":
@@ -242,6 +250,8 @@ def main():
             print(f"   👤 フォロー結果: {st} ({det})")
             if st in ["SUCCESS", "ALREADY_FOLLOWING"]:
                 db_mgr.record_sent(target_name, account_id, "FOLLOW", st, det)
+            elif st == "FAILED":
+                ctrl.capture_error_screenshot("test_follow_failed", account_id, target_name)
             time.sleep(2)
 
         if choice == "1":
@@ -290,9 +300,15 @@ def main():
             if status == "SUCCESS":
                 db_mgr.record_sent(target_name, account_id, "DM", "SUCCESS", test_msg[:30])
                 print(f"✅ 専用DB ({os.path.basename(acc_db_path)}) への登録も完了しました！")
+            elif status == "FAILED":
+                ctrl.capture_error_screenshot("test_dm_failed", account_id, target_name)
 
     except Exception as e:
         print(f"❌ エラーが発生しました: {e}")
+        try:
+            ctrl.capture_error_screenshot("test_exception", account_id, target_name)
+        except Exception:
+            pass
         import traceback
         traceback.print_exc()
     finally:

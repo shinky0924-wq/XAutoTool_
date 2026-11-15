@@ -42,9 +42,10 @@ if not os.path.exists(acc_info) and not os.path.exists(acc_name):
             pass
     sys.exit(1)
 
-# 2. logフォルダ & dbフォルダ 自動準備
+# 2. logフォルダ & dbフォルダ & スクショフォルダ 自動準備
 os.makedirs(os.path.join(base_dir, "logフォルダ"), exist_ok=True)
 os.makedirs(os.path.join(base_dir, "dbフォルダ"), exist_ok=True)
+os.makedirs(os.path.join(base_dir, "スクショフォルダ"), exist_ok=True)
 
 # 3. 必須ライブラリ確認 & 自動インストール
 missing = []
@@ -78,6 +79,7 @@ if missing:
 # 4. GUIアプリケーション起動
 try:
     import gui_launcher
+    gui_launcher.ensure_gui_without_console(os.path.abspath(__file__))
     root = gui_launcher.tk.Tk()
     app = gui_launcher.AppLauncherGUI(root)
     root.mainloop()

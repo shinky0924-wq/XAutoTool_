@@ -61,7 +61,13 @@ def sanitize_profile_name(name: str) -> str:
 def get_base_dir() -> str:
     if getattr(sys, "frozen", False):
         return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
+    env_dir = os.environ.get("X_AUTO_DM_BASE_DIR", "").strip().strip('"')
+    if env_dir and os.path.isdir(env_dir):
+        return os.path.normpath(env_dir)
+    d = os.path.dirname(os.path.abspath(__file__))
+    if os.path.basename(d) == "_app":
+        return os.path.dirname(d)
+    return d
 
 
 def _find_registry_browser(exe_name: str) -> str:
