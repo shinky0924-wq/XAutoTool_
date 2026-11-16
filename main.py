@@ -25,9 +25,10 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from config_manager import ConfigManager
+from config_manager import ConfigManager, parse_active_hours_spec, is_within_active_hours
 from db_manager import (
     DatabaseManager,
+    AccountHealthManager,
     get_db_dir,
     get_account_db_path,
     get_log_dir,
@@ -37,6 +38,10 @@ from db_manager import (
     normalize_tweet_url
 )
 from browser_controller import XBrowserController
+
+
+def is_low_spec_mode_enabled() -> bool:
+    return os.environ.get("TOOL_LOW_SPEC_MODE", "").strip().lower() in ("1", "true", "yes", "on")
 
 def get_base_dir() -> str:
     """PyInstaller EXE化実行環境・_app/ 実行環境・通常Python実行環境でルートディレクトリを取得"""
@@ -512,6 +517,18 @@ def wait_for_account_interval(target_account_name: str, wait_seconds: float, min
     log(f"✨ アカウント [{target_account_name}] の待機時間が到来しました！")
     log(f"🚀 アカウント [{target_account_name}] のブラウザを起動します。")
 
+
+def select_ready_first_candidate(candidates: list[tuple[float, int, dict]], now_ts: float):
+    """
+    (ready_at, acc_idx, item) の候補リストから、
+    1) ready_at <= now_ts の準備完了済みアカウントを最優先（その中で最も早く準備できていた順）
+    2) 全て待機中なら最も早く ready_at が到来するアカウントを優先
+    """
+    if not candidates:
+        return None
+    return min(candidates, key=lambda x: (0 if x[0] <= now_ts else 1, x[0], x[1]))
+
+
 def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, account_ready_times: dict = None) -> tuple[float, float]:
     if account_ready_times is None:
         account_ready_times = {}
@@ -567,8 +584,22 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
     # 3. 各アカウント実行関数 (1窓ローテーション & 2窓同時並列モード両対応)
     total_acc_count = len(accounts)
+    health_mgr = AccountHealthManager(base_dir)
+    low_spec_mode = is_low_spec_mode_enabled()
+    cycle_executed_count = 0
+    cycle_executed_lock = threading.Lock()
 
-    def process_single_account(acc, acc_idx: int, total_acc_count: int, active_slot: int = 1, slot_semaphore=None):
+    def _extract_clean_id_from_row(acc_dict: dict, idx: int) -> tuple[str, str]:
+        raw_id = get_acc_val(acc_dict, ["アカウントid", "アカウント名", "ユーザー名", "id"], "").strip() or f"アカウント#{idx}"
+        raw_clean = raw_id.replace(" ", "").replace("　", "").lower()
+        if raw_clean in ["モード", "モード名", "モード名称", "番号", "1", "2", "3", "4", "5", "※備考", "※使い方", "※複数指定の例"]:
+            return "", raw_id
+        if raw_id.startswith("【") or raw_id.startswith("※") or raw_id.startswith("(") or raw_id.startswith("（"):
+            return "", raw_id
+        return (normalize_screen_name(raw_id) or f"acc_{idx}"), raw_id
+
+    def process_single_account(acc, acc_idx: int, total_acc_count: int, active_slot: int = 1, slot_semaphore=None, skip_interval_wait: bool = False):
+        nonlocal cycle_executed_count
         def get_acc_val(acc_dict, keywords, default=""):
             for k, val in acc_dict.items():
                 if not k or val is None or str(val).strip() == "":
@@ -623,11 +654,27 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         target_read_limit = acc_settings.get("target_count", 15)
         reply_url_loop_limit = max(0, int(acc_settings.get("reply_url_loop_limit", 0)))
         reply_parent_hop_limit = max(0, int(acc_settings.get("reply_parent_hop_limit", 15)))
-        block_media = acc_settings.get("block_media", True)
+        block_media = True if low_spec_mode else acc_settings.get("block_media", True)
+        active_hours_spec = str(acc_settings.get("active_hours", "") or get_acc_val(acc, ["稼働時間帯", "稼働時間", "営業時間", "実行時間帯", "activehours"], "") or "").strip()
         ai_engine = acc_settings.get("ai_engine", "gemini")
         ai_dedicated_window = bool(acc_settings.get("ai_dedicated_window", True))
         ai_api_key = acc_settings.get("ai_api_key", "")
         ai_prompt_extra = acc_settings.get("ai_prompt", "")
+
+        # サーキットブレーカー / 稼働時間帯の事前チェック (Chrome起動前に判定して省メモリ)
+        is_paused, pause_info = health_mgr.is_paused(clean_account_id)
+        if is_paused:
+            rem_min = max(1, int((float(pause_info.get("paused_until") or 0) - time.time()) // 60) + 1)
+            log(f"⛔ [自動休止スキップ] アカウント [@{clean_account_id}] は一時休止中のためスキップします（残り約{rem_min}分 / 理由: {pause_info.get('pause_reason', '異常検知')}）")
+            set_current_logger(None)
+            return min_sec if 'min_sec' in locals() else 60.0, max_sec if 'max_sec' in locals() else 120.0
+
+        within_hours, _until_sec = is_within_active_hours(active_hours_spec)
+        if not within_hours:
+            hrs_min = max(1, int(_until_sec // 60))
+            log(f"🌙 [稼働時間外スキップ] アカウント [@{clean_account_id}] は稼働時間帯 ({active_hours_spec}) 外のためブラウザを起動せずスキップします（次回開始まで約{hrs_min}分）")
+            set_current_logger(None)
+            return min_sec if 'min_sec' in locals() else 60.0, max_sec if 'max_sec' in locals() else 120.0
 
         target_min_sec = float(acc_settings.get("target_min_sec", 60.0))
         target_max_sec = float(acc_settings.get("target_max_sec", 150.0))
@@ -709,7 +756,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         log(f"\n{'='*58}")
         log(f"🚀 アカウント [{account_id}] ({acc_idx}/{total_acc_count}件目) のスロット{active_slot}セッションを開始します")
         log(f"   📂 ターゲット/設定ファイル: {os.path.basename(acc_target_path)} (個別動作設定シート適用)")
-        log(f"   ⚡ メディア読込ブロック: {'ON (省メモリ・超高速)' if block_media else 'OFF (通常)'}")
+        log(f"   ⏰ 稼働時間帯: {active_hours_spec or '24時間 (終日稼働)'}")
+        log(f"   ⚡ メディア読込ブロック: {'ON (省メモリ・超高速)' if block_media else 'OFF (通常)'}" + (" | 🪶 低スペ超軽量モード: ON" if low_spec_mode else ""))
         log(f"   スクロール上限: {scroll_limit}回 / 読み込みターゲット件数上限: {target_read_limit}件 / URLリプライ巡回上限: {'全件' if reply_url_loop_limit == 0 else str(reply_url_loop_limit) + '件'} / 親ホップ上限: {reply_parent_hop_limit}回")
         log(f"   AIエンジン: {ai_engine}")
         log(f"   AI専用ウィンドウ連携: {'ON (専用ウィンドウ起動・連携)' if ai_dedicated_window else 'OFF (API直接生成)'}")
@@ -741,19 +789,19 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         log(f"      ・ターゲット間ランダム待機: {target_min_sec:.0f}秒 〜 {target_max_sec:.0f}秒")
         log(f"{'='*58}")
 
-        # ★ 起動時の待機なし＆周回時個別待機制御（アプリ起動時は待機なしで即座にブラウザを起動）
-        if clean_account_id in account_ready_times:
-            ready_at = account_ready_times[clean_account_id]
-            remaining_wait = ready_at - time.time()
-            if remaining_wait > 0:
-                wait_for_account_interval(clean_account_id, remaining_wait, account_min_sec, account_max_sec, base_dir, f"第{cycle_count}周回 個別実行間隔")
+        # ★ 起動時の待機なし＆周回時個別待機制御（1窓スケジューラ時は待機完了後に呼ばれるためスキップ可）
+        if not skip_interval_wait:
+            if clean_account_id in account_ready_times:
+                ready_at = account_ready_times[clean_account_id]
+                remaining_wait = ready_at - time.time()
+                if remaining_wait > 0:
+                    wait_for_account_interval(clean_account_id, remaining_wait, account_min_sec, account_max_sec, base_dir, f"第{cycle_count}周回 個別実行間隔")
+                else:
+                    log(f"✅ アカウント [{clean_account_id}] の設定実行間隔（{account_min_sec:.0f}秒 〜 {account_max_sec:.0f}秒）は既に経過しています。待ち時間0秒で直ちにブラウザを起動します！")
             else:
-                log(f"✅ アカウント [{clean_account_id}] の設定実行間隔（{account_min_sec:.0f}秒 〜 {account_max_sec:.0f}秒）は既に経過しています。待ち時間0秒で直ちにブラウザを起動します！")
-        else:
-            # アプリ起動直後・初回実行時: 待機時間なしで即座にブラウザを起動
-            log(f"⚡ アカウント [{clean_account_id}] を待ち時間なしで直ちに起動します（初回即時実行）")
+                log(f"⚡ アカウント [{clean_account_id}] を待ち時間なしで直ちに起動します（初回即時実行）")
 
-        # 2窓並列モードの場合、セマフォで最大2ブラウザに制御
+        # 2窓並列モードの場合、セマフォで最大Nブラウザに制御
         acquired_semaphore = False
         if slot_semaphore is not None:
             if not slot_semaphore.acquire(blocking=False):
@@ -762,9 +810,21 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 log(f"✨ 実行枠が空きました！ アカウント [{clean_account_id}] のブラウザを直ちに起動します（スロット{active_slot}取得完了）。")
             acquired_semaphore = True
 
+        with cycle_executed_lock:
+            cycle_executed_count += 1
+
         profile_dir = os.path.join(base_dir, "browser_profiles", sanitize_filename(clean_account_id))
         browser_channel = get_acc_val(acc, ["ブラウザ", "使用ブラウザ", "browser", "channel"], "").strip().lower()
-        browser_ctrl = XBrowserController(headless=False, user_data_dir=profile_dir, base_dir=base_dir, block_media=block_media, preferred_channel=browser_channel)
+        browser_ctrl = XBrowserController(
+            headless=False,
+            user_data_dir=profile_dir,
+            base_dir=base_dir,
+            block_media=block_media,
+            preferred_channel=browser_channel,
+            low_spec_mode=low_spec_mode,
+            auto_cache_cleanup=True,
+        )
+        session_failed = False
         try:
             browser_ctrl.start()
             browser_ctrl.current_account_id = clean_account_id
@@ -774,7 +834,19 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             # ログイン (Cookie優先・パスコード自動対応)
             login_success = browser_ctrl.login(account_id=clean_account_id, auth_token=auth_token, password=password, passcode=dm_passcode)
             if not login_success:
+                session_failed = True
                 browser_ctrl.capture_error_screenshot("login_failed", clean_account_id)
+                fail_reason = getattr(browser_ctrl, "last_login_failure_reason", "") or "ログイン認証失敗"
+                is_crit = bool(getattr(browser_ctrl, "last_login_failure_critical", False))
+                res_h = health_mgr.record_failure(
+                    clean_account_id,
+                    reason=fail_reason,
+                    pause_hours=24.0 if is_crit else 2.0,
+                    immediate_pause=is_crit,
+                    threshold=2,
+                )
+                if res_h.get("paused_until", 0) > time.time():
+                    log(f"⛔ 【自動休止(サーキットブレーカー)】アカウント [{account_id}] を自動一時休止しました (連続失敗: {res_h.get('consecutive_failures', 1)}回 / 理由: {fail_reason})")
                 log(f"❌ アカウント [{account_id}] のログインに失敗したため、次のアカウントへ移ります。")
                 browser_ctrl.close()
                 return min_sec, max_sec
@@ -886,8 +958,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 if m_type in ["SEARCH_LATEST", "SEARCH_TOP"]:
                     stype_override = "話題" if m_type == "SEARCH_TOP" else "最新"
                     if acc_search_keywords:
-                        log(f"🔍 [{m_label}] 完全新規ターゲット収集開始 (登録キーワード: {len(acc_search_keywords)}件 / DB未登録のみ上限: {target_read_limit}件)...")
-                        for kw_item in acc_search_keywords:
+                        kw_candidates = list(acc_search_keywords)
+                        random.shuffle(kw_candidates)
+                        log(f"🔍 [{m_label}] 完全新規ターゲット収集開始 (登録キーワード: {len(kw_candidates)}件 / 目標人数: {target_read_limit if target_read_limit > 0 else '無制限'}件)...")
+                        for kw_idx, kw_item in enumerate(kw_candidates, start=1):
                             rem = remaining_limit()
                             if target_read_limit > 0 and rem <= 0:
                                 break
@@ -895,8 +969,17 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             stype = "話題" if m_type == "SEARCH_TOP" else kw_item.get("search_type", stype_override)
                             found = browser_ctrl.collect_targets_from_search(kw, search_type=stype, scroll_limit=scroll_limit, max_targets=rem, should_skip_fn=should_skip_target)
                             append_collected_items(found, f"{m_label}:{kw}", collected)
-                            if target_read_limit > 0 and len(collected) >= target_read_limit:
-                                break
+                            if target_read_limit > 0:
+                                if len(collected) >= target_read_limit:
+                                    log(f"   ✅ [{m_label}] 目標人数 ({len(collected)}/{target_read_limit}件) に達したため探索を終了します。")
+                                    break
+                                elif kw_idx < len(kw_candidates):
+                                    log(f"   ℹ️ [{m_label}] キーワード「{kw}」終了時点で {len(collected)}/{target_read_limit}件 のため、別ワードへ移動して目標人数まで取得を続けます...")
+                            else:
+                                if len(collected) > 0:
+                                    break
+                                elif kw_idx < len(kw_candidates):
+                                    log(f"   ℹ️ [{m_label}] キーワード「{kw}」は新規0件だったため、別ワードへフォールバックします...")
                     else:
                         log(f"   ℹ️ [{m_label}] 「検索キーワード」シートにキーワード未登録のため、「相互フォロー」で探索します。")
                         found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type=stype_override, scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
@@ -919,14 +1002,19 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 elif m_type == "URL_REPLY":
                     if acc_reply_urls:
-                        urls_to_visit = acc_reply_urls[:reply_url_loop_limit] if reply_url_loop_limit > 0 else list(acc_reply_urls)
-                        log(f"💬 [URLリスト（リプライ）] DB未登録ターゲット収集開始 (巡回URL: {len(urls_to_visit)}/{len(acc_reply_urls)}件 / 上限: {target_read_limit}件 / 親ホップ上限: {reply_parent_hop_limit}回)...")
+                        shuffled_reply_urls = list(acc_reply_urls)
+                        random.shuffle(shuffled_reply_urls)
+                        single_url_mode = (reply_url_loop_limit == 0)
+                        urls_to_visit = list(shuffled_reply_urls)
+                        log(f"💬 [URLリスト（リプライ）] DB未登録ターゲット収集開始 (登録URL: {len(acc_reply_urls)}件 / {'目標人数到達まで巡回' if single_url_mode else f'巡回上限: {reply_url_loop_limit}件'} / 目標人数: {target_read_limit if target_read_limit > 0 else '無制限'}件 / 親ホップ上限: {reply_parent_hop_limit}回)...")
                         visited_reply_accounts = {clean_account_id.lower()} if clean_account_id else set()
                         visited_parent_urls = set()
                         pending_parent_urls = []
                         pending_hop_accounts = []
 
                         for r_idx, rurl in enumerate(urls_to_visit, start=1):
+                            if not single_url_mode and r_idx > reply_url_loop_limit and len(collected) > 0:
+                                break
                             rem = remaining_limit()
                             if target_read_limit > 0 and rem <= 0:
                                 break
@@ -949,7 +1037,18 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 if p_norm and p_norm not in visited_parent_urls and pu not in pending_parent_urls:
                                     pending_parent_urls.append(pu)
                             if target_read_limit > 0 and len(collected) >= target_read_limit:
+                                log(f"   ✅ [URLリスト（リプライ）] 目標人数 ({len(collected)}/{target_read_limit}件) に達したため登録URL探索を完了します。")
                                 break
+                            if single_url_mode:
+                                if target_read_limit <= 0 and len(collected) > 0:
+                                    break
+                                if r_idx < len(urls_to_visit):
+                                    log(f"   ℹ️ [URLリスト（リプライ）] 現時点 {len(collected)}/{target_read_limit}件 のため、別URLへ移動して取得を続けます...")
+                            else:
+                                if r_idx >= reply_url_loop_limit and len(collected) > 0:
+                                    break
+                                if len(collected) == 0 and r_idx < len(urls_to_visit):
+                                    log(f"   ℹ️ [URLリスト（リプライ）] 新規0件だったため、別URLへフォールバックします...")
 
                         need_more = (target_read_limit > 0 and len(collected) < target_read_limit) or (target_read_limit <= 0 and len(collected) == 0)
                         if need_more and reply_parent_hop_limit > 0 and pending_parent_urls:
@@ -1016,15 +1115,26 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 elif m_type == "URL_FOLLOW":
                     if acc_follow_urls:
-                        log(f"👥 [URLリスト（フォロー）] DB未登録ターゲット収集開始 (登録URL: {len(acc_follow_urls)}件 / 上限: {target_read_limit}件)...")
-                        for furl in acc_follow_urls:
+                        follow_candidates = list(acc_follow_urls)
+                        random.shuffle(follow_candidates)
+                        log(f"👥 [URLリスト（フォロー）] DB未登録ターゲット収集開始 (登録URL: {len(follow_candidates)}件 / 目標人数: {target_read_limit if target_read_limit > 0 else '無制限'}件)...")
+                        for f_idx, furl in enumerate(follow_candidates, start=1):
                             rem = remaining_limit()
                             if target_read_limit > 0 and rem <= 0:
                                 break
                             found = browser_ctrl.collect_targets_from_follow(furl, scroll_limit=scroll_limit, max_targets=rem, should_skip_fn=should_skip_target)
                             append_collected_items(found, f"URLリスト（フォロー）:{furl}", collected)
-                            if target_read_limit > 0 and len(collected) >= target_read_limit:
-                                break
+                            if target_read_limit > 0:
+                                if len(collected) >= target_read_limit:
+                                    log(f"   ✅ [URLリスト（フォロー）] 目標人数 ({len(collected)}/{target_read_limit}件) に達したため探索を終了します。")
+                                    break
+                                elif f_idx < len(follow_candidates):
+                                    log(f"   ℹ️ [URLリスト（フォロー）] {furl} 終了時点で {len(collected)}/{target_read_limit}件 のため、別URLへ移動して目標人数まで取得を続けます...")
+                            else:
+                                if len(collected) > 0:
+                                    break
+                                elif f_idx < len(follow_candidates):
+                                    log(f"   ℹ️ [URLリスト（フォロー）] {furl} は新規0件だったため、別URLへフォールバックします...")
                     else:
                         log(f"   ℹ️ [URLリスト（フォロー）] 「URLリスト_フォロー」シートに対象URLが未登録のためスキップします。")
 
@@ -1400,9 +1510,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             def wait_between_targets(wait_time: float, label_prefix: str, cur_cnt: int, goal_cnt: int, act_min: float, act_max: float):
                 log(f"☕ [{label_prefix}] 次のターゲットまで {wait_time:.1f} 秒待機します（実行間隔 {act_min:.0f}秒〜{act_max:.0f}秒 / 進捗: {cur_cnt}/{goal_cnt}件）...")
                 start_wait = time.time()
-                close_during_wait = wait_time >= 300.0
+                close_threshold = 60.0 if low_spec_mode else 300.0
+                close_during_wait = wait_time >= close_threshold
                 if close_during_wait:
-                    log(f"🚪 [超長時間待機] 待機時間（{wait_time:.1f}秒）のため、ブラウザウィンドウを一旦安全に閉じます...")
+                    log(f"🚪 [{'省メモリ待機' if low_spec_mode else '超長時間待機'}] 待機時間（{wait_time:.1f}秒 >= {close_threshold:.0f}秒）のため、ブラウザウィンドウを一旦安全に閉じてメモリを解放します...")
                     try:
                         from ai_generator import AIDedicatedWindowManager
                         AIDedicatedWindowManager.close_ai_window()
@@ -1533,11 +1644,21 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     else:
                         log("ℹ️ 有効なターゲットが見つかりませんでした。安全に今回のアカウント処理を終了します。")
 
+            if not session_failed:
+                health_mgr.record_success(clean_account_id)
+
         except Exception as e:
+            session_failed = True
             log(f"⚠️ アカウント [{account_id}] の処理中に予期せぬエラーが発生しました: {e}。このアカウントを安全にスキップし、次のアカウントへ進みます。")
             try:
                 if browser_ctrl:
                     browser_ctrl.capture_error_screenshot("account_exception", clean_account_id)
+            except Exception:
+                pass
+            try:
+                res_h = health_mgr.record_failure(clean_account_id, reason=str(e), pause_hours=1.0, immediate_pause=False, threshold=3)
+                if res_h.get("newly_paused"):
+                    log(f"⛔ 【自動休止(サーキットブレーカー)】アカウント [{account_id}] が連続エラー ({res_h.get('consecutive_failures')}回) のため一時休止されました。")
             except Exception:
                 pass
             traceback.print_exc()
@@ -1567,47 +1688,92 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             account_ready_times[clean_account_id] = time.time() + next_interval
             log(f"⏰ 次回のアカウント [{account_id}] 実行可能時間: 約{next_interval:.1f}秒後 (実行間隔設定: {account_min_sec:.0f}秒 〜 {account_max_sec:.0f}秒)")
 
-        # ★ 提案1: 「1窓・待機時間ごとにローテーション」 次のアカウント案内
-        if acc_idx < total_acc_count:
-            next_acc_obj = accounts[acc_idx]
-            next_raw_id = get_acc_val(next_acc_obj, ["アカウントid", "アカウント名", "ユーザー名", "id"], "").strip() or f"アカウント#{acc_idx+1}"
-            next_name = normalize_screen_name(next_raw_id) or f"acc_{acc_idx+1}"
-            next_min, next_max = extract_account_interval_seconds(next_acc_obj, 300.0, 900.0)
-            log("")
-            log(f"{'-'*58}")
-            log(f"🔒 【提案1: 1窓ローテーション切替】アカウント [{account_id}] 終了 → 次のアカウント [{next_name}] ({acc_idx + 1}/{total_acc_count}件目) へ")
-            log(f"   💡 同一PC・同一IPからの同時アクセスをゼロ化し、アカウント凍結・制限リスクを最小化")
-            if next_name in account_ready_times and account_ready_times[next_name] > time.time():
-                wait_left = account_ready_times[next_name] - time.time()
-                log(f"   ⏰ アカウント [{next_name}] の次回待機時間: あと{wait_left:.0f}秒後に自動起動")
-            else:
-                log(f"   🚀 アカウント [{next_name}] を待ち時間なしで直ちに起動します")
-            log(f"{'-'*58}")
-
-    # === 実行モード判定 (1窓〜最大5窓同時並列実行) ===
+    # === 実行モード判定 (1窓〜最大5窓同時並列実行 / 低スペPC超軽量モード時は1窓固定) ===
     env_concurrent = os.environ.get("TOOL_MAX_CONCURRENT", "").strip()
     global_max_concurrent = 1
-    if env_concurrent.isdigit() and 1 <= int(env_concurrent) <= 5:
+    if low_spec_mode:
+        global_max_concurrent = 1
+    elif env_concurrent.isdigit() and 1 <= int(env_concurrent) <= 5:
         global_max_concurrent = int(env_concurrent)
     else:
         global_max_concurrent = config_mgr.load_max_concurrent()
 
     log("")
-    log(f"🪟 【ブラウザ起動モード】: {f'⚡ {global_max_concurrent}窓同時並列実行モード (最大{global_max_concurrent}アカウント同時進行)' if global_max_concurrent > 1 else '🔒 1窓完全ローテーションモード (1画面ずつ順番・超安全・省メモリ推奨)'}")
+    if low_spec_mode:
+        log("🪶 【低スペPC超軽量モード ON】 1窓固定・メディア通信遮断・軽量Chromiumフラグ・キャッシュ自動掃除・60秒以上待機時ブラウザ自動終了を有効化")
+    log(f"🪟 【ブラウザ起動モード】: {f'⚡ {global_max_concurrent}窓同時並列実行モード (最大{global_max_concurrent}アカウント同時進行)' if global_max_concurrent > 1 else '🔒 1窓完全ローテーションモード (1画面ずつ順番・最短待ち優先スケジューラ)'}")
 
     if global_max_concurrent == 1:
-        log("📋 【1窓順次ローテーション】全アカウントを1画面ずつ順番に待機時間を確認しながら実行します。")
+        log("📋 【非ブロッキング・最短待ち優先スケジューラ】稼働時間帯＆健全性を確認し、待機完了済みのアカウントから即座に順次実行します。")
+        pending = []
         for acc_idx, acc in enumerate(accounts, start=1):
-            process_single_account(acc, acc_idx, total_acc_count, active_slot=1, slot_semaphore=None)
+            clean_id, _ = _extract_clean_id_from_row(acc, acc_idx)
+            if not clean_id:
+                continue
+            acc_t_path = config_mgr.get_target_path_for_account(clean_id)
+            acc_s = config_mgr.load_account_settings(clean_id, target_path_override=acc_t_path, fallback_acc=acc)
+            ah_spec = str(acc_s.get("active_hours", "") or get_acc_val(acc, ["稼働時間帯", "稼働時間", "営業時間", "実行時間帯", "activehours"], "") or "").strip()
+            e_mins = [cfg.get("min_interval", 300.0) for cfg in (acc_s.get("actions") or {}).values() if cfg.get("enabled")]
+            e_maxs = [cfg.get("max_interval", 900.0) for cfg in (acc_s.get("actions") or {}).values() if cfg.get("enabled")]
+            pending.append({
+                "acc": acc,
+                "acc_idx": acc_idx,
+                "clean_id": clean_id,
+                "active_hours": ah_spec,
+                "min_sec": min(e_mins) if e_mins else 300.0,
+                "max_sec": max(e_maxs) if e_maxs else 900.0,
+            })
+
+        while pending:
+            check_app_termination(base_dir)
+            check_pause_state("スケジューラ待機")
+            now_ts = time.time()
+            eligible = []
+            still_pending = []
+            for item in pending:
+                cid = item["clean_id"]
+                is_paused, p_info = health_mgr.is_paused(cid, now_ts=now_ts)
+                if is_paused:
+                    rem_m = max(1, int((float(p_info.get("paused_until") or 0) - now_ts) // 60) + 1)
+                    log(f"⛔ [自動休止スキップ] アカウント [@{cid}] は一時休止中のため今回スキップします（残り約{rem_m}分 / 理由: {p_info.get('pause_reason', '異常検知')}）")
+                    continue
+                ok_hr, wait_hr = is_within_active_hours(item["active_hours"])
+                if not ok_hr:
+                    log(f"🌙 [稼働時間外スキップ] アカウント [@{cid}] は稼働時間帯 ({item['active_hours']}) 外のため今回スキップします（次回開始まで約{max(1, wait_hr // 60)}分）")
+                    continue
+                ready_at = account_ready_times.get(cid, 0.0)
+                eligible.append((ready_at, item["acc_idx"], item))
+                still_pending.append(item)
+
+            pending = still_pending
+            if not eligible:
+                break
+
+            # 準備完了済み (ready_at <= now) を最優先。無ければ最短待ち時刻のアカウントを選択
+            chosen_ready_at, chosen_idx, chosen_item = select_ready_first_candidate(eligible, now_ts)
+            remaining_wait = chosen_ready_at - time.time()
+            if remaining_wait > 0:
+                log(f"⏳ [最短待ち優先] 実行可能な他アカウントがないため、最短待機アカウント [@{chosen_item['clean_id']}] の準備完了まで {remaining_wait:.1f} 秒待機します...")
+                wait_for_account_interval(chosen_item["clean_id"], remaining_wait, chosen_item["min_sec"], chosen_item["max_sec"], base_dir, f"第{cycle_count}周回 最短待ち優先")
+            else:
+                log(f"⚡ [即時起動] アカウント [@{chosen_item['clean_id']}] は準備完了済みのため待ち時間0秒で開始します（残り待機キュー: {len(pending) - 1}件）")
+
+            pending = [it for it in pending if it["clean_id"] != chosen_item["clean_id"] or it["acc_idx"] != chosen_idx]
+            process_single_account(chosen_item["acc"], chosen_idx, total_acc_count, active_slot=1, slot_semaphore=None, skip_interval_wait=True)
     else:
         log(f"⚡ 【{global_max_concurrent}窓同時並列実行】時間が被ったアカウントは最大{global_max_concurrent}画面まで同時に独立ブラウザ（独立Cookie/独立DB/独立ログ）で並行稼働します。")
         log(f"   ※{global_max_concurrent}枠が埋まっている間に待機時間が到来した場合は、待機キューでスタンバイし、空き枠が出次第0秒即時起動します。")
         slot_semaphore = threading.Semaphore(global_max_concurrent)
+        # 待機時間到来順（準備完了済み優先）でスレッド投入
+        ordered_accs = sorted(
+            enumerate(accounts, start=1),
+            key=lambda pair: account_ready_times.get(_extract_clean_id_from_row(pair[1], pair[0])[0], 0.0),
+        )
         threads = []
-        for acc_idx, acc in enumerate(accounts, start=1):
+        for acc_idx, acc in ordered_accs:
             t = threading.Thread(
                 target=process_single_account,
-                args=(acc, acc_idx, total_acc_count, ((acc_idx - 1) % global_max_concurrent) + 1, slot_semaphore),
+                args=(acc, acc_idx, total_acc_count, ((acc_idx - 1) % global_max_concurrent) + 1, slot_semaphore, False),
                 name=f"Thread-Acc-{acc_idx}"
             )
             threads.append(t)
@@ -1617,7 +1783,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         for t in threads:
             t.join()
 
-    log(f"\n🏁 【第 {cycle_count} 周回 完了】 今回の巡回対象アカウント処理がすべて完了しました。")
+    account_ready_times["__last_cycle_executed__"] = cycle_executed_count
+    log(f"\n🏁 【第 {cycle_count} 周回 完了】 今回の巡回対象アカウント処理がすべて完了しました (実行: {cycle_executed_count}件)。")
     return cycle_min_sec, cycle_max_sec
 
 def main():
@@ -1659,7 +1826,7 @@ def main():
         log("")
         log(f"{'#'*65}")
         log(f"🔄 【第 {cycle_count} 周回 巡回開始】 設定ファイル・ターゲットを読み込んで実行します (無限ループ稼働中)")
-        log(f"   💡 提案1: 常に1画面のみ / 提案2: メディア通信遮断 / アカウント別待機タイマー制御")
+        log(f"   💡 提案1: 最短待ち優先1窓ローテ / 提案2: メディア通信遮断 / 稼働時間帯・自動休止対応")
         log(f"{'#'*65}")
 
         try:
@@ -1668,11 +1835,21 @@ def main():
             log(f"⚠️ 第 {cycle_count} 周回中に予期せぬエラーが発生しました: {cycle_err}。")
             traceback.print_exc()
 
-        log("")
-        log(f"{'='*65}")
-        log(f"🏁 【第 {cycle_count} 周回 完了】 すべてのアカウントの処理が一巡しました。")
-        log(f"💡 ※ 自動で無限ループ巡回を継続します。各アカウントの設定待機時間が来たら順次自動起動します。")
-        log(f"{'='*65}")
+        executed_cnt = int(account_ready_times.pop("__last_cycle_executed__", 0) or 0)
+        if executed_cnt == 0:
+            idle_sec = 60.0
+            log(f"💤 現在稼働可能なアカウントがない（稼働時間外または自動休止中）ため、CPU負荷0%で {idle_sec:.0f}秒後に再チェックします...")
+            idle_start = time.time()
+            while time.time() - idle_start < idle_sec:
+                check_app_termination(base_dir)
+                check_pause_state("アイドル待機中")
+                time.sleep(1.0)
+        else:
+            log("")
+            log(f"{'='*65}")
+            log(f"🏁 【第 {cycle_count} 周回 完了】 すべてのアカウントの処理が一巡しました。")
+            log(f"💡 ※ 自動で無限ループ巡回を継続します。各アカウントの設定待機時間が来たら順次自動起動します。")
+            log(f"{'='*65}")
 
 if __name__ == "__main__":
     try:

@@ -265,9 +265,23 @@ def get_account_log_path(base_dir: str, account_name: str) -> str:
     return os.path.join(log_dir, f"{clean}.log")
 
 try:
-    from db_manager import DatabaseManager
+    from db_manager import (
+        DatabaseManager,
+        AccountHealthManager,
+        load_launcher_prefs,
+        save_launcher_prefs,
+    )
 except Exception:
     DatabaseManager = None
+    AccountHealthManager = None
+    load_launcher_prefs = None
+    save_launcher_prefs = None
+
+try:
+    from config_manager import is_within_active_hours
+except Exception:
+    def is_within_active_hours(_spec: str, _now=None):
+        return True, 0
 
 class AppLauncherGUI:
     def get_db_dir(self) -> str:
@@ -542,11 +556,18 @@ class AppLauncherGUI:
         self.opt_box = tk.Frame(self.tab_run, padx=4, pady=2)
         self.opt_box.pack(fill=tk.X, padx=8)
 
+        prefs = {}
+        if load_launcher_prefs is not None:
+            try:
+                prefs = load_launcher_prefs(self.base_dir)
+            except Exception:
+                prefs = {}
+
         self.var_concurrency = tk.IntVar(value=1)
         lbl_mode = tk.Label(self.opt_box, text="🪟 窓数 (1~5窓):", font=("Meiryo", 8, "bold"), fg="#1E293B")
         lbl_mode.pack(side=tk.LEFT, padx=3)
-        cb_conc = ttk.Combobox(self.opt_box, textvariable=self.var_concurrency, values=[1, 2, 3, 4, 5], width=4, state="readonly")
-        cb_conc.pack(side=tk.LEFT, padx=2)
+        self.cb_conc = ttk.Combobox(self.opt_box, textvariable=self.var_concurrency, values=[1, 2, 3, 4, 5], width=4, state="readonly")
+        self.cb_conc.pack(side=tk.LEFT, padx=2)
         lbl_conc_sub = tk.Label(self.opt_box, text="窓 (1=超安全ローテ, 2〜5=同時並列)", font=("Meiryo", 8), fg="#475569")
         lbl_conc_sub.pack(side=tk.LEFT, padx=3)
 
@@ -554,15 +575,29 @@ class AppLauncherGUI:
         chk_headless = tk.Checkbutton(self.opt_box, text="画面表示", variable=self.var_headless, font=("Meiryo", 8))
         chk_headless.pack(side=tk.LEFT, padx=6)
 
-        lbl_tip = tk.Label(self.opt_box, text="※DM拒否アカウントは安全スキップされ、アカウント名.dbに自動登録されます", font=("Meiryo", 8), fg="#64748B")
-        lbl_tip.pack(side=tk.RIGHT, padx=4)
+        self.var_low_spec = tk.BooleanVar(value=bool(prefs.get("low_spec_mode", False)))
+        chk_low_spec = tk.Checkbutton(
+            self.opt_box,
+            text="🪶 低スペPC超軽量モード (1窓固定・省メモリ・キャッシュ自動掃除)",
+            variable=self.var_low_spec,
+            font=("Meiryo", 8, "bold"),
+            fg="#0F766E",
+            command=self._on_toggle_low_spec,
+        )
+        chk_low_spec.pack(side=tk.LEFT, padx=6)
+        if self.var_low_spec.get():
+            self.var_concurrency.set(1)
+            self.cb_conc.config(state="disabled")
 
         # リアルタイムログターミナル
-        log_box = tk.LabelFrame(self.tab_run, text=" 📜 リアルタイム実行ログ ", font=("Meiryo", 9, "bold"), padx=6, pady=4)
+        log_box = tk.LabelFrame(self.tab_run, text=" 📜 リアルタイム実行ログ (GUI表示上限自動管理・全ログはlogフォルダに保存) ", font=("Meiryo", 9, "bold"), padx=6, pady=4)
         log_box.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
 
         log_toolbar = tk.Frame(log_box)
         log_toolbar.pack(fill=tk.X, pady=2)
+
+        lbl_tip = tk.Label(log_toolbar, text="※DM拒否はDB登録で次回スキップ / ログ画面はメモリ節約のため最新行のみ表示", font=("Meiryo", 8), fg="#64748B")
+        lbl_tip.pack(side=tk.LEFT, padx=2)
 
         btn_clear_log = ttk.Button(log_toolbar, text="ログをクリア", command=self._clear_log)
         btn_clear_log.pack(side=tk.RIGHT, padx=2)
@@ -578,34 +613,96 @@ class AppLauncherGUI:
         self.log("【準備完了】設定ファイルを読み込み中...")
 
     def _build_accounts_tab(self):
-        top_bar = tk.Frame(self.tab_accounts, padx=8, pady=6)
-        top_bar.pack(fill=tk.X)
+        top_bar = tk.Frame(self.tab_accounts)
+        top_bar.pack(fill=tk.X, padx=8, pady=(6, 2))
 
         tk.Label(top_bar, text="「アカウント情報.xlsx」から自動読み込みされたアカウント一覧", font=("Meiryo", 9, "bold")).pack(side=tk.LEFT)
         ttk.Button(top_bar, text="📗 Excelを開く", command=lambda: self._open_file("アカウント情報.xlsx")).pack(side=tk.RIGHT, padx=3)
         ttk.Button(top_bar, text="🔄 再読込", command=self.reload_all_configs).pack(side=tk.RIGHT, padx=3)
-        ttk.Button(top_bar, text="👤 Chromeプロファイル起動 (chrome_launcher)", command=self._start_profile_launcher_process).pack(side=tk.RIGHT, padx=3)
-        ttk.Button(top_bar, text="🔑 DMパスコード設定 (初回保存)", command=self._set_passcode_dialog).pack(side=tk.RIGHT, padx=3)
-        ttk.Button(top_bar, text="🌐 アカウント編集ブラウザ起動 (ウィンドウ保持)", command=self._start_edit_browser_process).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(top_bar, text="🧹 キャッシュ掃除", command=self._clear_browser_cache).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(top_bar, text="🔓 休止解除", command=self._clear_account_pause).pack(side=tk.RIGHT, padx=3)
 
-        cols = ("アカウントID", "アカウントPW", "auth_token状態", "DMパスコード", "動作設定Excel", "設定モード", "ターゲット件数", "DM実行", "いいね実行", "フォロー実行", "リプライ実行", "引用RT実行")
+        sub_bar = tk.Frame(self.tab_accounts)
+        sub_bar.pack(fill=tk.X, padx=8, pady=(0, 4))
+        ttk.Button(sub_bar, text="👤 Chromeプロファイル起動 (chrome_launcher)", command=self._start_profile_launcher_process).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(sub_bar, text="🔑 DMパスコード設定 (初回保存)", command=self._set_passcode_dialog).pack(side=tk.RIGHT, padx=3)
+        ttk.Button(sub_bar, text="🌐 アカウント編集ブラウザ起動 (ウィンドウ保持)", command=self._start_edit_browser_process).pack(side=tk.RIGHT, padx=3)
+
+        cols = ("アカウントID", "アカウントPW", "auth_token状態", "DMパスコード", "動作設定Excel", "稼働時間帯", "稼働状態", "設定モード", "ターゲット件数", "DM実行", "いいね実行", "フォロー実行", "リプライ実行", "引用RT実行")
         self.tree_acc = ttk.Treeview(self.tab_accounts, columns=cols, show="headings", height=8)
         for c in cols:
             self.tree_acc.heading(c, text=c)
-            self.tree_acc.column(c, width=80, anchor=tk.CENTER)
-        self.tree_acc.column("アカウントID", width=120, anchor=tk.W)
-        self.tree_acc.column("アカウントPW", width=100, anchor=tk.CENTER)
+            self.tree_acc.column(c, width=72, anchor=tk.CENTER)
+        self.tree_acc.column("アカウントID", width=110, anchor=tk.W)
+        self.tree_acc.column("アカウントPW", width=90, anchor=tk.CENTER)
         self.tree_acc.column("auth_token状態", width=95, anchor=tk.CENTER)
-        self.tree_acc.column("DMパスコード", width=110, anchor=tk.CENTER)
-        self.tree_acc.column("動作設定Excel", width=140, anchor=tk.W)
-        self.tree_acc.column("設定モード", width=180, anchor=tk.W)
-        self.tree_acc.column("ターゲット件数", width=85, anchor=tk.CENTER)
+        self.tree_acc.column("DMパスコード", width=95, anchor=tk.CENTER)
+        self.tree_acc.column("動作設定Excel", width=120, anchor=tk.W)
+        self.tree_acc.column("稼働時間帯", width=95, anchor=tk.CENTER)
+        self.tree_acc.column("稼働状態", width=115, anchor=tk.CENTER)
+        self.tree_acc.column("設定モード", width=155, anchor=tk.W)
+        self.tree_acc.column("ターゲット件数", width=78, anchor=tk.CENTER)
 
         scrollbar = ttk.Scrollbar(self.tab_accounts, orient=tk.VERTICAL, command=self.tree_acc.yview)
         self.tree_acc.configure(yscroll=scrollbar.set)
         scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.tree_acc.pack(fill=tk.BOTH, expand=True, padx=8, pady=4)
         self.tree_acc.bind("<Double-1>", lambda e: self._set_passcode_dialog())
+
+    def _on_toggle_low_spec(self):
+        enabled = bool(self.var_low_spec.get())
+        if enabled:
+            self.var_concurrency.set(1)
+            self.cb_conc.config(state="disabled")
+            self.log("🪶 【低スペPC超軽量モード ON】 1窓固定・軽量Chromiumフラグ・キャッシュ自動掃除・60秒以上待機時ブラウザ自動終了を有効化しました。", tag="INFO")
+        else:
+            self.cb_conc.config(state="readonly")
+            self.log("ℹ️ 【低スペPC超軽量モード OFF】 通常モードに戻しました。", tag="INFO")
+        if save_launcher_prefs is not None:
+            try:
+                save_launcher_prefs(self.base_dir, {"low_spec_mode": enabled})
+            except Exception:
+                pass
+
+    def _clear_browser_cache(self):
+        try:
+            from browser_controller import cleanup_all_profiles_cache
+        except Exception as e:
+            messagebox.showerror("エラー", f"キャッシュ掃除モジュールの読込に失敗しました: {e}", parent=self.root)
+            return
+
+        if self.running_process:
+            if not messagebox.askyesno("確認", "現在プロセスが実行中です。\n使用中のプロファイルファイルは自動スキップされますが、キャッシュ掃除を実行しますか？", parent=self.root):
+                return
+
+        prof_cnt, freed_bytes, file_cnt = cleanup_all_profiles_cache(self.base_dir)
+        freed_mb = freed_bytes / (1024 * 1024)
+        self.log(f"🧹 【キャッシュ手動掃除完了】 {prof_cnt}プロファイルから {freed_mb:.1f} MB ({file_cnt}ファイル) の不要キャッシュを削除しました（Cookie・ログイン情報保持）。", tag="SUCCESS")
+        messagebox.showinfo(
+            "キャッシュ掃除完了",
+            f"対象プロファイル数: {prof_cnt}件\n削除ファイル数: {file_cnt}件\n削減容量: {freed_mb:.1f} MB\n\n※Xログイン状態 (Cookie・暗号化DM鍵) は完全に保持されています。",
+            parent=self.root,
+        )
+
+    def _clear_account_pause(self):
+        if AccountHealthManager is None:
+            messagebox.showinfo("案内", "健全性管理モジュールが見つかりません。", parent=self.root)
+            return
+        hm = AccountHealthManager(self.base_dir)
+        selected = self.tree_acc.selection()
+        if selected:
+            acc_id = str(self.tree_acc.item(selected[0])["values"][0]).strip().lstrip("@")
+            if hm.clear_pause(acc_id):
+                self.log(f"🔓 アカウント [@{acc_id}] の一時休止状態を解除しました。", tag="SUCCESS")
+                messagebox.showinfo("休止解除", f"アカウント @{acc_id} の自動休止を解除しました。", parent=self.root)
+            else:
+                messagebox.showinfo("案内", f"アカウント @{acc_id} は休止状態ではありませんでした。", parent=self.root)
+        else:
+            if messagebox.askyesno("一括解除確認", "休止中の全アカウントの自動休止状態を解除しますか？", parent=self.root):
+                cnt = hm.clear_all_pauses()
+                self.log(f"🔓 一時休止中の {cnt} 件のアカウントを解除しました。", tag="SUCCESS")
+                messagebox.showinfo("休止解除完了", f"{cnt}件のアカウントの休止状態を解除しました。", parent=self.root)
+        self.reload_all_configs()
 
     def _set_passcode_dialog(self):
         selected = self.tree_acc.selection()
@@ -801,6 +898,7 @@ class AppLauncherGUI:
                 self.log(f"⚠️ アカウント情報.xlsx 読込エラー: {e}")
 
         # テーブル更新
+        health_mgr = AccountHealthManager(self.base_dir) if AccountHealthManager is not None else None
         for item in self.tree_acc.get_children():
             self.tree_acc.delete(item)
         for acc in self.accounts_data:
@@ -852,6 +950,23 @@ class AppLauncherGUI:
             passcode_display = f"登録済 ({passcode_val})" if passcode_val else "未設定 (初回時に自動保存)"
 
             excel_name = os.path.basename(acc_target_path) if acc_target_path and os.path.exists(acc_target_path) else "アカウント名.xlsx"
+            active_hours_val = str(acc_set.get("active_hours", "") or acc.get("稼働時間帯", "") or acc.get("稼働時間", "") or "").strip()
+            active_hours_disp = active_hours_val or "24時間"
+
+            status_disp = "✅ 稼働可能"
+            if health_mgr is not None and clean_acc:
+                try:
+                    is_p, p_info = health_mgr.is_paused(clean_acc)
+                    if is_p:
+                        rem_m = max(1, int((float(p_info.get("paused_until") or 0) - time.time()) // 60) + 1)
+                        status_disp = f"⛔ 休止 ({rem_m}分)"
+                    else:
+                        ok_hr, _ = is_within_active_hours(active_hours_val)
+                        if not ok_hr:
+                            status_disp = "🌙 時間外"
+                except Exception:
+                    pass
+
             acts = acc_set.get("actions", {})
             enabled_modes = []
             for a_k, a_lbl in [("dm", "DM"), ("like", "いいね"), ("follow", "フォロー"), ("reply", "リプライ"), ("quote", "引用"), ("reply_ai", "リプライAI"), ("quote_ai", "引用AI")]:
@@ -873,6 +988,8 @@ class AppLauncherGUI:
                 has_token,
                 passcode_display,
                 excel_name,
+                active_hours_disp,
+                status_disp,
                 target_mode_display,
                 f"{t_cnt}件",
                 is_dm,
@@ -1315,12 +1432,14 @@ class AppLauncherGUI:
                     except Exception:
                         pass
 
+                low_spec_enabled = bool(getattr(self, "var_low_spec", tk.BooleanVar(value=False)).get())
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
                 env["PYTHONUTF8"] = "1"
                 env["LAUNCHER_PID"] = str(os.getpid())
                 env["X_AUTO_DM_BASE_DIR"] = self.base_dir
-                env["TOOL_MAX_CONCURRENT"] = str(getattr(self, "var_concurrency", tk.IntVar(value=1)).get())
+                env["TOOL_LOW_SPEC_MODE"] = "1" if low_spec_enabled else "0"
+                env["TOOL_MAX_CONCURRENT"] = "1" if low_spec_enabled else str(getattr(self, "var_concurrency", tk.IntVar(value=1)).get())
                 
                 # 他PC実行（PyInstaller EXE化環境）自動判定
                 if getattr(sys, 'frozen', False):
@@ -1621,18 +1740,38 @@ class AppLauncherGUI:
         if not tag:
             if "✅" in message or "SUCCESS" in message or "成功" in message:
                 tag = "SUCCESS"
-            elif "❌" in message or "ERROR" in message or "失敗" in message:
+            elif "❌" in message or "ERROR" in message or "失敗" in message or "⛔" in message:
                 tag = "ERROR"
-            elif "⚠️" in message or "WARN" in message or "スキップ" in message:
+            elif "⚠️" in message or "WARN" in message or "スキップ" in message or "🌙" in message:
                 tag = "WARN"
-            elif ">>>" in message or "ℹ️" in message:
+            elif ">>>" in message or "ℹ️" in message or "🪶" in message or "🧹" in message:
                 tag = "INFO"
 
-        if tag:
-            self.log_text.insert(tk.END, message + "\n", tag)
+        if threading.current_thread() is threading.main_thread():
+            self._append_log_ui(message, tag)
         else:
-            self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END)
+            try:
+                self.root.after(0, lambda m=message, t=tag: self._append_log_ui(m, t))
+            except Exception:
+                pass
+
+    def _append_log_ui(self, message, tag=None):
+        try:
+            if tag:
+                self.log_text.insert(tk.END, message + "\n", tag)
+            else:
+                self.log_text.insert(tk.END, message + "\n")
+            self._log_insert_count = getattr(self, "_log_insert_count", 0) + 1
+            is_low_spec = bool(hasattr(self, "var_low_spec") and self.var_low_spec.get())
+            max_lines = 400 if is_low_spec else 800
+            if self._log_insert_count % 25 == 0:
+                line_cnt = int(float(self.log_text.index("end-1c").split(".")[0]))
+                if line_cnt > max_lines:
+                    trim_to = line_cnt - max_lines + 1
+                    self.log_text.delete("1.0", f"{trim_to}.0")
+            self.log_text.see(tk.END)
+        except Exception:
+            pass
 
     def _clear_log(self):
         self.log_text.delete("1.0", tk.END)

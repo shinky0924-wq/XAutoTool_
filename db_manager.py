@@ -9,6 +9,8 @@ import os
 import sys
 import re
 import json
+import time
+import threading
 from datetime import datetime
 
 # Windows CP932 / Emoji UnicodeEncodeError 対策
@@ -641,4 +643,196 @@ class DatabaseManager:
             if f.lower().endswith(".db"):
                 files.append(os.path.join(db_dir, f))
         return sorted(files)
+
+
+def load_launcher_prefs(base_dir: str) -> dict:
+    """GUIランチャーのユーザー設定（低スペPC超軽量モード等）を読込"""
+    db_dir = get_db_dir(base_dir)
+    pref_file = os.path.join(db_dir, "launcher_prefs.json")
+    defaults = {"low_spec_mode": False, "max_concurrent": 1}
+    if os.path.exists(pref_file):
+        try:
+            with open(pref_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    defaults.update(data)
+        except Exception:
+            pass
+    return defaults
+
+
+def save_launcher_prefs(base_dir: str, prefs: dict) -> bool:
+    """GUIランチャーのユーザー設定を保存"""
+    db_dir = get_db_dir(base_dir)
+    pref_file = os.path.join(db_dir, "launcher_prefs.json")
+    try:
+        current = load_launcher_prefs(base_dir)
+        if isinstance(prefs, dict):
+            current.update(prefs)
+        tmp_file = pref_file + ".tmp"
+        with open(tmp_file, "w", encoding="utf-8") as f:
+            json.dump(current, f, ensure_ascii=False, indent=2)
+        os.replace(tmp_file, pref_file)
+        return True
+    except Exception:
+        return False
+
+
+class AccountHealthManager:
+    """
+    アカウント健全性・サーキットブレーカー管理 (dbフォルダ/account_health.json)
+    - 凍結・ロック・連続ログイン失敗/致命的エラー発生時に該当アカウントのみ自動一時休止し、
+      他の正常アカウントの稼働を止めずに安全運用を継続する。
+    """
+
+    def __init__(self, base_dir: str):
+        self.base_dir = base_dir
+        self.db_dir = get_db_dir(base_dir)
+        self.health_file = os.path.join(self.db_dir, "account_health.json")
+        self._lock = threading.Lock()
+
+    def _normalize_key(self, account_id: str) -> str:
+        clean = normalize_screen_name(account_id)
+        key = (clean or str(account_id or "")).strip().lstrip("@").lower()
+        return key
+
+    def _read_all_unlocked(self) -> dict:
+        if not os.path.exists(self.health_file):
+            return {}
+        try:
+            with open(self.health_file, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return data if isinstance(data, dict) else {}
+        except Exception:
+            return {}
+
+    def _write_all_unlocked(self, data: dict) -> bool:
+        try:
+            os.makedirs(self.db_dir, exist_ok=True)
+            tmp_file = self.health_file + ".tmp"
+            with open(tmp_file, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+            os.replace(tmp_file, self.health_file)
+            return True
+        except Exception:
+            return False
+
+    def get_all_health(self) -> dict:
+        with self._lock:
+            return dict(self._read_all_unlocked())
+
+    def is_paused(self, account_id: str, now_ts: float = None) -> tuple[bool, dict]:
+        """アカウントが現在自動一時休止中か判定。期限切れの場合は自動解除する。"""
+        key = self._normalize_key(account_id)
+        if not key:
+            return False, {}
+        now = time.time() if now_ts is None else float(now_ts)
+        with self._lock:
+            data = self._read_all_unlocked()
+            info = dict(data.get(key) or {})
+            paused_until = float(info.get("paused_until") or 0.0)
+            if paused_until > now:
+                return True, info
+            if paused_until > 0.0 and paused_until <= now:
+                info["paused_until"] = 0.0
+                info["pause_reason"] = ""
+                info["consecutive_failures"] = 0
+                data[key] = info
+                self._write_all_unlocked(data)
+            return False, info
+
+    def record_success(self, account_id: str):
+        """ログインおよび実行成功時に失敗カウントと休止状態をリセット"""
+        key = self._normalize_key(account_id)
+        if not key:
+            return
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            data = self._read_all_unlocked()
+            info = dict(data.get(key) or {})
+            info["account_id"] = normalize_screen_name(account_id) or key
+            info["consecutive_failures"] = 0
+            info["paused_until"] = 0.0
+            info["pause_reason"] = ""
+            info["last_success_at"] = now_str
+            data[key] = info
+            self._write_all_unlocked(data)
+
+    def record_failure(
+        self,
+        account_id: str,
+        reason: str = "エラー",
+        pause_hours: float = 2.0,
+        immediate_pause: bool = False,
+        threshold: int = 3,
+    ) -> dict:
+        """
+        失敗を記録し、重大異常(凍結/ロック等)または連続失敗閾値到達で自動一時休止を設定。
+        戻り値辞書には newly_paused, paused_until, consecutive_failures 等を含む。
+        """
+        key = self._normalize_key(account_id)
+        if not key:
+            return {"newly_paused": False}
+        now = time.time()
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with self._lock:
+            data = self._read_all_unlocked()
+            info = dict(data.get(key) or {})
+            fails = int(info.get("consecutive_failures") or 0) + 1
+            info["account_id"] = normalize_screen_name(account_id) or key
+            info["consecutive_failures"] = fails
+            info["last_error"] = str(reason or "エラー")[:200]
+            info["last_error_at"] = now_str
+
+            already_paused = float(info.get("paused_until") or 0.0) > now
+            should_pause = immediate_pause or (fails >= max(1, int(threshold)))
+            newly_paused = False
+            if should_pause:
+                pause_sec = max(60.0, float(pause_hours) * 3600.0)
+                new_until = max(float(info.get("paused_until") or 0.0), now + pause_sec)
+                if not already_paused:
+                    newly_paused = True
+                info["paused_until"] = new_until
+                info["pause_reason"] = str(reason or "連続エラー")[:200]
+
+            data[key] = info
+            self._write_all_unlocked(data)
+            out = dict(info)
+            out["newly_paused"] = newly_paused
+            return out
+
+    def clear_pause(self, account_id: str) -> bool:
+        """指定アカウントの一時休止を手動解除"""
+        key = self._normalize_key(account_id)
+        if not key:
+            return False
+        with self._lock:
+            data = self._read_all_unlocked()
+            if key not in data:
+                return False
+            info = dict(data[key] or {})
+            info["consecutive_failures"] = 0
+            info["paused_until"] = 0.0
+            info["pause_reason"] = ""
+            data[key] = info
+            return self._write_all_unlocked(data)
+
+    def clear_all_pauses(self) -> int:
+        """全アカウントの一時休止を手動解除し、解除件数を返す"""
+        with self._lock:
+            data = self._read_all_unlocked()
+            now = time.time()
+            cleared = 0
+            for key, raw_info in list(data.items()):
+                info = dict(raw_info or {})
+                if float(info.get("paused_until") or 0.0) > now or int(info.get("consecutive_failures") or 0) > 0:
+                    info["consecutive_failures"] = 0
+                    info["paused_until"] = 0.0
+                    info["pause_reason"] = ""
+                    data[key] = info
+                    cleared += 1
+            if cleared > 0:
+                self._write_all_unlocked(data)
+            return cleared
+
 

@@ -60,6 +60,85 @@ def normalize_screen_name(val: str) -> str:
         s = s.split("/")[0]
     return s.lstrip("@").strip()
 
+
+_FULLWIDTH_TRANS = str.maketrans("０１２３４５６７８９：；〜～−‐—－、／", "0123456789:;------,/")
+
+
+def parse_active_hours_spec(spec: str) -> list[tuple[int, int]]:
+    """
+    稼働時間帯文字列 (例: "09:00-17:00", "22:00-04:00", "07:00-10:00, 19:00-23:00", "9時-18時")
+    を (開始分, 終了分) のタプルリスト (0〜1440分) にパース。
+    空欄 / "24時間" / "常時" 等の場合は空リスト []（＝24時間常に稼働）を返す。
+    """
+    raw = str(spec or "").translate(_FULLWIDTH_TRANS).strip()
+    if not raw:
+        return []
+    low = raw.replace(" ", "").replace("　", "").lower()
+    if low in ("24", "24h", "24時間", "常時", "いつでも", "終日", "all", "always", "なし", "未設定", "-"):
+        return []
+
+    parts = [p.strip() for p in re.split(r"[,;/\n]+", raw) if p.strip()]
+    windows: list[tuple[int, int]] = []
+    time_pat = re.compile(
+        r"(\d{1,2})(?::(\d{1,2})|時(\d{1,2})?分?)?\s*(?:-|to)\s*(\d{1,2})(?::(\d{1,2})|時(\d{1,2})?分?)?",
+        re.IGNORECASE,
+    )
+    for part in parts:
+        p_norm = part.replace("〜", "-").replace("~", "-").replace("から", "-")
+        m = time_pat.search(p_norm)
+        if not m:
+            continue
+        try:
+            sh = int(m.group(1))
+            sm = int(m.group(2) or m.group(3) or 0)
+            eh = int(m.group(4))
+            em = int(m.group(5) or m.group(6) or 0)
+            if not (0 <= sh <= 24 and 0 <= sm < 60 and 0 <= eh <= 24 and 0 <= em < 60):
+                continue
+            start_min = min(1440, sh * 60 + sm)
+            end_min = min(1440, eh * 60 + em)
+            if start_min == end_min or (start_min == 0 and end_min == 1440):
+                # 00:00-24:00 または 同一時刻は24時間扱い
+                return []
+            windows.append((start_min, end_min))
+        except Exception:
+            continue
+    return windows
+
+
+def is_within_active_hours(spec: str, now_dt: datetime = None) -> tuple[bool, int]:
+    """
+    現在時刻が稼働時間帯内かどうか判定する。
+    戻り値: (is_active: bool, seconds_until_next_start: int)
+    """
+    windows = parse_active_hours_spec(spec)
+    if not windows:
+        return True, 0
+
+    now = now_dt or datetime.now()
+    cur_sec = now.hour * 3600 + now.minute * 60 + now.second
+    cur_min = now.hour * 60 + now.minute
+
+    for start_min, end_min in windows:
+        if start_min < end_min:
+            if start_min <= cur_min < end_min:
+                return True, 0
+        else:
+            # 日跨ぎウィンドウ (例: 22:00-04:00)
+            if cur_min >= start_min or cur_min < end_min:
+                return True, 0
+
+    # 時間外: 次に開始するウィンドウまでの最短秒数を計算
+    min_wait = 86400
+    for start_min, _ in windows:
+        start_sec = start_min * 60
+        diff = start_sec - cur_sec
+        if diff <= 0:
+            diff += 86400
+        if diff < min_wait:
+            min_wait = diff
+    return False, max(1, int(min_wait))
+
 class ConfigManager:
     def __init__(self, account_config_path: str = "", target_list_path: str = "", base_dir: str = ""):
         # 1引数のみでディレクトリが渡された場合、または空引数に対応 (例: ConfigManager(self.base_dir))
@@ -312,6 +391,7 @@ class ConfigManager:
             "ai_prompt": "",
             "block_media": True,
             "dm_passcode": "",
+            "active_hours": "",
             "actions": {
                 "dm": {"enabled": True, "mode": "検索最新,URLリスト（リプライ）,URLリスト（フォロー）", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 3, "max_batch": 8, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
                 "like": {"enabled": False, "mode": "検索最新,HOMEおすすめ", "min_interval": 30.0, "max_interval": 90.0, "min_batch": 5, "max_batch": 10, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
@@ -350,6 +430,8 @@ class ConfigManager:
                     res["ai_engine"] = str(v).strip()
                 elif "メディア" in kc:
                     res["block_media"] = str(v).strip().lower() not in ["0", "false", "off", "無効"]
+                elif any(m in kc for m in ["稼働時間帯", "稼働時間", "営業時間", "実行時間帯", "activehours", "activehour"]):
+                    res["active_hours"] = str(v).strip()
                 s_on = str(v).strip().lower() in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
                 if "命令実行dm" in kc or kc == "dm": res["actions"]["dm"]["enabled"] = s_on
                 elif "命令実行いいね" in kc or kc == "いいね": res["actions"]["like"]["enabled"] = s_on
@@ -439,6 +521,8 @@ class ConfigManager:
                                 res["ai_prompt"] = val1
                             elif "メディア読込ブロック" in col0_clean:
                                 res["block_media"] = val1.lower() not in ["0", "false", "off", "無効"]
+                            elif any(m in col0_clean for m in ["稼働時間帯", "稼働時間", "営業時間", "実行時間帯", "activehours", "activehour"]):
+                                res["active_hours"] = val1
 
                         is_passcode_row = any(m in col0_clean for m in ["パスコード", "passcode", "暗号化", "pin"])
                         act_key = None

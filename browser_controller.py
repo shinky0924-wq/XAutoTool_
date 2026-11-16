@@ -13,6 +13,7 @@ import re
 import time
 import random
 import math
+import shutil
 import subprocess
 
 # Windows CP932 / Emoji UnicodeEncodeError 対策
@@ -151,12 +152,128 @@ def format_template_message(template: str, display_name: str = "", screen_name: 
     res = re.sub(r'様様(?=[^w]|$)', '様', res)
     return res
 
+_SAFE_CACHE_REL_DIRS = (
+    "Cache",
+    "Cache_Data",
+    "Code Cache",
+    "GPUCache",
+    "DawnCache",
+    "DawnGraphiteCache",
+    "DawnWebGPUCache",
+    "GraphiteDawnCache",
+    "GrShaderCache",
+    "ShaderCache",
+    "Crashpad",
+    "BrowserMetrics",
+    "component_crx_cache",
+    "extensions_crx_cache",
+    os.path.join("Service Worker", "CacheStorage"),
+    os.path.join("Service Worker", "ScriptCache"),
+)
+
+
+def cleanup_profile_cache(profile_dir: str, logger=None) -> tuple[int, int]:
+    """
+    browser_profiles/<account> 内の不要キャッシュのみを安全に削除する。
+    ※ Cookies / Network/Cookies / Local Storage / IndexedDB (暗号化DM鍵) /
+      Session Storage / Preferences / storage_state.json は絶対に削除しない。
+    戻り値: (削減バイト数, 削除ファイル数)
+    """
+    if not profile_dir or not os.path.isdir(profile_dir):
+        return 0, 0
+
+    scan_roots = [profile_dir]
+    default_dir = os.path.join(profile_dir, "Default")
+    if os.path.isdir(default_dir):
+        scan_roots.append(default_dir)
+    try:
+        for entry in os.listdir(profile_dir):
+            if entry.startswith("Profile "):
+                p = os.path.join(profile_dir, entry)
+                if os.path.isdir(p):
+                    scan_roots.append(p)
+    except Exception:
+        pass
+
+    freed_bytes = 0
+    deleted_files = 0
+    for root_dir in scan_roots:
+        for rel_cache in _SAFE_CACHE_REL_DIRS:
+            cache_path = os.path.join(root_dir, rel_cache)
+            if not os.path.isdir(cache_path):
+                continue
+            for walk_root, dirs, files in os.walk(cache_path, topdown=False):
+                for fname in files:
+                    fpath = os.path.join(walk_root, fname)
+                    try:
+                        fsize = os.path.getsize(fpath)
+                    except Exception:
+                        fsize = 0
+                    try:
+                        os.remove(fpath)
+                        freed_bytes += fsize
+                        deleted_files += 1
+                    except Exception:
+                        pass
+                for dname in dirs:
+                    dpath = os.path.join(walk_root, dname)
+                    try:
+                        os.rmdir(dpath)
+                    except Exception:
+                        pass
+            try:
+                if os.path.isdir(cache_path) and not os.listdir(cache_path):
+                    os.rmdir(cache_path)
+            except Exception:
+                pass
+
+    if logger and freed_bytes > 0:
+        mb = freed_bytes / (1024 * 1024)
+        prof_name = os.path.basename(os.path.normpath(profile_dir))
+        logger(f"🧹 [キャッシュ掃除] @{prof_name}: 不要キャッシュ {mb:.1f} MB ({deleted_files}ファイル) を解放（ログインCookie保持）")
+    return freed_bytes, deleted_files
+
+
+def cleanup_all_profiles_cache(base_dir: str, logger=None) -> tuple[int, int, int]:
+    """browser_profiles 配下の全アカウントキャッシュを一括掃除 -> (アカウント数, 合計解放バイト, 合計ファイル数)"""
+    profiles_root = os.path.join(base_dir, "browser_profiles")
+    if not os.path.isdir(profiles_root):
+        return 0, 0, 0
+    total_profiles = 0
+    total_bytes = 0
+    total_files = 0
+    try:
+        for entry in sorted(os.listdir(profiles_root)):
+            prof_dir = os.path.join(profiles_root, entry)
+            if os.path.isdir(prof_dir):
+                total_profiles += 1
+                b, c = cleanup_profile_cache(prof_dir, logger=logger)
+                total_bytes += b
+                total_files += c
+    except Exception:
+        pass
+    return total_profiles, total_bytes, total_files
+
+
 class XBrowserController:
-    def __init__(self, headless: bool = False, user_data_dir: str = "", base_dir: str = "", block_media: bool = True, preferred_channel: str = ""):
+    def __init__(
+        self,
+        headless: bool = False,
+        user_data_dir: str = "",
+        base_dir: str = "",
+        block_media: bool = True,
+        preferred_channel: str = "",
+        low_spec_mode: bool = None,
+        auto_cache_cleanup: bool = True,
+    ):
         self.headless = headless
         self.user_data_dir = user_data_dir
         self.base_dir = base_dir or os.path.dirname(os.path.abspath(__file__))
-        self.block_media = block_media
+        if low_spec_mode is None:
+            low_spec_mode = os.environ.get("TOOL_LOW_SPEC_MODE", "").strip().lower() in ("1", "true", "yes", "on")
+        self.low_spec_mode = bool(low_spec_mode)
+        self.auto_cache_cleanup = bool(auto_cache_cleanup)
+        self.block_media = True if self.low_spec_mode else bool(block_media)
         self.preferred_channel = preferred_channel
         self.active_channel = None
         self.current_account_id = ""
@@ -168,6 +285,8 @@ class XBrowserController:
         self.last_acted_tweet_url = ""
         self.last_unavailable_reason = ""
         self.last_error_screenshot = ""
+        self.last_login_failure_reason = ""
+        self.last_login_failure_critical = False
 
     def get_screenshot_dir(self) -> str:
         """スクショフォルダのパスを取得し、無ければ自動作成"""
@@ -313,7 +432,19 @@ class XBrowserController:
             "--no-default-browser-check",
             "--disable-infobars"
         ]
-        
+        if self.low_spec_mode:
+            args.extend([
+                "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-background-networking",
+                "--disable-extensions",
+                "--disable-sync",
+                "--metrics-recording-only",
+                "--mute-audio",
+                "--no-first-run",
+                "--renderer-process-limit=2",
+            ])
+
         launch_candidates = self._get_launch_candidates()
         self.context = None
         self.browser = None
@@ -324,6 +455,10 @@ class XBrowserController:
             os.makedirs(self.user_data_dir, exist_ok=True)
             self._terminate_zombie_browsers()
             self._cleanup_profile_locks()
+            if self.auto_cache_cleanup:
+                freed_b, freed_cnt = cleanup_profile_cache(self.user_data_dir)
+                if freed_b >= 1024 * 1024:
+                    print(f"   🧹 [起動前キャッシュ掃除] {freed_b / (1024 * 1024):.1f} MB ({freed_cnt}ファイル) を削除しました（Cookie保持）", flush=True)
 
             for ch in launch_candidates:
                 ch_label = "Google Chrome (channel='chrome')" if ch == "chrome" else (
@@ -1228,6 +1363,8 @@ class XBrowserController:
            - パスワード入力欄への自動入力と「ログイン」ボタン押下
         4. 2FA等の追加確認時は手動入力待ち受け (最大60秒ポーリング検知)
         """
+        self.last_login_failure_reason = ""
+        self.last_login_failure_critical = False
         self.current_account_id = account_id
         if passcode:
             self.current_passcode = str(passcode).strip()
@@ -1258,6 +1395,13 @@ class XBrowserController:
                     print(f"✅ [@{account_id}] プロファイルの既存セッションを確認しました！（ログイン維持 / 再認証不要）")
                     self.save_storage_state()
                     return True
+                lock_reason = self._detect_own_account_lock_or_suspension(page)
+                if lock_reason:
+                    self.last_login_failure_reason = lock_reason
+                    self.last_login_failure_critical = True
+                    print(f"⛔ [@{account_id}] {lock_reason} を検知したためログイン試行を即時中断し、自動休止対象にします。")
+                    self.capture_error_screenshot("account_locked_or_suspended", account_id=account_id)
+                    return False
                 cur_url = page.url.lower()
                 if "/login" in cur_url or "/flow/login" in cur_url or "mode=login" in cur_url or "/onboarding" in cur_url:
                     break
@@ -1417,6 +1561,13 @@ class XBrowserController:
         # -------------------------------------------------------------
         print(f"⏳ [@{account_id}] 画面上でログイン認証の完了を確認中（最大60秒待機）...")
         for wait_idx in range(30):
+            lock_reason = self._detect_own_account_lock_or_suspension(page)
+            if lock_reason:
+                self.last_login_failure_reason = lock_reason
+                self.last_login_failure_critical = True
+                print(f"⛔ [@{account_id}] {lock_reason} を検知したため自動休止します。")
+                self.capture_error_screenshot("account_locked_or_suspended", account_id=account_id)
+                return False
             time.sleep(2.0)
             if self._is_logged_in():
                 print(f"🎉 [@{account_id}] ログインが確認できました！セッション情報を永続プロファイルに保存します。")
@@ -1426,6 +1577,8 @@ class XBrowserController:
                 print(f"   ⏳ ログイン完了を待機中... ({wait_idx * 2}/60秒)")
 
         # 5. 失敗時のガイダンス
+        self.last_login_failure_reason = "ログイン認証失敗（セッション切れ・認証要求）"
+        self.last_login_failure_critical = False
         print()
         print(f"❌ [@{account_id}] ログイン状態が確認できませんでした。")
         print("💡 【おすすめの解決方法】")
@@ -1436,6 +1589,30 @@ class XBrowserController:
         print()
         self.capture_error_screenshot("login_failed", account_id=account_id)
         return False
+
+    def _detect_own_account_lock_or_suspension(self, page: Page) -> str:
+        """ログイン中アカウント自体の凍結・ロック・アクセス制限画面を検知"""
+        if page is None:
+            return ""
+        try:
+            url = (page.url or "").lower()
+            if "/account/access" in url:
+                return "LOCKED: アカウントアクセス制限・ロック画面(/account/access)"
+            body = ""
+            try:
+                body = (page.locator("body").inner_text(timeout=1500) or "")[:1200]
+            except Exception:
+                pass
+            if not body:
+                return ""
+            low = body.lower()
+            if any(k in body for k in ("アカウントは凍結されています", "あなたのアカウントは凍結されました")) or "your account is suspended" in low or "account is suspended" in low:
+                return "SUSPENDED: アカウント凍結検知"
+            if any(k in body for k in ("アカウントがロックされました", "不正な操作が検出されたため", "アカウントの一部の機能が制限")) or "your account has been locked" in low:
+                return "LOCKED: アカウントロック・機能制限検知"
+        except Exception:
+            pass
+        return ""
 
     def _is_logged_in(self, allow_url_fallback: bool = True) -> bool:
         """ログイン状態の厳密判定 (偽陽性・偽陰性を完全防止)"""
@@ -4148,11 +4325,20 @@ class XBrowserController:
                 return True
             if s.isdigit():
                 return True
-            if s in ["話題を検索", "For you", "トレンド", "Trending", "ニュース", "News", "スポーツ", "エンターテイメント", "さらに表示", "Show more", "プロモーション", "Promoted", "ライブ", "LIVE"]:
+            meta_exact = {
+                "話題を検索", "for you", "おすすめ", "トレンド", "trending", "ニュース", "news",
+                "スポーツ", "sports", "エンターテイメント", "entertainment", "さらに表示", "show more",
+                "プロモーション", "promoted", "ライブ", "live", "日本のトレンド", "世界のトレンド",
+                "おすすめトレンド", "あなたにおすすめのトレンド", "今起きていること", "what's happening",
+                "trends for you", "trending in japan", "worldwide trends", "japan trends", "trending now",
+            }
+            if s.lower() in meta_exact:
                 return True
-            if re.search(r'(?:^|[・·])\s*(?:トレンド|trending|ニュース|news|プロモーション|promoted)\s*$', s, re.I):
+            if re.search(r'(?:^|[・·\s]|の)\s*(?:トレンド|trending|trends|ニュース|news|プロモーション|promoted)\s*$', s, re.I):
                 return True
-            if re.search(r'(?:\d+(?:時間|分|日|秒)前|件のポスト|\bposts?\b|^\d+[\s·・]*$)', s, re.I):
+            if re.search(r'^(?:\d+\s*[・·\.]\s*)?(?:trending\s+in\s+|trends\s+for\s+|.+のトレンド|.+のニュース)', s, re.I):
+                return True
+            if re.search(r'(?:\d+(?:時間|分|日|秒)前|件のポスト|\bposts?\b|^\d+[\s·・\.]*$)', s, re.I):
                 return True
             if s.startswith("プロモーション") or s.startswith("Promoted by"):
                 return True
@@ -4176,9 +4362,19 @@ class XBrowserController:
                 if href:
                     top_u = _to_top_search_url(href)
                     lbl = ""
+                    raw_text = ""
                     try:
-                        lines = [ln.strip() for ln in (a_el.inner_text() or "").splitlines() if not _is_explore_metadata_line(ln)]
+                        raw_text = (a_el.inner_text() or "").strip()
+                        lines = [ln.strip() for ln in raw_text.splitlines() if not _is_explore_metadata_line(ln)]
                         lbl = lines[0] if lines else ""
+                    except Exception:
+                        pass
+                    if raw_text and not lbl:
+                        continue
+                    try:
+                        parsed_q = urllib.parse.parse_qs(urllib.parse.urlparse(top_u).query).get("q", [""])[0].strip()
+                        if parsed_q and _is_explore_metadata_line(parsed_q):
+                            continue
                     except Exception:
                         pass
                     lbl_key = lbl.lower() if lbl else ""
@@ -4265,6 +4461,19 @@ class XBrowserController:
                 except Exception as se:
                     print(f"   ⚠️ {tab_label}項目取得通知: {se}")
 
+                if max_targets > 0:
+                    if len(discovered) >= max_targets:
+                        print(f"   ✅ [{tab_label}] 目標人数 ({len(discovered)}/{max_targets}件) を取得したため探索を終了します。")
+                        break
+                    elif idx_u < max_topics:
+                        print(f"   ℹ️ [{tab_label}] 「{cand_lbl[:30]}」終了時点で {len(discovered)}/{max_targets}件 のため、別ワードへ移動して目標人数まで取得を続けます...")
+                else:
+                    if len(discovered) > 0:
+                        print(f"   ✅ [{tab_label}] 「{cand_lbl[:30]}」から {len(discovered)}件 取得したため探索を終了します。")
+                        break
+                    elif idx_u < max_topics:
+                        print(f"   ℹ️ [{tab_label}] 「{cand_lbl[:30]}」は新規0件だったため、別ワードへフォールバックします...")
+
         # もしワード候補が見つからない／0件だった場合のみ探索画面上のポストからフォールバック収集
         if not discovered:
             try:
@@ -4320,6 +4529,11 @@ class XBrowserController:
             self.browser = None
             self.playwright = None
             time.sleep(0.5)
+            if self.user_data_dir and self.auto_cache_cleanup:
+                try:
+                    cleanup_profile_cache(self.user_data_dir)
+                except Exception:
+                    pass
 
     def restart_browser(self):
         """ブラウザウィンドウを一度安全に閉じて、再起動（Cookie/ログインセッション完全維持）"""
