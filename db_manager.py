@@ -632,6 +632,40 @@ class DatabaseManager:
             conn.commit()
             return deleted
 
+    def get_meta(self, key: str, default: str = "") -> str:
+        """db_metaテーブルから永続設定/直近実行履歴を取得（アプリ再起動後も保持）"""
+        if not key:
+            return default
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute("SELECT value FROM db_meta WHERE key = ?", (str(key),))
+                row = cursor.fetchone()
+                if row and row[0] is not None:
+                    return str(row[0])
+        except Exception:
+            pass
+        return default
+
+    def set_meta(self, key: str, value: str) -> bool:
+        """db_metaテーブルへ永続設定/直近実行履歴を保存（アプリ再起動後も保持）"""
+        if not key:
+            return False
+        try:
+            with self._get_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    INSERT INTO db_meta (key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (str(key), str(value or "")),
+                )
+                conn.commit()
+                return True
+        except Exception:
+            return False
+
     @staticmethod
     def list_account_dbs(base_dir: str) -> list[str]:
         """dbフォルダ内の全アカウントDBファイル一覧を取得"""

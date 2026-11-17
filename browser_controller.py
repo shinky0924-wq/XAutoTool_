@@ -3361,8 +3361,149 @@ class XBrowserController:
             else:
                 time.sleep(random.uniform(0.04, 0.11))
 
-    def _ensure_top_tab_on_search(self, page: Page):
-        """検索・トレンド画面で「最新」ではなく「話題（Top）」タブが選択されていることを保証"""
+    def _wait_for_page_render_or_reload(
+        self,
+        target_url: str,
+        ready_selector: str,
+        page_label: str = "ページ",
+        wait_sec: float = 15.0,
+        max_reloads: int = 2,
+        empty_text_markers: tuple = (),
+        tab_click_texts: list = None,
+        abort_check_fn=None,
+    ) -> bool:
+        """
+        XのReact/XHR描画ラグを考慮し、実コンテンツ(ready_selector)が実際に表示されるまで待機する。
+        表示されない場合（ラグ・白紙・読み込み止まり・エラー画面）はページを再読み込みして再待機する。
+        """
+        page = self.ensure_page()
+        for attempt in range(max_reloads + 1):
+            if attempt > 0:
+                print(f"   🔄 [{page_label}] ページ描画が確認できないため再読み込みします ({attempt}/{max_reloads}回目): {target_url}")
+                try:
+                    retry_btn = page.locator('button[data-testid="empty_state_button_text"], button:has-text("やりなおす"), button:has-text("再読み込み"), button:has-text("再試行"), button:has-text("Retry")')
+                    if retry_btn.count() > 0 and retry_btn.first.is_visible():
+                        retry_btn.first.click(timeout=4000)
+                        time.sleep(2.5)
+                    elif target_url and "x.com" in target_url:
+                        page.goto(target_url, timeout=40000, wait_until="domcontentloaded")
+                        time.sleep(2.5)
+                    else:
+                        page.reload(timeout=35000, wait_until="domcontentloaded")
+                        time.sleep(2.5)
+                except Exception as re_e:
+                    print(f"   ⚠️ [{page_label}] 再読み込み通知: {re_e}")
+
+            if tab_click_texts:
+                tab_wait_s = time.time()
+                while time.time() - tab_wait_s < 8.0:
+                    try:
+                        if page.locator('a[role="tab"], div[role="tab"]').count() > 0 or page.locator(ready_selector).count() > 0:
+                            break
+                    except Exception:
+                        pass
+                    time.sleep(0.8)
+                try:
+                    tabs = page.locator('a[role="tab"], div[role="tab"]').all()
+                    for tab in tabs:
+                        try:
+                            t_txt = (tab.inner_text() or "").strip()
+                            if any(cand.lower() == t_txt.lower() or cand in t_txt for cand in tab_click_texts):
+                                sel = (tab.get_attribute("aria-selected") or "").lower()
+                                if sel != "true":
+                                    tab.click(timeout=4000)
+                                    print(f"   👉 タブ「{t_txt}」を選択しました（描画待機中...）")
+                                    time.sleep(2.0)
+                                else:
+                                    print(f"   👉 タブ「{t_txt}」が表示されています")
+                                break
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+            start_w = time.time()
+            while time.time() - start_w < wait_sec:
+                if abort_check_fn:
+                    try:
+                        if abort_check_fn(page):
+                            return False
+                    except Exception:
+                        pass
+                try:
+                    if page.locator(ready_selector).count() > 0:
+                        time.sleep(0.8)
+                        return True
+                except Exception:
+                    pass
+                try:
+                    retry_btn = page.locator('button[data-testid="empty_state_button_text"], button:has-text("やりなおす"), button:has-text("再読み込み"), button:has-text("Retry")')
+                    if retry_btn.count() > 0 and retry_btn.first.is_visible():
+                        break
+                except Exception:
+                    pass
+                if empty_text_markers and (time.time() - start_w >= 4.0):
+                    try:
+                        col = page.locator('div[data-testid="primaryColumn"]')
+                        if col.count() > 0:
+                            col_txt = col.first.inner_text() or ""
+                            if any(mk in col_txt for mk in empty_text_markers) and page.locator('div[role="progressbar"]').count() == 0:
+                                return False
+                    except Exception:
+                        pass
+                time.sleep(0.8)
+
+        return False
+
+    def _scroll_timeline_and_wait(
+        self,
+        page: Page,
+        item_selector: str = 'div[data-testid="primaryColumn"] article[data-testid="tweet"]',
+        lag_retry: bool = False,
+    ) -> None:
+        """
+        1スクロール分の移動とXHR描画待ちを行う。
+        前回スクロールで新規要素が増えなかった場合 (lag_retry=True) は、
+        ローディングスピナー (progressbar) や描画ラグの完了を少し長めに待ってから次へ進む。
+        """
+        before_cnt = 0
+        try:
+            before_cnt = page.locator(item_selector).count()
+        except Exception:
+            before_cnt = 0
+
+        if lag_retry:
+            try:
+                wait_lag_s = time.time()
+                while time.time() - wait_lag_s < 2.5:
+                    if page.locator(item_selector).count() > before_cnt:
+                        return
+                    if page.locator('div[role="progressbar"]').count() == 0 and (time.time() - wait_lag_s) >= 1.2:
+                        break
+                    time.sleep(0.5)
+            except Exception:
+                pass
+
+        try:
+            page.mouse.wheel(0, random.randint(750, 1250))
+        except Exception:
+            pass
+        time.sleep(random.uniform(1.8, 3.0))
+
+        # スクロール直後に読み込み中スピナーが出ていたら最大2.5秒追加待機
+        try:
+            spin_s = time.time()
+            while time.time() - spin_s < 2.5:
+                if page.locator(item_selector).count() > before_cnt:
+                    break
+                if page.locator('div[role="progressbar"]').count() == 0:
+                    break
+                time.sleep(0.5)
+        except Exception:
+            pass
+
+    def _ensure_top_tab_on_search(self, page: Page, current_url: str = ""):
+        """検索・トレンド画面で「最新」ではなく「話題（Top）」タブが選択されていることを保証し、切替後の描画も待機"""
         try:
             tabs = page.locator('a[role="tab"], div[role="tab"]').all()
             for tab in tabs:
@@ -3372,8 +3513,15 @@ class XBrowserController:
                         sel = (tab.get_attribute("aria-selected") or "").lower()
                         if sel != "true":
                             tab.click(timeout=4000)
-                            print("   👉 「話題（Top）」タブへ切り替えました（最新ではなく話題のポストを取得）")
-                            time.sleep(2.2)
+                            print("   👉 「話題（Top）」タブへ切り替えました（最新ではなく話題のポストを取得・描画待機中）")
+                            self._wait_for_page_render_or_reload(
+                                current_url or page.url,
+                                'div[data-testid="primaryColumn"] article[data-testid="tweet"], article[data-testid="tweet"]',
+                                page_label="話題(Top)タブ",
+                                wait_sec=10.0,
+                                max_reloads=1,
+                                empty_text_markers=("検索結果はありません", "No results for"),
+                            )
                         return
                 except Exception:
                     continue
@@ -3408,33 +3556,20 @@ class XBrowserController:
             page.goto(url, timeout=40000, wait_until="domcontentloaded")
         except Exception as ge:
             print(f"   ⚠️ 検索ページアクセス通知: {ge}")
-        time.sleep(3)
+        time.sleep(2.5)
 
-        # 検索結果の投稿描画を待機（くるくる表示中は最大15秒じっくり待機）
-        print("   ⏳ 検索結果（ツイート）の描画完了を待機中...")
-        tweets_found = False
-        start_wait = time.time()
-        while time.time() - start_wait < 15.0:
-            try:
-                cnt = page.locator('article[data-testid="tweet"], div[data-testid="cellInnerDiv"]').count()
-                if cnt > 0:
-                    tweets_found = True
-                    break
-            except Exception:
-                pass
-            time.sleep(1.0)
-
-        # 15秒待っても描画されず、真のエラー画面が出ている場合のみページ内再読み込み
-        if not tweets_found and self.check_error_screen(page):
-            self.recover_if_stuck(url, "検索結果の読み込みエラー")
-            page = self.ensure_page()
-            try:
-                page.wait_for_selector('article[data-testid="tweet"], div[data-testid="cellInnerDiv"]', timeout=10000)
-            except Exception:
-                pass
+        print("   ⏳ 検索結果（ツイート）の表示完了を待機中...")
+        self._wait_for_page_render_or_reload(
+            url,
+            'div[data-testid="primaryColumn"] article[data-testid="tweet"], article[data-testid="tweet"]',
+            page_label=f"検索:{clean_kw}",
+            wait_sec=15.0,
+            max_reloads=2,
+            empty_text_markers=("検索結果はありません", "No results for"),
+        )
 
         if not is_latest:
-            self._ensure_top_tab_on_search(page)
+            self._ensure_top_tab_on_search(page, url)
 
         try:
             page.mouse.wheel(0, 300)
@@ -3607,11 +3742,7 @@ class XBrowserController:
                     pass
                 continue
 
-            try:
-                page.mouse.wheel(0, random.randint(700, 1200))
-            except Exception:
-                pass
-            time.sleep(random.uniform(1.8, 3.2))
+            self._scroll_timeline_and_wait(page, lag_retry=(len(seen_dom) == dom_before))
 
         return discovered[:max_targets] if max_targets > 0 else discovered
 
@@ -3637,27 +3768,29 @@ class XBrowserController:
         except Exception as ge:
             print(f"   ⚠️ リプライページアクセス通知: {ge}")
 
-        # リプライツイートの描画完了を待機（最大12秒・凍結/存在しないアカウントは即終了）
-        print("   ⏳ リプライ一覧の描画完了を待機中...")
-        tweets_found = False
-        start_wait = time.time()
-        while time.time() - start_wait < 12.0:
-            try:
-                if page.locator('article[data-testid="tweet"]').count() > 0:
-                    tweets_found = True
-                    break
-            except Exception:
-                pass
-            unavail = self._detect_unavailable_account_reason(page)
-            if unavail:
-                self.last_unavailable_reason = unavail
-                print(f"   🚫 リプライ一覧ページ利用不可のためスキップ: {unavail} ({replies_url})")
-                return []
-            time.sleep(0.8)
+        # リプライツイートの描画完了を待機（未描画時は最大2回リロード・凍結/存在しないアカウントは即終了）
+        print("   ⏳ リプライ一覧の表示完了を待機中...")
+        aborted_unavail = {"reason": ""}
 
-        if not tweets_found and self.check_error_screen(page):
-            self.recover_if_stuck(replies_url, "リプライ一覧の読み込みエラー")
-            page = self.ensure_page()
+        def _check_reply_unavail(p):
+            r = self._detect_unavailable_account_reason(p)
+            if r:
+                aborted_unavail["reason"] = r
+                return True
+            return False
+
+        self._wait_for_page_render_or_reload(
+            replies_url,
+            'div[data-testid="primaryColumn"] article[data-testid="tweet"], article[data-testid="tweet"]',
+            page_label="リプライ一覧",
+            wait_sec=14.0,
+            max_reloads=2,
+            abort_check_fn=_check_reply_unavail,
+        )
+        if aborted_unavail["reason"]:
+            self.last_unavailable_reason = aborted_unavail["reason"]
+            print(f"   🚫 リプライ一覧ページ利用不可のためスキップ: {aborted_unavail['reason']} ({replies_url})")
+            return []
 
         discovered = []
         seen_users = set()
@@ -3818,11 +3951,7 @@ class XBrowserController:
             else:
                 no_new_dom_scrolls = 0
 
-            try:
-                page.mouse.wheel(0, random.randint(600, 1100))
-            except Exception:
-                pass
-            time.sleep(random.uniform(1.8, 3.0))
+            self._scroll_timeline_and_wait(page, lag_retry=(len(seen_dom) == dom_before))
 
         # もし親ポスト記事が画面上に直列表示されなかったスレッド用フォールバック
         if out_parent_candidates is not None and not out_parent_candidates and fallback_owner_status_urls:
@@ -3922,22 +4051,28 @@ class XBrowserController:
             page.goto(follow_url, timeout=35000, wait_until="domcontentloaded")
         except Exception as ge:
             print(f"   ⚠️ フォロー一覧ページアクセス通知: {ge}")
-        # フォロー・フォロワー一覧の描画完了を待機（最大12秒）
-        print("   ⏳ フォロー・フォロワー一覧の描画完了を待機中...")
-        users_found = False
-        start_wait = time.time()
-        while time.time() - start_wait < 12.0:
-            try:
-                if page.locator('button[data-testid="UserCell"], [data-testid="UserCell"]').count() > 0:
-                    users_found = True
-                    break
-            except Exception:
-                pass
-            time.sleep(1.0)
+        # フォロー・フォロワー一覧の描画完了を待機（未描画時は最大2回リロード）
+        print("   ⏳ フォロー・フォロワー一覧の表示完了を待機中...")
+        aborted_follow_unavail = {"reason": ""}
 
-        if not users_found and self.check_error_screen(page):
-            self.recover_if_stuck(follow_url, "フォロー一覧の読み込みエラー")
-            page = self.ensure_page()
+        def _check_follow_unavail(p):
+            r = self._detect_unavailable_account_reason(p)
+            if r:
+                aborted_follow_unavail["reason"] = r
+                return True
+            return False
+
+        self._wait_for_page_render_or_reload(
+            follow_url,
+            'div[data-testid="primaryColumn"] [data-testid="UserCell"], [data-testid="UserCell"]',
+            page_label="フォロー一覧",
+            wait_sec=14.0,
+            max_reloads=2,
+            abort_check_fn=_check_follow_unavail,
+        )
+        if aborted_follow_unavail["reason"]:
+            print(f"   🚫 フォロー一覧ページ利用不可のためスキップ: {aborted_follow_unavail['reason']} ({follow_url})")
+            return []
 
         discovered = []
         seen_users = set()
@@ -4007,11 +4142,11 @@ class XBrowserController:
             else:
                 no_new_dom_scrolls = 0
 
-            try:
-                page.mouse.wheel(0, random.randint(700, 1300))
-            except Exception:
-                pass
-            time.sleep(random.uniform(1.8, 3.2))
+            self._scroll_timeline_and_wait(
+                page,
+                item_selector='div[data-testid="primaryColumn"] [data-testid="UserCell"]',
+                lag_retry=(len(seen_dom) == dom_before),
+            )
 
         return discovered[:max_targets] if max_targets > 0 else discovered
 
@@ -4158,44 +4293,15 @@ class XBrowserController:
             print(f"   ⚠️ HOMEページアクセス通知: {ge}")
         time.sleep(2.5)
 
-        start_wait = time.time()
-        while time.time() - start_wait < 12.0:
-            try:
-                if page.locator('a[role="tab"], div[role="tab"], article[data-testid="tweet"]').count() > 0:
-                    break
-            except Exception:
-                pass
-            time.sleep(1.0)
-
-        try:
-            tabs = page.locator('a[role="tab"], div[role="tab"]').all()
-            for tab in tabs:
-                try:
-                    t_txt = (tab.inner_text() or "").strip()
-                    if any(cand.lower() == t_txt.lower() or cand in t_txt for cand in target_tab_texts):
-                        tab.click(timeout=4000)
-                        print(f"   👉 タブ「{t_txt}」を選択しました")
-                        time.sleep(2.0)
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        tweets_found = False
-        wait_t = time.time()
-        while time.time() - wait_t < 10.0:
-            try:
-                if page.locator('article[data-testid="tweet"]').count() > 0:
-                    tweets_found = True
-                    break
-            except Exception:
-                pass
-            time.sleep(1.0)
-
-        if not tweets_found and self.check_error_screen(page):
-            self.recover_if_stuck("https://x.com/home", f"{tab_label}の読み込みエラー")
-            page = self.ensure_page()
+        print(f"   ⏳ {tab_label}の投稿描画完了を待機中...")
+        self._wait_for_page_render_or_reload(
+            "https://x.com/home",
+            'div[data-testid="primaryColumn"] article[data-testid="tweet"], article[data-testid="tweet"]',
+            page_label=tab_label,
+            wait_sec=14.0,
+            max_reloads=2,
+            tab_click_texts=target_tab_texts,
+        )
 
         discovered = []
         seen = set()
@@ -4224,15 +4330,19 @@ class XBrowserController:
                     break
             else:
                 no_new_dom_scrolls = 0
-            try:
-                page.mouse.wheel(0, random.randint(700, 1200))
-            except Exception:
-                pass
-            time.sleep(random.uniform(1.8, 3.2))
+            self._scroll_timeline_and_wait(page, lag_retry=(len(seen_dom) == dom_before))
 
         return discovered[:max_targets] if max_targets > 0 else discovered
 
-    def collect_targets_from_explore(self, tab_type: str = "トレンド", scroll_limit: int = 5, max_targets: int = 0, should_skip_fn=None) -> list[dict]:
+    def collect_targets_from_explore(
+        self,
+        tab_type: str = "トレンド",
+        scroll_limit: int = 5,
+        max_targets: int = 0,
+        should_skip_fn=None,
+        last_used_topic: str = "",
+        out_used_topics: list = None,
+    ) -> list[dict]:
         """
         話題・探索 (話題を検索 / ニュース / トレンド) からターゲットを収集
         - 話題を検索: https://x.com/explore (「話題を検索 / For you」タブ)
@@ -4268,37 +4378,21 @@ class XBrowserController:
             print(f"   ⚠️ {tab_label}ページアクセス通知: {ge}")
         time.sleep(2.5)
 
-        start_wait = time.time()
-        while time.time() - start_wait < 12.0:
-            try:
-                if page.locator('article[data-testid="tweet"], div[data-testid="trend"], div[data-testid="cellInnerDiv"], a[role="tab"], div[role="tab"]').count() > 0:
-                    break
-            except Exception:
-                pass
-            time.sleep(1.0)
-
-        try:
-            tabs = page.locator('a[role="tab"], div[role="tab"]').all()
-            for tab in tabs:
-                try:
-                    t_txt = (tab.inner_text() or "").strip()
-                    if any(cand.lower() == t_txt.lower() or cand in t_txt for cand in target_tab_texts):
-                        sel = (tab.get_attribute("aria-selected") or "").lower()
-                        if sel != "true":
-                            tab.click(timeout=4000)
-                            print(f"   👉 タブ「{t_txt}」を選択しました")
-                            time.sleep(2.2)
-                        else:
-                            print(f"   👉 タブ「{t_txt}」が表示されています")
-                        break
-                except Exception:
-                    continue
-        except Exception:
-            pass
-
-        if page.locator('article[data-testid="tweet"], div[data-testid="trend"], div[data-testid="cellInnerDiv"]').count() == 0 and self.check_error_screen(page):
-            self.recover_if_stuck(explore_url, f"{tab_label}の読み込みエラー")
-            page = self.ensure_page()
+        print(f"   ⏳ {tab_label}のトレンド/トピック描画完了を待機中...")
+        explore_ready_selector = (
+            'div[data-testid="primaryColumn"] div[data-testid="trend"], '
+            'div[data-testid="primaryColumn"] article[data-testid="tweet"], '
+            'div[data-testid="primaryColumn"] a[href*="/search"], '
+            'div[data-testid="primaryColumn"] a[href*="/i/trending/"]'
+        )
+        self._wait_for_page_render_or_reload(
+            explore_url,
+            explore_ready_selector,
+            page_label=tab_label,
+            wait_sec=15.0,
+            max_reloads=2,
+            tab_click_texts=target_tab_texts,
+        )
 
         discovered = []
         seen = set()
@@ -4356,10 +4450,23 @@ class XBrowserController:
         seen_cand_labels = set()
 
         try:
-            # 1. primaryColumn内のリンク (/search または /i/trending/) を収集
+            # 1. primaryColumn内の純粋なトレンド/トピックリンク (/search または /i/trending/) を収集
+            # ※ おすすめポスト (article[data-testid="tweet"]) 内のハッシュタグ (#相互フォロー 等) は絶対にワード候補に入れない
             for a_el in page.locator('div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[href*="/search"], div[data-testid="primaryColumn"] div[data-testid="cellInnerDiv"] a[href*="/i/trending/"], div[data-testid="primaryColumn"] div[data-testid="trend"] a').all():
+                try:
+                    if a_el.locator('xpath=ancestor::article[@data-testid="tweet"]').count() > 0:
+                        continue
+                except Exception:
+                    pass
                 href = a_el.get_attribute("href")
                 if href:
+                    href_low = href.lower()
+                    if ("src=hashtag_click" in href_low or "src=cashtag_click" in href_low):
+                        try:
+                            if a_el.locator('xpath=ancestor::*[@data-testid="trend"]').count() == 0:
+                                continue
+                        except Exception:
+                            continue
                     top_u = _to_top_search_url(href)
                     lbl = ""
                     raw_text = ""
@@ -4371,9 +4478,11 @@ class XBrowserController:
                         pass
                     if raw_text and not lbl:
                         continue
+                    if lbl.startswith("@"):
+                        continue
                     try:
                         parsed_q = urllib.parse.parse_qs(urllib.parse.urlparse(top_u).query).get("q", [""])[0].strip()
-                        if parsed_q and _is_explore_metadata_line(parsed_q):
+                        if parsed_q and (_is_explore_metadata_line(parsed_q) or parsed_q.startswith("@")):
                             continue
                     except Exception:
                         pass
@@ -4389,8 +4498,10 @@ class XBrowserController:
             # 2. div[data-testid="trend"] カードのテキストからワードを収集 (<a>がないReactクリックカード対応)
             for tr in page.locator('div[data-testid="primaryColumn"] div[data-testid="trend"]').all():
                 t_lines = [ln.strip() for ln in (tr.inner_text() or "").splitlines() if ln.strip()]
+                if any(tl.startswith("プロモーション") or tl.startswith("Promoted") for tl in t_lines):
+                    continue
                 for ln in t_lines:
-                    if _is_explore_metadata_line(ln):
+                    if _is_explore_metadata_line(ln) or ln.startswith("@"):
                         continue
                     top_u = f"https://x.com/search?q={urllib.parse.quote(ln)}"
                     lbl_key = ln.lower()
@@ -4425,41 +4536,62 @@ class XBrowserController:
 
         if candidates:
             random.shuffle(candidates)
+            last_norm = str(last_used_topic or "").strip().lower()
+            if last_norm and len(candidates) >= 2:
+                front_cands = [c for c in candidates if str(c[0] or "").strip().lower() != last_norm]
+                tail_cands = [c for c in candidates if str(c[0] or "").strip().lower() == last_norm]
+                if front_cands and tail_cands:
+                    candidates = front_cands + tail_cands
+                    print(f"   ⏭️ [{tab_label}] 前回実行ワード「{last_used_topic}」を後回しにしました (候補末尾へ移動)")
             max_topics = min(12, len(candidates))
             print(f"   🎲 [{tab_label}] 候補 {len(candidates)}件から検索ワードをランダム選択しました (抽選順先頭: 「{candidates[0][0][:35]}」)")
 
+            first_accessed_lbl = ""
             for idx_u, (cand_lbl, sub_url) in enumerate(candidates[:max_topics], start=1):
                 if max_targets > 0 and len(discovered) >= max_targets:
                     break
+                if not first_accessed_lbl and cand_lbl:
+                    first_accessed_lbl = str(cand_lbl).strip()
+                before_topic_cnt = len(discovered)
                 print(f"   🔎 {tab_label}ランダム項目 [{idx_u}/{max_topics}] 「{cand_lbl[:30]}」の話題のポスト(Top)を取得中: {sub_url}")
                 try:
                     page.goto(sub_url, timeout=35000, wait_until="domcontentloaded")
-                    time.sleep(2.2)
-                    wait_s = time.time()
-                    while time.time() - wait_s < 8.0:
-                        if page.locator('article[data-testid="tweet"]').count() > 0:
-                            break
-                        time.sleep(0.8)
-                    self._ensure_top_tab_on_search(page)
+                    time.sleep(2.0)
+                    self._wait_for_page_render_or_reload(
+                        sub_url,
+                        'div[data-testid="primaryColumn"] article[data-testid="tweet"], article[data-testid="tweet"]',
+                        page_label=f"{tab_label}:{cand_lbl[:20]}",
+                        wait_sec=12.0,
+                        max_reloads=1,
+                        empty_text_markers=("検索結果はありません", "No results for"),
+                    )
+                    self._ensure_top_tab_on_search(page, sub_url)
+                    eff_scroll_limit = max(1, int(scroll_limit or 15))
                     no_new_sub = 0
-                    for _ in range(min(5, max(1, scroll_limit))):
+                    for sub_scroll in range(eff_scroll_limit):
                         dom_before = len(seen_dom)
+                        prev_db_skip = skip_stats.get("db_skipped", 0)
                         self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets, should_skip_fn=should_skip_fn, seen_dom=seen_dom, skip_stats=skip_stats)
+                        scroll_db_skip = skip_stats.get("db_skipped", 0) - prev_db_skip
+                        db_note = f" (DB登録済・不可 {scroll_db_skip}件スキップ)" if scroll_db_skip > 0 else ""
+                        print(f"   {tab_label}項目「{cand_lbl[:20]}」[{sub_scroll + 1}/{eff_scroll_limit}]: 新規 {len(discovered)}/{max_targets if max_targets > 0 else '無制限'}件{db_note}")
                         if max_targets > 0 and len(discovered) >= max_targets:
                             break
                         if len(seen_dom) == dom_before:
                             no_new_sub += 1
-                            if no_new_sub >= 2:
+                            if no_new_sub >= 3:
+                                print(f"   ℹ️ 「{cand_lbl[:20]}」でこれ以上新しいポストが読み込まれないため切り上げます。")
                                 break
                         else:
                             no_new_sub = 0
-                        try:
-                            page.mouse.wheel(0, random.randint(600, 1000))
-                        except Exception:
-                            pass
-                        time.sleep(1.5)
+                        self._scroll_timeline_and_wait(page, lag_retry=(len(seen_dom) == dom_before))
                 except Exception as se:
                     print(f"   ⚠️ {tab_label}項目取得通知: {se}")
+
+                if out_used_topics is not None and cand_lbl and len(discovered) > before_topic_cnt:
+                    lbl_clean = str(cand_lbl).strip()
+                    if lbl_clean and lbl_clean not in out_used_topics:
+                        out_used_topics.append(lbl_clean)
 
                 if max_targets > 0:
                     if len(discovered) >= max_targets:
@@ -4474,25 +4606,33 @@ class XBrowserController:
                     elif idx_u < max_topics:
                         print(f"   ℹ️ [{tab_label}] 「{cand_lbl[:30]}」は新規0件だったため、別ワードへフォールバックします...")
 
-        # もしワード候補が見つからない／0件だった場合のみ探索画面上のポストからフォールバック収集
+            if out_used_topics is not None and not out_used_topics and first_accessed_lbl:
+                out_used_topics.append(first_accessed_lbl)
+
+        # もしワード候補が見つからない／0件だった場合のみ探索画面を再読み込みしてフォールバック収集
         if not discovered:
             try:
-                if page.url != explore_url:
-                    page.goto(explore_url, timeout=35000, wait_until="domcontentloaded")
-                    time.sleep(2.0)
+                page.goto(explore_url, timeout=35000, wait_until="domcontentloaded")
+                time.sleep(2.0)
+                self._wait_for_page_render_or_reload(
+                    explore_url,
+                    'div[data-testid="primaryColumn"] article[data-testid="tweet"], article[data-testid="tweet"]',
+                    page_label=f"{tab_label}(再試行)",
+                    wait_sec=10.0,
+                    max_reloads=1,
+                    tab_click_texts=target_tab_texts,
+                )
             except Exception:
                 pass
-            for scroll_idx in range(min(3, max(1, scroll_limit))):
+            fb_scrolls = max(1, min(8, int(scroll_limit or 5)))
+            for scroll_idx in range(fb_scrolls):
+                dom_before = len(seen_dom)
                 self._extract_tweets_from_current_timeline(page, seen, system_names, discovered, max_targets, should_skip_fn=should_skip_fn, seen_dom=seen_dom, skip_stats=skip_stats)
                 if max_targets > 0 and len(discovered) >= max_targets:
                     break
                 if page.locator('article[data-testid="tweet"]').count() == 0 and scroll_idx == 0:
                     break
-                try:
-                    page.mouse.wheel(0, random.randint(600, 1000))
-                except Exception:
-                    pass
-                time.sleep(random.uniform(1.5, 2.5))
+                self._scroll_timeline_and_wait(page, lag_retry=(len(seen_dom) == dom_before))
 
         print(f"   📰 {tab_label}収集完了: 完全新規 {len(discovered)} 件抽出 (DB登録済・不可 {skip_stats['db_skipped']}件スキップ)")
         return discovered[:max_targets] if max_targets > 0 else discovered
@@ -4554,9 +4694,9 @@ class XBrowserController:
             if p is None or p.is_closed():
                 return False
 
-            # ツイートやプロフィール等のメインコンテンツが既に描画されている場合はエラー画面ではない
+            # 実コンテンツ（ツイート・トレンド・ユーザー一覧・プロフィール名）が既に描画されている場合はエラー画面ではない
             try:
-                if p.locator('article[data-testid="tweet"], div[data-testid="cellInnerDiv"], div[data-testid="UserName"]').count() > 0:
+                if p.locator('article[data-testid="tweet"], div[data-testid="trend"], [data-testid="UserCell"], div[data-testid="UserName"]').count() > 0:
                     return False
             except Exception:
                 pass

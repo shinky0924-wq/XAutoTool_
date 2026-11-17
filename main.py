@@ -25,7 +25,7 @@ if sys.platform == "win32":
     except Exception:
         pass
 
-from config_manager import ConfigManager, parse_active_hours_spec, is_within_active_hours
+from config_manager import ConfigManager, parse_active_hours_spec, is_within_active_hours, is_placeholder_target
 from db_manager import (
     DatabaseManager,
     AccountHealthManager,
@@ -923,10 +923,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             "表示名": d_name
                         })
 
-            def collect_targets_for_mode(m_type: str, m_label: str, act_key: str = "dm") -> list[dict]:
+            def collect_targets_for_mode(m_type: str, m_label: str, act_key: str = "dm", force_refresh: bool = False) -> list[dict]:
                 db_action_type = db_action_map.get(act_key, act_key.upper())
                 cache_key = (m_type, db_action_type)
-                if cache_key in mode_targets_cache:
+                if not force_refresh and cache_key in mode_targets_cache:
                     cached = mode_targets_cache[cache_key]
                     log(f"   ♻️ [{m_label}/{db_action_type}] 収集済みキャッシュから {len(cached)} 件の完全新規ターゲットを再利用します")
                     return cached
@@ -936,7 +936,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 def should_skip_target(cand_user: str, cand_tweet_url: str = "") -> bool:
                     clean_u = normalize_screen_name(cand_user)
-                    if not clean_u:
+                    if not clean_u or is_placeholder_target(clean_u):
                         return True
                     if db_mgr.is_user_unavailable(clean_u):
                         return True
@@ -955,20 +955,46 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         return 0
                     return max(0, target_read_limit - len(collected))
 
+                def _defer_last_used(items: list, last_val: str, key_fn, mode_lbl: str, item_type_lbl: str) -> list:
+                    norm_last = str(last_val or "").strip().rstrip("/").lower()
+                    if not norm_last or len(items) < 2:
+                        return items
+                    front = [it for it in items if str(key_fn(it) or "").strip().rstrip("/").lower() != norm_last]
+                    tail = [it for it in items if str(key_fn(it) or "").strip().rstrip("/").lower() == norm_last]
+                    if front and tail:
+                        log(f"   ⏭️ [{mode_lbl}] 前回実行{item_type_lbl}「{last_val}」を後回しにしました (候補末尾へ移動)")
+                        return front + tail
+                    return items
+
                 if m_type in ["SEARCH_LATEST", "SEARCH_TOP"]:
                     stype_override = "話題" if m_type == "SEARCH_TOP" else "最新"
                     if acc_search_keywords:
                         kw_candidates = list(acc_search_keywords)
                         random.shuffle(kw_candidates)
+                        last_kw = db_mgr.get_meta("last_used_search_keyword", "")
+                        kw_candidates = _defer_last_used(
+                            kw_candidates,
+                            last_kw,
+                            lambda x: x.get("keyword", ""),
+                            m_label,
+                            "キーワード",
+                        )
                         log(f"🔍 [{m_label}] 完全新規ターゲット収集開始 (登録キーワード: {len(kw_candidates)}件 / 目標人数: {target_read_limit if target_read_limit > 0 else '無制限'}件)...")
+                        last_yielded_kw = ""
+                        first_accessed_kw = ""
                         for kw_idx, kw_item in enumerate(kw_candidates, start=1):
                             rem = remaining_limit()
                             if target_read_limit > 0 and rem <= 0:
                                 break
                             kw = kw_item.get("keyword")
+                            if not first_accessed_kw and kw:
+                                first_accessed_kw = str(kw).strip()
+                            before_kw_cnt = len(collected)
                             stype = "話題" if m_type == "SEARCH_TOP" else kw_item.get("search_type", stype_override)
                             found = browser_ctrl.collect_targets_from_search(kw, search_type=stype, scroll_limit=scroll_limit, max_targets=rem, should_skip_fn=should_skip_target)
                             append_collected_items(found, f"{m_label}:{kw}", collected)
+                            if len(collected) > before_kw_cnt and kw:
+                                last_yielded_kw = str(kw).strip()
                             if target_read_limit > 0:
                                 if len(collected) >= target_read_limit:
                                     log(f"   ✅ [{m_label}] 目標人数 ({len(collected)}/{target_read_limit}件) に達したため探索を終了します。")
@@ -980,6 +1006,9 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                     break
                                 elif kw_idx < len(kw_candidates):
                                     log(f"   ℹ️ [{m_label}] キーワード「{kw}」は新規0件だったため、別ワードへフォールバックします...")
+                        save_kw = last_yielded_kw or first_accessed_kw
+                        if save_kw:
+                            db_mgr.set_meta("last_used_search_keyword", save_kw)
                     else:
                         log(f"   ℹ️ [{m_label}] 「検索キーワード」シートにキーワード未登録のため、「相互フォロー」で探索します。")
                         found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type=stype_override, scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
@@ -987,8 +1016,19 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 elif m_type == "EXPLORE_TOPICS":
                     log(f"🔥 [話題の検索] X探索「話題を検索」タブからランダムにワードを選び、DB未登録の話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_explore(tab_type="話題を検索", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
+                    last_explore_kw = db_mgr.get_meta("last_used_explore_話題を検索", "")
+                    used_explore_kws = []
+                    found = browser_ctrl.collect_targets_from_explore(
+                        tab_type="話題を検索",
+                        scroll_limit=scroll_limit,
+                        max_targets=target_read_limit,
+                        should_skip_fn=should_skip_target,
+                        last_used_topic=last_explore_kw,
+                        out_used_topics=used_explore_kws,
+                    )
                     append_collected_items(found, "話題の検索", collected)
+                    if used_explore_kws:
+                        db_mgr.set_meta("last_used_explore_話題を検索", used_explore_kws[-1])
 
                 elif m_type == "HOME_FOR_YOU":
                     log(f"🏠 [HOMEおすすめ] タイムラインからDB未登録ターゲット収集開始 (上限: {target_read_limit}件)...")
@@ -1004,6 +1044,14 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     if acc_reply_urls:
                         shuffled_reply_urls = list(acc_reply_urls)
                         random.shuffle(shuffled_reply_urls)
+                        last_reply_url = db_mgr.get_meta("last_used_reply_url", "")
+                        shuffled_reply_urls = _defer_last_used(
+                            shuffled_reply_urls,
+                            last_reply_url,
+                            lambda u: u,
+                            "URLリスト（リプライ）",
+                            "URL",
+                        )
                         single_url_mode = (reply_url_loop_limit == 0)
                         urls_to_visit = list(shuffled_reply_urls)
                         log(f"💬 [URLリスト（リプライ）] DB未登録ターゲット収集開始 (登録URL: {len(acc_reply_urls)}件 / {'目標人数到達まで巡回' if single_url_mode else f'巡回上限: {reply_url_loop_limit}件'} / 目標人数: {target_read_limit if target_read_limit > 0 else '無制限'}件 / 親ホップ上限: {reply_parent_hop_limit}回)...")
@@ -1011,6 +1059,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         visited_parent_urls = set()
                         pending_parent_urls = []
                         pending_hop_accounts = []
+                        last_yielded_reply_url = ""
+                        first_accessed_reply_url = ""
 
                         for r_idx, rurl in enumerate(urls_to_visit, start=1):
                             if not single_url_mode and r_idx > reply_url_loop_limit and len(collected) > 0:
@@ -1018,6 +1068,9 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             rem = remaining_limit()
                             if target_read_limit > 0 and rem <= 0:
                                 break
+                            if not first_accessed_reply_url and rurl:
+                                first_accessed_reply_url = str(rurl).strip()
+                            before_rurl_cnt = len(collected)
                             owner_cand = normalize_screen_name(rurl).lower()
                             if "/status/" not in rurl and owner_cand:
                                 visited_reply_accounts.add(owner_cand)
@@ -1032,6 +1085,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 out_parent_candidates=discovered_parents,
                             )
                             append_collected_items(found, f"URLリスト（リプライ）:{rurl}", collected)
+                            if len(collected) > before_rurl_cnt and rurl:
+                                last_yielded_reply_url = str(rurl).strip()
                             for pu in discovered_parents:
                                 p_norm = (normalize_tweet_url(pu) or pu).lower()
                                 if p_norm and p_norm not in visited_parent_urls and pu not in pending_parent_urls:
@@ -1049,6 +1104,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                     break
                                 if len(collected) == 0 and r_idx < len(urls_to_visit):
                                     log(f"   ℹ️ [URLリスト（リプライ）] 新規0件だったため、別URLへフォールバックします...")
+
+                        save_reply_url = last_yielded_reply_url or first_accessed_reply_url
+                        if save_reply_url:
+                            db_mgr.set_meta("last_used_reply_url", save_reply_url)
 
                         need_more = (target_read_limit > 0 and len(collected) < target_read_limit) or (target_read_limit <= 0 and len(collected) == 0)
                         if need_more and reply_parent_hop_limit > 0 and pending_parent_urls:
@@ -1117,13 +1176,28 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     if acc_follow_urls:
                         follow_candidates = list(acc_follow_urls)
                         random.shuffle(follow_candidates)
+                        last_follow_url = db_mgr.get_meta("last_used_follow_url", "")
+                        follow_candidates = _defer_last_used(
+                            follow_candidates,
+                            last_follow_url,
+                            lambda u: u,
+                            "URLリスト（フォロー）",
+                            "URL",
+                        )
                         log(f"👥 [URLリスト（フォロー）] DB未登録ターゲット収集開始 (登録URL: {len(follow_candidates)}件 / 目標人数: {target_read_limit if target_read_limit > 0 else '無制限'}件)...")
+                        last_yielded_follow_url = ""
+                        first_accessed_follow_url = ""
                         for f_idx, furl in enumerate(follow_candidates, start=1):
                             rem = remaining_limit()
                             if target_read_limit > 0 and rem <= 0:
                                 break
+                            if not first_accessed_follow_url and furl:
+                                first_accessed_follow_url = str(furl).strip()
+                            before_furl_cnt = len(collected)
                             found = browser_ctrl.collect_targets_from_follow(furl, scroll_limit=scroll_limit, max_targets=rem, should_skip_fn=should_skip_target)
                             append_collected_items(found, f"URLリスト（フォロー）:{furl}", collected)
+                            if len(collected) > before_furl_cnt and furl:
+                                last_yielded_follow_url = str(furl).strip()
                             if target_read_limit > 0:
                                 if len(collected) >= target_read_limit:
                                     log(f"   ✅ [URLリスト（フォロー）] 目標人数 ({len(collected)}/{target_read_limit}件) に達したため探索を終了します。")
@@ -1135,18 +1209,43 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                     break
                                 elif f_idx < len(follow_candidates):
                                     log(f"   ℹ️ [URLリスト（フォロー）] {furl} は新規0件だったため、別URLへフォールバックします...")
+                        save_follow_url = last_yielded_follow_url or first_accessed_follow_url
+                        if save_follow_url:
+                            db_mgr.set_meta("last_used_follow_url", save_follow_url)
                     else:
                         log(f"   ℹ️ [URLリスト（フォロー）] 「URLリスト_フォロー」シートに対象URLが未登録のためスキップします。")
 
                 elif m_type == "NEWS":
                     log(f"📰 [ニュース] 探索タブからランダムにワードを選び、DB未登録の話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_explore(tab_type="ニュース", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
+                    last_news_kw = db_mgr.get_meta("last_used_explore_ニュース", "")
+                    used_news_kws = []
+                    found = browser_ctrl.collect_targets_from_explore(
+                        tab_type="ニュース",
+                        scroll_limit=scroll_limit,
+                        max_targets=target_read_limit,
+                        should_skip_fn=should_skip_target,
+                        last_used_topic=last_news_kw,
+                        out_used_topics=used_news_kws,
+                    )
                     append_collected_items(found, "ニュース", collected)
+                    if used_news_kws:
+                        db_mgr.set_meta("last_used_explore_ニュース", used_news_kws[-1])
 
                 elif m_type == "TRENDS":
                     log(f"📈 [トレンド] 探索タブからランダムにワードを選び、DB未登録の話題のポスト(Top)を収集開始 (上限: {target_read_limit}件)...")
-                    found = browser_ctrl.collect_targets_from_explore(tab_type="トレンド", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=should_skip_target)
+                    last_trend_kw = db_mgr.get_meta("last_used_explore_トレンド", "")
+                    used_trend_kws = []
+                    found = browser_ctrl.collect_targets_from_explore(
+                        tab_type="トレンド",
+                        scroll_limit=scroll_limit,
+                        max_targets=target_read_limit,
+                        should_skip_fn=should_skip_target,
+                        last_used_topic=last_trend_kw,
+                        out_used_topics=used_trend_kws,
+                    )
                     append_collected_items(found, "トレンド", collected)
+                    if used_trend_kws:
+                        db_mgr.set_meta("last_used_explore_トレンド", used_trend_kws[-1])
 
                 elif m_type == "LIST":
                     log(f"📑 [リスト送信] Excel「{os.path.basename(acc_target_path)}」からDB未登録ターゲットを読込中...")
@@ -1167,6 +1266,24 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 mode_targets_cache[cache_key] = collected
                 return collected
+
+            def pick_next_template(kind: str, candidates: list[str], fallback_default: str) -> str:
+                unique_cands = []
+                for c in (candidates or []):
+                    cs = str(c or "").strip()
+                    if cs and cs not in unique_cands:
+                        unique_cands.append(cs)
+                if not unique_cands:
+                    return fallback_default
+                meta_key = f"last_used_template_{kind}"
+                last_used = (db_mgr.get_meta(meta_key, "") or "").strip()
+                if last_used and last_used in unique_cands:
+                    next_idx = (unique_cands.index(last_used) + 1) % len(unique_cands)
+                    chosen = unique_cands[next_idx]
+                else:
+                    chosen = unique_cands[0]
+                db_mgr.set_meta(meta_key, chosen)
+                return chosen
 
             def generate_ai_or_template_text(kind: str, target_screen_name: str, resolved_disp: str, tweet_url: str, use_ai: bool, cached_tweet_text: str = "", cached_parent_text: str = "", is_reply_target: bool = False) -> str:
                 if use_ai and ai_engine and str(ai_engine).strip().lower() not in ["none", "off", "無効"]:
@@ -1249,9 +1366,17 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         log(f"   ⚠️ AI生成通知 ({ai_e}) → 定型テンプレートを使用します")
 
                 if kind == "reply":
-                    raw_msg = random.choice(acc_reply_templates) if acc_reply_templates else (random.choice(reply_templates) if reply_templates else "大変参考になります！有益な情報をありがとうございます✨")
+                    raw_msg = pick_next_template(
+                        "reply",
+                        acc_reply_templates or reply_templates,
+                        "大変参考になります！有益な情報をありがとうございます✨",
+                    )
                 else:
-                    raw_msg = random.choice(acc_quote_templates) if acc_quote_templates else (random.choice(quote_templates) if quote_templates else "大変有益なポストです！📌")
+                    raw_msg = pick_next_template(
+                        "quote",
+                        acc_quote_templates or quote_templates,
+                        "大変有益なポストです！📌",
+                    )
                 return format_template_message(raw_msg, resolved_disp, target_screen_name, preserve_unresolved=True)
 
             # 単一アクションをターゲット1件に実行
@@ -1427,12 +1552,12 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                     elif act_key == "dm":
                         dm_msg = target_item.get("個別メッセージ") or ""
-                        if not dm_msg and acc_dm_templates:
-                            dm_msg = random.choice(acc_dm_templates)
-                        elif not dm_msg and dm_templates:
-                            dm_msg = random.choice(dm_templates)
                         if not dm_msg:
-                            dm_msg = "{name}さん、はじめまして！ご連絡ありがとうございます。今後ともよろしくお願いいたします。"
+                            dm_msg = pick_next_template(
+                                "dm",
+                                acc_dm_templates or dm_templates,
+                                "{name}さん、はじめまして！ご連絡ありがとうございます。今後ともよろしくお願いいたします。",
+                            )
 
                         resolved_disp = get_target_name()
                         dm_msg = format_template_message(dm_msg, resolved_disp, target_screen_name, preserve_unresolved=True)
@@ -1561,6 +1686,14 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 for mode_idx, (m_type, m_label) in enumerate(act_modes, start=1):
                     check_pause_state(f"{act_title} モード [{mode_idx}/{len(act_modes)}: {m_label}] 開始前")
                     mode_targets = collect_targets_for_mode(m_type, m_label, act_key=act_key)
+                    if not mode_targets and m_type != "LIST":
+                        log(f"🔄 [{act_title} / {m_label}] ターゲットを取得できなかったため、ページを再読み込みして再探索します...")
+                        wait_with_abort(3.0)
+                        try:
+                            browser_ctrl.recover_if_stuck("", f"{m_label}ターゲット未取得のため再読み込み")
+                        except Exception:
+                            pass
+                        mode_targets = collect_targets_for_mode(m_type, m_label, act_key=act_key, force_refresh=True)
                     if not mode_targets:
                         log(f"ℹ️ [{act_title} / {m_label}] 完全新規の有効ターゲットが0件でした。次のモードへ進みます。")
                         continue
@@ -1608,7 +1741,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     log("⚠️ 【全モード完了確認】設定されたモードによる実行件数が0件でした。Excel内の未送信・DB未登録ターゲットまたは自動救済を確認します...")
                     act_key_fb = active_action_jobs[0][0]
                     fb_db_act = db_action_map.get(act_key_fb, "DM")
-                    fb_skip_fn = lambda u, tu="": db_mgr.is_user_unavailable(u) or db_mgr.is_registered_in_db(u, action_type=fb_db_act, target_url=tu)
+                    fb_skip_fn = lambda u, tu="": (not u) or is_placeholder_target(u) or db_mgr.is_user_unavailable(u) or db_mgr.is_registered_in_db(u, action_type=fb_db_act, target_url=tu)
                     raw_existing = config_mgr.load_targets(limit=0, target_path_override=acc_target_path)
                     existing_targets = [
                         it for it in raw_existing
@@ -1616,7 +1749,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                     ]
                     if target_read_limit > 0:
                         existing_targets = existing_targets[:target_read_limit]
-                    if not existing_targets:
+                    allow_mutual_rescue = bool(configured_mode_types & {"SEARCH_LATEST", "SEARCH_TOP", "LIST", "MUTUAL"})
+                    if not existing_targets and allow_mutual_rescue:
                         log("💡 【新規アカウント救済モード】標準キーワード「相互フォロー (最新)」からDB未登録のアクティブユーザーを探索します...")
                         auto_found = browser_ctrl.collect_targets_from_search("相互フォロー", search_type="最新", scroll_limit=scroll_limit, max_targets=target_read_limit, should_skip_fn=fb_skip_fn)
                         append_collected_items(auto_found, "自動救済:相互フォロー(最新)", existing_targets)
@@ -1642,7 +1776,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 if fb_success_count < batch_target_count and t_idx < len(existing_targets):
                                     wait_between_targets(random.uniform(act_min_int, act_max_int), act_title, fb_success_count, batch_target_count, act_min_int, act_max_int)
                     else:
-                        log("ℹ️ 有効なターゲットが見つかりませんでした。安全に今回のアカウント処理を終了します。")
+                        log("ℹ️ 有効なターゲットが見つかりませんでした（サンプル/ダミーターゲットは除外）。再読み込み後も取得できなかったため安全に終了します。")
 
             if not session_failed:
                 health_mgr.record_success(clean_account_id)

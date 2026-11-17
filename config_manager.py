@@ -61,6 +61,14 @@ def normalize_screen_name(val: str) -> str:
     return s.lstrip("@").strip()
 
 
+def is_placeholder_target(val: str) -> bool:
+    """テンプレート初期サンプル (@sample_user_01 等) のダミーアカウントを判定して実行除外する"""
+    clean = normalize_screen_name(val).lower()
+    if not clean:
+        return True
+    return bool(re.match(r'^(?:sample_user|sample_account|dummy_user|example_user|test_user)(?:_\d+|\d+)?$', clean))
+
+
 _FULLWIDTH_TRANS = str.maketrans("０１２３４５６７８９：；〜～−‐—－、／", "0123456789:;------,/")
 
 
@@ -928,7 +936,7 @@ class ConfigManager:
             clean_name = normalize_screen_name(raw_name)
             if not clean_name and url_idx is not None and len(row) > url_idx:
                 clean_name = normalize_screen_name(str(row[url_idx] or ""))
-            if not clean_name:
+            if not clean_name or is_placeholder_target(clean_name):
                 continue
 
             status = str(row[status_idx] or "").strip() if status_idx is not None and len(row) > status_idx else "未送信"
