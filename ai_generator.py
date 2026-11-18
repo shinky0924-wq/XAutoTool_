@@ -24,6 +24,7 @@ AI文章生成エンジン統合モジュール (ai_generator.py)
 """
 
 import os
+import re
 import sys
 import json
 import time
@@ -190,51 +191,119 @@ class AIGenerator:
         action_type: str = "reply",
         target_name: str = "",
         custom_instruction: str = "",
-        parent_post_text: str = ""
+        parent_post_text: str = "",
+        prompt_config: Optional[dict] = None
     ) -> str:
         action_label = "リプライ（返信）" if "reply" in action_type.lower() else "引用リツイート（感想・紹介）"
-
-        instruction = custom_instruction.strip() if custom_instruction else (
-            "投稿者のポスト内容に深く共感し、親しみやすく丁寧な日本語の1〜2文で自然な会話口調を作成してください。"
-            "ハッシュタグ（#）、絵文字の過剰使用、不自然な敬語、宣伝的な表現は避けてください。"
-        )
-
+        safe_name = target_name if target_name else "ユーザー"
+        safe_url = post_url if post_url else "なし"
         has_parent = bool(parent_post_text and parent_post_text.strip())
+        safe_parent = parent_post_text.strip() if has_parent else ""
+
         if has_parent:
-            context_block = f"""【対象の投稿情報（やり取り・返信への反応）】
-・投稿者: @{target_name if target_name else 'ユーザー'}
-・投稿URL: {post_url if post_url else 'なし'}
+            safe_post_body = post_text.strip() if post_text and post_text.strip() else "（返信本文取得不可・元ポストや対象者に合わせて自然な共感メッセージを作成）"
+            default_context_block = f"""【対象の投稿情報（やり取り・返信への反応）】
+・投稿者: @{safe_name}
+・投稿URL: {safe_url}
 
 【元ポスト（会話の前提）】
 \"\"\"
-{parent_post_text.strip()}
+{safe_parent}
 \"\"\"
 
 【対象者の返信内容】
 \"\"\"
-{post_text.strip() if post_text and post_text.strip() else '（返信本文取得不可・元ポストや対象者に合わせて自然な共感メッセージを作成）'}
-\"\"\"
-"""
-            context_note = f"\n※【元ポスト（会話の前提）】と【対象者の返信内容】の両方の文脈を踏まえ、対象者（@{target_name if target_name else 'ユーザー'}）の返信内容に沿った自然な{action_label}を作成してください。"
+{safe_post_body}
+\"\"\""""
+            context_note = f"\n※【元ポスト（会話の前提）】と【対象者の返信内容】の両方の文脈を踏まえ、対象者（@{safe_name}）の返信内容に沿った自然な{action_label}を作成してください。"
         else:
-            context_block = f"""【対象の投稿情報】
-・投稿者: @{target_name if target_name else 'ユーザー'}
-・投稿URL: {post_url if post_url else 'なし'}
+            safe_post_body = post_text.strip() if post_text and post_text.strip() else "（投稿本文取得不可・投稿者名や文脈に合わせて自然な応援/共感メッセージを作成）"
+            default_context_block = f"""【対象の投稿情報】
+・投稿者: @{safe_name}
+・投稿URL: {safe_url}
 ・投稿本文:
 \"\"\"
-{post_text.strip() if post_text and post_text.strip() else '（投稿本文取得不可・投稿者名や文脈に合わせて自然な応援/共感メッセージを作成）'}
-\"\"\"
-"""
+{safe_post_body}
+\"\"\""""
             context_note = ""
 
-        prompt = f"""あなたはX(Twitter)の親しみやすく礼儀正しいユーザーです。
-以下の投稿に対して、魅力的な{action_label}のメッセージを作成してください。
+        def _apply_tags(tmpl: str) -> str:
+            out = (tmpl or "").replace("{アクション}", action_label)
+            out = out.replace("{投稿情報}", default_context_block)
+            out = out.replace("{投稿者}", safe_name)
+            out = out.replace("{投稿URL}", safe_url)
+            out = out.replace("{投稿本文}", safe_post_body)
+            out = out.replace("{元ポスト}", safe_parent if safe_parent else "なし")
+            return out
 
-{context_block}
-【指示】
+        if isinstance(prompt_config, dict) and any(k in prompt_config for k in ("character", "post_format", "instruction", "output_rule")):
+            parts = []
+            action_intro = f"以下の投稿に対して、魅力的な{action_label}のメッセージを作成してください。"
+            char_raw = str(prompt_config.get("character", "") or "").strip()
+            if char_raw:
+                rendered_char = _apply_tags(char_raw)
+                if "{アクション}" not in char_raw and "作成してください" not in char_raw:
+                    parts.append(f"{rendered_char}\n{action_intro}")
+                else:
+                    parts.append(rendered_char)
+            else:
+                parts.append(action_intro)
+
+            post_raw = str(prompt_config.get("post_format", "") or "").strip()
+            if post_raw:
+                rendered_post = _apply_tags(post_raw)
+                if has_parent and "{元ポスト}" not in post_raw and "{投稿情報}" not in post_raw:
+                    rendered_post += f'\n\n【元ポスト（会話の前提）】\n"""\n{safe_parent}\n"""'
+                parts.append(rendered_post)
+            else:
+                parts.append(default_context_block)
+
+            instr_raw = str(prompt_config.get("instruction", "") or "").strip()
+            if not instr_raw and custom_instruction:
+                instr_raw = str(custom_instruction).strip()
+            if instr_raw:
+                rendered_instr = _apply_tags(instr_raw) + context_note
+                if rendered_instr.lstrip().startswith("【指示】"):
+                    parts.append(rendered_instr)
+                else:
+                    parts.append(f"【指示】\n{rendered_instr}")
+
+            rule_raw = str(prompt_config.get("output_rule", "") or "").strip()
+            if rule_raw:
+                parts.append(_apply_tags(rule_raw))
+
+            if parts:
+                return "\n\n".join(parts)
+
+        has_custom = bool(custom_instruction and custom_instruction.strip())
+        instruction = custom_instruction.strip() if has_custom else (
+            "投稿者のポスト内容に深く共感し、親しみやすく丁寧な日本語の1〜2文で自然な会話口調を作成してください。\n"
+            "ハッシュタグ（#）、絵文字の過剰使用、不自然な敬語、宣伝的な表現は避けてください。"
+        )
+
+        if has_custom:
+            intro_line = f"以下の【設定・指示】と【対象の投稿情報】を踏まえ、最も自然で魅力的なX(Twitter)の{action_label}を1つだけ作成してください。"
+            instr_heading = "【設定・指示】"
+            length_rule = "・140文字以内（上記【設定・指示】に文字数条件がある場合はその範囲を優先しつつ最大140文字以内）"
+        else:
+            intro_line = (
+                "あなたはX(Twitter)の親しみやすく礼儀正しいユーザーです。\n"
+                f"以下の投稿に対して、魅力的な{action_label}のメッセージを1つだけ作成してください。"
+            )
+            instr_heading = "【指示】"
+            length_rule = "・1〜2行（140文字以内）で自然な日本語にすること"
+
+        prompt = f"""{intro_line}
+
+{default_context_block}
+
+{instr_heading}
 {instruction}{context_note}
 
-※出力は送信するメッセージ本文のみを1〜2行（140文字以内）で返してください。挨拶や前置き（例: 「了解しました」「返信案:」）や引用符などの余計な注釈は一切含めないでください。"""
+【出力ルール（厳守）】
+・実際にXへ投稿する本文のみを1つ返してください。
+・「【返信案】」「返信案:」「了解しました」等の見出し・挨拶・前置き・引用符（「」""）・文字数メモ・補足説明は一切出力しないでください。
+{length_rule}"""
         return prompt
 
     @classmethod
@@ -274,7 +343,8 @@ class AIGenerator:
         custom_prompt: str = "",
         page = None,
         use_dedicated_window: bool = False,
-        parent_post_text: str = ""
+        parent_post_text: str = "",
+        prompt_config: Optional[dict] = None
     ) -> Tuple[bool, str]:
         """
         指定されたAIエンジンを使用して返信・引用文章を生成
@@ -284,7 +354,15 @@ class AIGenerator:
         if eff_eng in ["none", "off", "無効", ""]:
             return False, "AIエンジンが未指定または無効です"
 
-        prompt = cls.build_prompt(post_url, post_text, action_type, target_name, custom_prompt, parent_post_text=parent_post_text)
+        prompt = cls.build_prompt(
+            post_url,
+            post_text,
+            action_type,
+            target_name,
+            custom_prompt,
+            parent_post_text=parent_post_text,
+            prompt_config=prompt_config,
+        )
 
         try:
             # 1. Google Gemini API (推奨)
@@ -617,22 +695,84 @@ class AIGenerator:
 
     @staticmethod
     def _sanitize_output(text: str) -> str:
-        """生成結果から引用符や余分な見出しをクリーニング"""
-        clean = (text or "").strip()
-        if (clean.startswith('"') and clean.endswith('"')) or (clean.startswith('「') and clean.endswith('」')):
-            clean = clean[1:-1].strip()
-        prefixes = [
-            "返信案:", "リプライ案:", "引用案:", "回答:", "返信:", "AI:",
-            "了解しました。", "了解しました！", "承知しました。", "承知しました！",
-            "Gemini の回答", "Gemini:", "ChatGPT:", "Claude:"
-        ]
-        for p in prefixes:
-            if clean.startswith(p):
-                clean = clean[len(p):].strip()
-        if (clean.startswith('"') and clean.endswith('"')) or (clean.startswith('「') and clean.endswith('」')):
-            clean = clean[1:-1].strip()
+        """生成結果から見出し・挨拶・文字数メモ・引用符などをクリーニングし、自然な本文のみを抽出"""
+        clean = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        if not clean:
+            return ""
+
+        # 複数案が出力された場合は最初の案のみ採用
+        split_multi = re.split(
+            r"\n\s*(?:【\s*(?:案|候補|パターン)?\s*[2２②][^】]*】|(?:案|候補|パターン)\s*[2２②]\s*[:：]|---+\s*\n)",
+            clean,
+            maxsplit=1,
+        )
+        if len(split_multi) > 1 and split_multi[0].strip():
+            clean = split_multi[0].strip()
+
+        # 先頭の前置き行・ラベル行（【返信案】、了解しました。、**返信案** 等）を段階的に除去
+        header_line_re = re.compile(
+            r"^(?:【\s*(?:返信案|リプライ案|引用案|作成案|回答|出力|メッセージ|案\s*[1１①]?)\s*】"
+            r"|\[\s*(?:返信案|リプライ案|引用案|回答|出力)\s*\]"
+            r"|\*\*\s*(?:返信案|リプライ案|引用案|回答|出力)\s*\*\*"
+            r"|(?:了解しました|承知しました|かしこまりました|作成しました|以下(?:が|に|の通り)[^\n。]{0,30})[。！!：:\s]*)$"
+        )
+        inline_prefix_re = re.compile(
+            r"^(?:(?:【\s*(?:返信案|リプライ案|引用案|回答|出力)\s*】"
+            r"|(?:返信案|リプライ案|引用案|作成案|回答|返信|出力|メッセージ|案\s*[1１①]?|候補\s*[1１①]?|AI|Gemini(?:\s*の回答)?|ChatGPT|Claude|Grok))\s*[:：]?\s*)+"
+        )
+
+        lines = [ln.rstrip() for ln in clean.splitlines()]
+        while lines:
+            top = lines[0].strip()
+            if not top:
+                lines.pop(0)
+                continue
+            if header_line_re.match(top):
+                lines.pop(0)
+                continue
+            stripped_top = inline_prefix_re.sub("", top).strip()
+            if stripped_top != top:
+                if stripped_top:
+                    lines[0] = stripped_top
+                else:
+                    lines.pop(0)
+                    continue
+            break
+
+        # 末尾の文字数メモやUIコピー補助文字を除去
+        footer_line_re = re.compile(
+            r"^(?:[（(]\s*(?:約\s*)?\d+\s*文字\s*[）)]|※\s*文字数[:：]?.*|コピー(?:する)?|Copy(?:\s*code)?)$",
+            re.IGNORECASE,
+        )
+        while lines:
+            bot = lines[-1].strip()
+            if not bot or footer_line_re.match(bot):
+                lines.pop()
+                continue
+            bot_clean = re.sub(r"\s*[（(]\s*(?:約\s*)?\d+\s*文字\s*[）)]\s*$", "", bot).strip()
+            lines[-1] = bot_clean
+            break
+
+        clean = "\n".join(lines).strip()
+        clean = re.sub(r"\n{3,}", "\n\n", clean)
+
+        # 全体を囲む引用符を除去（最大2重まで）
+        for _ in range(2):
+            for lq, rq in [('"', '"'), ("'", "'"), ("「", "」"), ("『", "』"), ("“", "”")]:
+                if clean.startswith(lq) and clean.endswith(rq) and len(clean) >= 2:
+                    clean = clean[1:-1].strip()
+
         if len(clean) > 140:
-            clean = clean[:139].rstrip() + "…"
+            head = clean[:140]
+            best_end = -1
+            for sep in ("。", "！", "!", "？", "?"):
+                pos = head.rfind(sep)
+                if pos > best_end:
+                    best_end = pos
+            if best_end >= 55:
+                clean = head[:best_end + 1].rstrip()
+            else:
+                clean = clean[:139].rstrip() + "…"
         return clean
 
 
@@ -832,7 +972,7 @@ class AIDedicatedWindowManager:
                     nbtn = ai_page.locator(nsel)
                     if nbtn.count() > 0 and nbtn.first.is_visible():
                         nbtn.first.click(timeout=2500)
-                        time.sleep(1.2)
+                        time.sleep(1.5)
                         break
                 except Exception:
                     continue
@@ -858,6 +998,83 @@ class AIDedicatedWindowManager:
         return None
 
     @classmethod
+    def _normalize_multiline_prompt(cls, prompt: str) -> str:
+        """プロンプト内の改行構造を保ったまま余分な連続空行のみ整理"""
+        text = (prompt or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+        text = re.sub(r"\n{3,}", "\n\n", text)
+        return text
+
+    @classmethod
+    def _input_multiline_prompt(cls, ai_page, input_el, prompt: str) -> str:
+        """
+        改行を保持したままWeb AI入力欄へ安全に貼り付け/入力する。
+        - <textarea>系: fill() で改行(\n)ごと一括セット（誤送信なし・高速）
+        - contenteditable系 (Gemini/ChatGPT/Claude等): 行ごとに insert_text + Shift+Enter で改行を忠実再現
+        """
+        normalized_prompt = cls._normalize_multiline_prompt(prompt)
+        input_el.click(timeout=4000)
+        time.sleep(0.25)
+        try:
+            ai_page.keyboard.press("Control+A")
+            ai_page.keyboard.press("Backspace")
+            time.sleep(0.1)
+        except Exception:
+            pass
+
+        is_textarea = False
+        try:
+            is_textarea = bool(input_el.evaluate("(el) => !!el && el.tagName === 'TEXTAREA'"))
+        except Exception:
+            is_textarea = False
+
+        if is_textarea:
+            try:
+                input_el.fill(normalized_prompt)
+                time.sleep(0.2)
+                val = input_el.input_value()
+                if val and "\n" in normalized_prompt and "\n" in val:
+                    return normalized_prompt
+                if val and "\n" not in normalized_prompt:
+                    return normalized_prompt
+            except Exception:
+                pass
+
+        # contenteditable または textarea のフォールバック: Shift+Enter + insert_text で改行を維持
+        try:
+            input_el.click(timeout=3000)
+            ai_page.keyboard.press("Control+A")
+            ai_page.keyboard.press("Backspace")
+        except Exception:
+            pass
+
+        lines = normalized_prompt.split("\n")
+        typed_ok = True
+        try:
+            for idx, line in enumerate(lines):
+                if idx > 0:
+                    ai_page.keyboard.press("Shift+Enter")
+                if line:
+                    ai_page.keyboard.insert_text(line)
+        except Exception:
+            typed_ok = False
+
+        # 万一空になっていた場合の最終フォールバック
+        try:
+            cur_val = input_el.evaluate(
+                "(el) => el ? (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' ? (el.value || '') : (el.innerText || el.textContent || '')) : ''"
+            )
+            if not typed_ok or not (cur_val or "").strip():
+                input_el.fill(normalized_prompt)
+        except Exception:
+            if not typed_ok:
+                try:
+                    input_el.fill(normalized_prompt)
+                except Exception:
+                    pass
+
+        return normalized_prompt
+
+    @classmethod
     def _submit_and_stream_response(
         cls,
         ai_page,
@@ -881,39 +1098,33 @@ class AIDedicatedWindowManager:
                 prev_counts[rsel] = 0
                 prev_last_texts[rsel] = ""
 
-        single_line_prompt = " ".join([ln.strip() for ln in prompt.splitlines() if ln.strip()])
-        input_el.click(timeout=4000)
-        time.sleep(0.3)
-        try:
-            ai_page.keyboard.press("Control+A")
-            ai_page.keyboard.press("Backspace")
-            time.sleep(0.1)
-        except Exception:
-            pass
-
-        try:
-            ai_page.keyboard.insert_text(single_line_prompt)
-        except Exception:
-            try:
-                input_el.fill(single_line_prompt)
-            except Exception:
-                pass
-        time.sleep(0.6)
+        normalized_prompt = cls._input_multiline_prompt(ai_page, input_el, prompt)
+        prompt_ws = " ".join(normalized_prompt.split())
+        time.sleep(0.5)
 
         sent = False
-        for ssel in send_selectors:
-            try:
-                sbtn = ai_page.locator(ssel)
-                if sbtn.count() > 0 and sbtn.first.is_visible() and sbtn.first.is_enabled():
-                    sbtn.first.click(timeout=3000)
-                    sent = True
-                    break
-            except Exception:
-                continue
+        send_deadline = time.time() + 1.8
+        while time.time() < send_deadline and not sent:
+            for ssel in send_selectors:
+                try:
+                    sbtn = ai_page.locator(ssel)
+                    if sbtn.count() > 0 and sbtn.first.is_visible() and sbtn.first.is_enabled():
+                        sbtn.first.click(timeout=3000)
+                        sent = True
+                        break
+                except Exception:
+                    continue
+            if not sent:
+                time.sleep(0.25)
+
         if not sent:
+            try:
+                input_el.click(timeout=2000)
+            except Exception:
+                pass
             ai_page.keyboard.press("Enter")
 
-        print(f"   🤖 [AI専用ウィンドウ] {service_label} でリプライ/引用文を生成中...")
+        print(f"   🤖 [AI専用ウィンドウ] {service_label} でリプライ/引用文を生成中（改行保持プロンプト送信済）...")
         gen_start = time.time()
         last_txt = ""
         stable_ticks = 0
@@ -926,14 +1137,18 @@ class AIDedicatedWindowManager:
                     cnt = loc.count()
                     if cnt > prev_counts.get(rsel, 0):
                         candidate = loc.last.inner_text().strip()
-                        if candidate and candidate != single_line_prompt:
-                            cur_txt = candidate
-                            break
+                        if candidate:
+                            cand_ws = " ".join(candidate.split())
+                            if cand_ws != prompt_ws and candidate != normalized_prompt:
+                                cur_txt = candidate
+                                break
                     elif cnt > 0:
                         candidate = loc.last.inner_text().strip()
-                        if candidate and candidate != prev_last_texts.get(rsel, "") and candidate != single_line_prompt:
-                            cur_txt = candidate
-                            break
+                        if candidate and candidate != prev_last_texts.get(rsel, ""):
+                            cand_ws = " ".join(candidate.split())
+                            if cand_ws != prompt_ws and candidate != normalized_prompt:
+                                cur_txt = candidate
+                                break
                 except Exception:
                     continue
 
@@ -1122,7 +1337,8 @@ class AIDedicatedWindowManager:
                 ],
                 service_label="xAI Grok",
                 target_url=target,
-                login_markers=["/i/flow/login", "/login"]
+                login_markers=["/i/flow/login", "/login"],
+                new_chat_selectors=['a[href="/i/grok"]', 'button[aria-label*="新しいチャット"]', 'button[aria-label*="New chat"]']
             )
             if input_el is None:
                 return False, "Grok画面の入力欄が見つかりません（X未ログイン等）"
@@ -1164,7 +1380,8 @@ class AIDedicatedWindowManager:
                 ],
                 service_label="DeepSeek",
                 target_url=target,
-                login_markers=["sign_in", "login"]
+                login_markers=["sign_in", "login"],
+                new_chat_selectors=['button:has-text("New chat")', 'button:has-text("新しいチャット")', 'button[aria-label*="New chat"]']
             )
             if input_el is None:
                 return False, "DeepSeekの入力欄が検出できませんでした（ログイン未完了等）"
@@ -1207,7 +1424,8 @@ class AIDedicatedWindowManager:
                 ],
                 service_label="Perplexity",
                 target_url=target,
-                login_markers=["login", "signin"]
+                login_markers=["login", "signin"],
+                new_chat_selectors=['a[href="/"]', 'button[aria-label*="New Thread"]', 'button[aria-label*="新しいスレッド"]']
             )
             if input_el is None:
                 return False, "Perplexityの入力欄が検出できませんでした"
@@ -1249,7 +1467,8 @@ class AIDedicatedWindowManager:
                 ],
                 service_label="Microsoft Copilot",
                 target_url=target,
-                login_markers=["login.live.com", "login.microsoftonline.com"]
+                login_markers=["login.live.com", "login.microsoftonline.com"],
+                new_chat_selectors=['button[aria-label*="New topic"]', 'button[aria-label*="新しいトピック"]', 'button[aria-label*="New chat"]']
             )
             if input_el is None:
                 return False, "Copilotの入力欄が検出できませんでした"
@@ -1493,7 +1712,8 @@ class AIDedicatedWindowManager:
         headless: bool = False,
         base_dir: str = ".",
         slot_id: int = 1,
-        parent_post_text: str = ""
+        parent_post_text: str = "",
+        prompt_config: Optional[dict] = None
     ) -> Tuple[bool, str]:
         """
         AI専用ウィンドウで選択されたAIエンジン・接続URLを起動して文章を生成し、クリップボードおよび戻り値として返却
@@ -1529,7 +1749,8 @@ class AIDedicatedWindowManager:
                     custom_prompt=custom_prompt,
                     page=ai_page,
                     use_dedicated_window=True,
-                    parent_post_text=parent_post_text
+                    parent_post_text=parent_post_text,
+                    prompt_config=prompt_config
                 )
                 if ok and result_text:
                     try:
@@ -1563,15 +1784,22 @@ class AIDedicatedWindowManager:
                     custom_prompt=custom_prompt,
                     page=ai_page,
                     use_dedicated_window=True,
-                    parent_post_text=parent_post_text
+                    parent_post_text=parent_post_text,
+                    prompt_config=prompt_config
                 )
                 if not ok:
-                    prompt = AIGenerator.build_prompt(post_url, post_text, action_type, target_name, custom_prompt, parent_post_text=parent_post_text)
+                    prompt = AIGenerator.build_prompt(
+                        post_url, post_text, action_type, target_name, custom_prompt,
+                        parent_post_text=parent_post_text, prompt_config=prompt_config
+                    )
                     ok, result_text = cls._generate_via_gemini_web(ai_page, prompt)
 
             # 3. Web連携エンジンまたは接続URL指定時: AI専用ウィンドウ上の対象AIサイトで生成！
             else:
-                prompt = AIGenerator.build_prompt(post_url, post_text, action_type, target_name, custom_prompt, parent_post_text=parent_post_text)
+                prompt = AIGenerator.build_prompt(
+                    post_url, post_text, action_type, target_name, custom_prompt,
+                    parent_post_text=parent_post_text, prompt_config=prompt_config
+                )
                 custom_web_url = api_key.strip() if AIGenerator.is_web_url(api_key) else ""
                 if eff_eng == "chatgpt":
                     ok, result_text = cls._generate_via_chatgpt_web(ai_page, prompt, custom_web_url)

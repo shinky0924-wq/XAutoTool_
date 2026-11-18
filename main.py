@@ -751,7 +751,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         acc_search_keywords = config_mgr.load_search_keywords(target_path_override=acc_target_path) or search_keywords
         acc_reply_urls = config_mgr.load_reply_urls(target_path_override=acc_target_path) or reply_urls
         acc_follow_urls = config_mgr.load_follow_urls(target_path_override=acc_target_path) or follow_urls
-        acc_prompt_setting = config_mgr.load_prompt_settings(target_path_override=acc_target_path)
+        acc_ai_prompt_cfg = config_mgr.load_ai_prompt_config(target_path_override=acc_target_path, legacy_extra_prompt=ai_prompt_extra)
+        acc_prompt_setting = str(acc_ai_prompt_cfg.get("instruction") or "").strip()
 
         log(f"\n{'='*58}")
         log(f"🚀 アカウント [{account_id}] ({acc_idx}/{total_acc_count}件目) のスロット{active_slot}セッションを開始します")
@@ -1327,7 +1328,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         if parent_txt:
                             log(f"   🧵 [会話コンテキスト取得] 元ポスト: 「{parent_txt[:35]}...」 / 対象返信: 「{post_txt[:35]}...」")
 
-                        custom_p = ai_prompt_extra or acc_prompt_setting
+                        custom_p = acc_prompt_setting or ai_prompt_extra
                         use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
                         if use_win_flow:
                             ok_ai, ai_res = AIDedicatedWindowManager.generate_and_copy_via_ai_window(
@@ -1342,7 +1343,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 headless=False,
                                 base_dir=base_dir,
                                 slot_id=active_slot,
-                                parent_post_text=parent_txt
+                                parent_post_text=parent_txt,
+                                prompt_config=acc_ai_prompt_cfg
                             )
                         else:
                             ok_ai, ai_res = AIGenerator.generate_comment(
@@ -1354,7 +1356,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 api_key=ai_api_key,
                                 custom_prompt=custom_p,
                                 page=browser_ctrl.page,
-                                parent_post_text=parent_txt
+                                parent_post_text=parent_txt,
+                                prompt_config=acc_ai_prompt_cfg
                             )
                         if ok_ai and ai_res and ai_res.strip():
                             prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if use_win_flow else "🤖 [AI生成成功"

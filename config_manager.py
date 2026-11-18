@@ -795,44 +795,112 @@ class ConfigManager:
                     break
         return urls
 
-    def load_prompt_settings(self, target_path_override: str = None) -> str:
-        """「アカウント名.xlsx」の「プロンプト設定」シートからプロンプトを読込"""
-        prompt = ""
+    def load_ai_prompt_config(self, target_path_override: str = None, legacy_extra_prompt: str = "") -> dict:
+        """
+        アカウント名.xlsx (例: wqwq1320.xlsx) の「AIプロンプト」シートから
+        キャラ設定 / 取得URL・投稿情報 / プロンプト / 出力ルール を読込。
+        旧構成（プロンプト設定 / プロンプト枠組み / AIプロンプト追加指示）も自動フォールバック対応。
+        """
+        default_cfg = {
+            "character": "あなたはX(Twitter)の親しみやすく礼儀正しいユーザーです。",
+            "post_format": "",
+            "instruction": "取得する文章はXのポストです。相手に寄り添って文章を生成して 140文字以内で",
+            "output_rule": (
+                "※出力は送信するメッセージ本文のみを1〜2行（140文字以内）で返してください。"
+                "挨拶や前置き（例: 「了解しました」「返信案:」）や引用符などの余計な注釈は一切含めないでください。"
+            ),
+            "has_sheet": False,
+        }
         target_file = target_path_override or self.target_list_path
         paths = [p for p in [target_file, self.target_list_path, self.account_config_path] if p]
         seen_paths = set()
+
         for path in paths:
-            if path in seen_paths:
+            if path in seen_paths or not os.path.exists(path):
                 continue
             seen_paths.add(path)
-            if os.path.exists(path):
+            try:
                 wb = self._safe_load_workbook(path, read_only=True)
+                ai_sheet = None
+                for sname in wb.sheetnames:
+                    sc = sname.replace(" ", "").replace("　", "").lower()
+                    if sc in ["aiプロンプト", "aiプロンプト設定", "プロンプトai"]:
+                        ai_sheet = wb[sname]
+                        break
+                if ai_sheet is not None:
+                    res = dict(default_cfg)
+                    res["has_sheet"] = True
+                    rows = list(ai_sheet.iter_rows(values_only=True))
+                    for row in rows:
+                        if not row:
+                            continue
+                        k_raw = str(row[0] or "").strip()
+                        if not k_raw:
+                            continue
+                        k_clean = k_raw.replace(" ", "").replace("　", "").replace("_", "").lower()
+                        if k_clean in ["項目", "設定項目", "キー", "key", "item"]:
+                            continue
+                        val = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
+                        if any(m in k_clean for m in ["キャラ", "役割", "立場", "前提", "冒頭", "persona", "character"]):
+                            res["character"] = val
+                        elif any(m in k_clean for m in ["取得url", "投稿情報", "ポスト情報", "投稿フォーマット", "urlフォーマット", "postformat"]):
+                            res["post_format"] = val
+                        elif any(m in k_clean for m in ["出力ルール", "出力形式", "禁止", "末尾", "outputrule", "output"]):
+                            res["output_rule"] = val
+                        elif any(m in k_clean for m in ["プロンプト", "指示", "instruction", "prompt"]):
+                            res["instruction"] = val
+                    wb.close()
+                    return res
+
+                # 旧シート（プロンプト設定）互換フォールバック
                 if "プロンプト設定" in wb.sheetnames:
                     sheet = wb["プロンプト設定"]
+                    legacy_instr = ""
                     for row in sheet.iter_rows(min_row=2, values_only=True):
                         if row and row[0]:
-                            prompt = str(row[0]).strip()
+                            legacy_instr = str(row[0]).strip()
                             break
+                    wb.close()
+                    res = dict(default_cfg)
+                    extra = (legacy_extra_prompt or "").strip()
+                    if extra and legacy_instr:
+                        res["instruction"] = f"{legacy_instr}\n{extra}"
+                    elif extra:
+                        res["instruction"] = extra
+                    elif legacy_instr:
+                        res["instruction"] = legacy_instr
+                    return res
                 wb.close()
-                if prompt:
-                    break
-        return prompt or "取得する文章はXのポストです。相手に寄り添って文章を生成して 140文字以内で"
+            except Exception:
+                pass
+
+        res = dict(default_cfg)
+        if legacy_extra_prompt and str(legacy_extra_prompt).strip():
+            res["instruction"] = str(legacy_extra_prompt).strip()
+        return res
+
+    def load_prompt_settings(self, target_path_override: str = None) -> str:
+        """「アカウント名.xlsx」の「AIプロンプト」（または旧「プロンプト設定」）シートから指示プロンプトを読込"""
+        cfg = self.load_ai_prompt_config(target_path_override=target_path_override)
+        return str(cfg.get("instruction") or "").strip() or "取得する文章はXのポストです。相手に寄り添って文章を生成して 140文字以内で"
 
     def _get_target_sheet(self, wb):
-        """ターゲット蓄積シート（ターゲット履歴／ターゲット一覧／ターゲット等）を自動判定"""
+        """ターゲット蓄積シート（ターゲット履歴／ターゲット一覧／ターゲット等）を判定（存在しない場合はNone）"""
         for sname in ["ターゲット履歴", "ターゲット一覧", "ターゲット", "リスト", "ターゲットリスト"]:
             if sname in wb.sheetnames:
                 return wb[sname]
         for name in wb.sheetnames:
             sheet = wb[name]
-            first_row = [str(cell.value or "") for cell in sheet[1]]
-            if any("アカウント名" in h or "ユーザー名" in h or "ターゲット" in h or "screen_name" in h for h in first_row):
-                return sheet
-        # なければ最後のシート、またはwb.active
-        return wb.active
+            try:
+                first_row = [str(cell.value or "") for cell in sheet[1]]
+                if any("アカウント名" in h or "ユーザー名" in h or "ターゲットURL" in h or "screen_name" in h for h in first_row):
+                    return sheet
+            except Exception:
+                continue
+        return None
 
     def append_discovered_target(self, screen_name: str, source_url: str = "", target_path_override: str = None, tweet_url: str = "", display_name: str = ""):
-        """収集した新規ターゲットを「アカウント名.xlsx」の「ターゲット履歴」シートに自動追記"""
+        """旧「ターゲット履歴」シートが存在するExcelのみ追記（シート削除済みならDB管理のみとしExcelへ新規作成しない）"""
         clean_name = normalize_screen_name(screen_name)
         if not clean_name:
             return
@@ -844,20 +912,14 @@ class ConfigManager:
         for attempt in range(5):
             try:
                 wb = openpyxl.load_workbook(target_file)
-                
-                # ターゲット履歴シートの取得、存在しなければ作成
-                if "ターゲット履歴" in wb.sheetnames:
-                    sheet = wb["ターゲット履歴"]
-                else:
-                    sheet = None
-                    for name in wb.sheetnames:
-                        first_row = [str(cell.value or "") for cell in wb[name][1]]
-                        if any("アカウント名" in h or "ユーザー名" in h or "ターゲット" in h for h in first_row):
-                            sheet = wb[name]
-                            break
-                    if sheet is None:
-                        sheet = wb.create_sheet(title="ターゲット履歴")
-                        sheet.append(["アカウント名", "ターゲットURL", "個別メッセージ", "ステータス", "処理日時", "詳細備考"])
+                sheet = None
+                for sname in ["ターゲット履歴", "ターゲット一覧", "ターゲットリスト"]:
+                    if sname in wb.sheetnames:
+                        sheet = wb[sname]
+                        break
+                if sheet is None:
+                    wb.close()
+                    return
 
                 # アカウント名列の特定
                 name_col = 1
@@ -891,13 +953,16 @@ class ConfigManager:
                 break
 
     def load_targets(self, limit: int = 0, target_path_override: str = None) -> list[dict]:
-        """「アカウント名.xlsx」のターゲットシートから未処理ターゲット一覧を読込 (limit指定時はその件数のみ直接読込)"""
+        """「アカウント名.xlsx」のターゲットシートが存在する場合のみ未処理ターゲット一覧を読込"""
         target_file = target_path_override or self.target_list_path
         if not os.path.exists(target_file):
             return []
         try:
             wb = self._safe_load_workbook(target_file, read_only=True)
             sheet = self._get_target_sheet(wb)
+            if sheet is None:
+                wb.close()
+                return []
             rows = list(sheet.iter_rows(values_only=True))
             wb.close()
         except Exception as e:

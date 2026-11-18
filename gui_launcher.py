@@ -311,14 +311,13 @@ class AppLauncherGUI:
 
         # 設定キャッシュ
         self.accounts_data = []
-        self.targets_data = []
         self.keywords_data = []
         self.reply_urls_data = []
         self.follow_urls_data = []
         self.dm_templates = []
         self.reply_templates = []
         self.quote_templates = []
-        self.prompt_setting = ""
+        self.ai_prompt_config = {}
 
         # UI構築
         self._create_widgets()
@@ -400,9 +399,9 @@ class AppLauncherGUI:
         self.notebook.add(self.tab_accounts, text="  📋 アカウント設定  ")
         self._build_accounts_tab()
 
-        # --- タブ3: 🎯 ターゲット＆URL＆文面 (アカウント名.xlsx) ---
+        # --- タブ3: 🔍 キーワード＆URL＆文面 (アカウント名.xlsx) ---
         self.tab_targets = ttk.Frame(self.notebook)
-        self.notebook.add(self.tab_targets, text="  🎯 ターゲット＆文面  ")
+        self.notebook.add(self.tab_targets, text="  🔍 キーワード＆文面・AIプロンプト  ")
         self._build_targets_tab()
 
         # --- タブ4: 💾 送信履歴データベース (アカウント名.db) ---
@@ -738,22 +737,11 @@ class AppLauncherGUI:
                     messagebox.showerror("エラー", f"保存に失敗しました: {e}", parent=self.root)
 
     def _build_targets_tab(self):
-        # ターゲット＆各シート用サブタブ
+        # 各シート用サブタブ (検索キーワード / URLリスト / 送信文面＆AIプロンプト)
         sub_nb = ttk.Notebook(self.tab_targets)
         sub_nb.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
 
-        # サブタブ1: ターゲット一覧
-        frame_t = ttk.Frame(sub_nb)
-        sub_nb.add(frame_t, text=" 🎯 ターゲット履歴・蓄積一覧 ")
-        cols_t = ("アカウント名", "ステータス", "ターゲットURL", "処理日時", "備考")
-        self.tree_targets = ttk.Treeview(frame_t, columns=cols_t, show="headings")
-        for c in cols_t:
-            self.tree_targets.heading(c, text=c)
-            self.tree_targets.column(c, width=120)
-        self.tree_targets.column("ターゲットURL", width=240)
-        self.tree_targets.pack(fill=tk.BOTH, expand=True)
-
-        # サブタブ2: 検索キーワード (最新/おすすめ)
+        # サブタブ1: 検索キーワード (最新/おすすめ)
         frame_kw = ttk.Frame(sub_nb)
         sub_nb.add(frame_kw, text=" 🔍 検索キーワード ")
         cols_kw = ("検索キーワード", "検索種別")
@@ -763,7 +751,7 @@ class AppLauncherGUI:
             self.tree_kw.column(c, width=200)
         self.tree_kw.pack(fill=tk.BOTH, expand=True)
 
-        # サブタブ3: リプライURL & フォローURL
+        # サブタブ2: リプライURL & フォローURL
         frame_url = ttk.Frame(sub_nb)
         sub_nb.add(frame_url, text=" 🌐 URLリスト (リプライ/フォロー) ")
         cols_u = ("種別", "URL", "備考")
@@ -774,9 +762,9 @@ class AppLauncherGUI:
         self.tree_urls.column("URL", width=400)
         self.tree_urls.pack(fill=tk.BOTH, expand=True)
 
-        # サブタブ4: DM内容 & リプライ内容 & プロンプト
+        # サブタブ3: DM内容 & リプライ内容 & AIプロンプト
         frame_msg = ttk.Frame(sub_nb)
-        sub_nb.add(frame_msg, text=" ✉️ 送信文面＆プロンプト ")
+        sub_nb.add(frame_msg, text=" ✉️ 送信文面＆AIプロンプト ")
         self.txt_messages = scrolledtext.ScrolledText(frame_msg, wrap=tk.WORD, font=("Meiryo", 9))
         self.txt_messages.pack(fill=tk.BOTH, expand=True)
 
@@ -1074,36 +1062,17 @@ class AppLauncherGUI:
         if hasattr(self, "btn_name"):
             self.btn_name.config(text=f"📘 {self.current_target_file_name}", command=lambda: self._open_file(self.current_target_file_name))
 
-        self.targets_data = []
         self.keywords_data = []
         self.reply_urls_data = []
         self.follow_urls_data = []
         self.dm_templates = []
-        self.prompt_setting = ""
+        self.reply_templates = []
+        self.quote_templates = []
+        self.ai_prompt_config = {}
 
         if os.path.exists(name_path):
             try:
                 wb = openpyxl.load_workbook(name_path, data_only=True)
-
-                # ターゲット履歴
-                target_sheet = wb["ターゲット履歴"] if "ターゲット履歴" in wb.sheetnames else wb.active
-                t_rows = list(target_sheet.iter_rows(values_only=True))
-                if t_rows and len(t_rows) > 1:
-                    for r in t_rows[1:]:
-                        if r and r[0]:
-                            raw_t_name = str(r[0])
-                            c_t_name = normalize_screen_name(raw_t_name)
-                            if not c_t_name and len(r) > 1 and r[1]:
-                                c_t_name = normalize_screen_name(str(r[1]))
-                            disp_name = f"@{c_t_name}" if c_t_name else raw_t_name
-                            t_url = f"https://x.com/{c_t_name}" if c_t_name else (str(r[1]) if len(r) > 1 and r[1] else "")
-                            self.targets_data.append({
-                                "name": disp_name,
-                                "url": t_url,
-                                "status": str(r[3]) if len(r) > 3 and r[3] else "未送信",
-                                "date": str(r[4]) if len(r) > 4 and r[4] else "",
-                                "note": str(r[5]) if len(r) > 5 and r[5] else ""
-                            })
 
                 # 検索キーワード
                 if "検索キーワード" in wb.sheetnames:
@@ -1142,23 +1111,16 @@ class AppLauncherGUI:
                         if r and r[0]:
                             self.quote_templates.append(str(r[0]))
 
-                # プロンプト設定
-                if "プロンプト設定" in wb.sheetnames:
-                    for r in wb["プロンプト設定"].iter_rows(min_row=2, values_only=True):
-                        if r and r[0]:
-                            self.prompt_setting = str(r[0])
-                            break
-
                 wb.close()
             except Exception as e:
                 self.log(f"⚠️ アカウント名.xlsx 読込エラー: {e}")
 
-        # サブテーブル反映
-        for item in self.tree_targets.get_children():
-            self.tree_targets.delete(item)
-        for t in self.targets_data:
-            self.tree_targets.insert("", tk.END, values=(t["name"], t["status"], t["url"], t["date"], t["note"]))
+            try:
+                self.ai_prompt_config = self.config_mgr.load_ai_prompt_config(target_path_override=name_path)
+            except Exception:
+                self.ai_prompt_config = {}
 
+        # サブテーブル反映
         for item in self.tree_kw.get_children():
             self.tree_kw.delete(item)
         for kw in self.keywords_data:
@@ -1171,9 +1133,14 @@ class AppLauncherGUI:
         for u in self.follow_urls_data:
             self.tree_urls.insert("", tk.END, values=("フォローURL", u, ""))
 
-        # 文面テキスト表示
+        # 文面＆AIプロンプトテキスト表示
         self.txt_messages.delete("1.0", tk.END)
-        self.txt_messages.insert(tk.END, "=== ✉️ DM内容テンプレート ===\n")
+        self.txt_messages.insert(tk.END, f"=== 🤖 AIプロンプト ({self.current_target_file_name}) ===\n")
+        self.txt_messages.insert(tk.END, f"【キャラ設定】\n{self.ai_prompt_config.get('character', '') or '(未設定)'}\n\n")
+        self.txt_messages.insert(tk.END, f"【プロンプト】\n{self.ai_prompt_config.get('instruction', '') or '(未設定)'}\n\n")
+        self.txt_messages.insert(tk.END, f"【出力ルール】\n{self.ai_prompt_config.get('output_rule', '') or '(未設定)'}\n")
+        self.txt_messages.insert(tk.END, "※ アクション指定や対象の投稿URL・本文は実行時に自動差し込みされます。\n")
+        self.txt_messages.insert(tk.END, "\n=== ✉️ DM内容テンプレート ===\n")
         for i, dm in enumerate(self.dm_templates, 1):
             self.txt_messages.insert(tk.END, f"[{i}] {dm}\n")
         self.txt_messages.insert(tk.END, "\n=== 💬 リプライ内容テンプレート ===\n")
@@ -1182,8 +1149,6 @@ class AppLauncherGUI:
         self.txt_messages.insert(tk.END, "\n=== 🔁 引用リツイート内容テンプレート ===\n")
         for i, q in enumerate(self.quote_templates, 1):
             self.txt_messages.insert(tk.END, f"[{i}] {q}\n")
-        self.txt_messages.insert(tk.END, "\n=== 🤖 プロンプト設定 ===\n")
-        self.txt_messages.insert(tk.END, f"{self.prompt_setting or '未設定'}\n")
 
         # 3. データベース履歴読込
         self._reload_db()
@@ -1211,11 +1176,12 @@ class AppLauncherGUI:
                 tgt_min_s, tgt_max_s = 60.0, 150.0
                 acc_min_s, acc_max_s = 300.0, 900.0
 
-            pending = sum(1 for t in self.targets_data if t["status"] in ["未送信", "", "None"])
+            url_cnt = len(self.reply_urls_data) + len(self.follow_urls_data)
+            msg_cnt = len(self.dm_templates) + len(self.reply_templates) + len(self.quote_templates)
             self.lbl_summary_acc.config(text=f"アカウント: @{acc_id}")
             self.lbl_summary_mode.config(text=f"モード: {mode}")
             self.lbl_summary_interval.config(text=f"実行間隔: {acc_min_s:.0f}〜{acc_max_s:.0f}s | 送信待機: {tgt_min_s:.0f}〜{tgt_max_s:.0f}s")
-            self.lbl_summary_target.config(text=f"ターゲット: {len(self.targets_data)}件 (未送信: {pending}件)")
+            self.lbl_summary_target.config(text=f"キーワード: {len(self.keywords_data)}件 | URL: {url_cnt}件 | 文面: {msg_cnt}件")
         else:
             self.lbl_summary_acc.config(text="アカウント: 未設定")
 
