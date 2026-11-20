@@ -678,6 +678,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
         target_min_sec = float(acc_settings.get("target_min_sec", 60.0))
         target_max_sec = float(acc_settings.get("target_max_sec", 150.0))
+        if target_min_sec > target_max_sec:
+            target_min_sec, target_max_sec = target_max_sec, target_min_sec
 
         # アクション個別設定の取得 (DM, いいね, フォロー, リプライ, 引用RT, リプライAI生成, 引用RT AI生成)
         actions_cfg = acc_settings.get("actions", {})
@@ -735,6 +737,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         enabled_intervals_max = [cfg.get("max_interval", 900.0) for cfg in actions_cfg.values() if cfg.get("enabled")]
         account_min_sec = min(enabled_intervals_min) if enabled_intervals_min else 300.0
         account_max_sec = max(enabled_intervals_max) if enabled_intervals_max else 900.0
+        if account_min_sec > account_max_sec:
+            account_min_sec, account_max_sec = account_max_sec, account_min_sec
 
         enabled_batch_min = [cfg.get("min_batch", 3) for cfg in actions_cfg.values() if cfg.get("enabled")]
         enabled_batch_max = [cfg.get("max_batch", 8) for cfg in actions_cfg.values() if cfg.get("enabled")]
@@ -1077,6 +1081,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 visited_reply_accounts.add(owner_cand)
                             discovered_parents = []
                             log(f"   📍 登録URL [{r_idx}/{len(urls_to_visit)}]: {rurl}")
+                            allow_deleted_parent_profile_target = db_action_type in ("DM", "FOLLOW")
                             found = browser_ctrl.collect_targets_from_replies(
                                 rurl,
                                 scroll_limit=scroll_limit,
@@ -1084,6 +1089,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 should_skip_fn=should_skip_target,
                                 exclude_owner=True,
                                 out_parent_candidates=discovered_parents,
+                                include_reply_to_mentions=allow_deleted_parent_profile_target,
                             )
                             append_collected_items(found, f"URLリスト（リプライ）:{rurl}", collected)
                             if len(collected) > before_rurl_cnt and rurl:
@@ -1151,6 +1157,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 hop_url = f"https://x.com/{next_u}/with_replies"
                                 log(f"   🔁 [親ポスト連鎖ホップ {hop_count}/{reply_parent_hop_limit}] @{next_u}/with_replies から親ポスト側ターゲットを探索中...")
                                 hop_parents = []
+                                allow_deleted_parent_profile_target = db_action_type in ("DM", "FOLLOW")
                                 hop_found = browser_ctrl.collect_targets_from_replies(
                                     hop_url,
                                     scroll_limit=scroll_limit,
@@ -1158,6 +1165,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                     should_skip_fn=should_skip_target,
                                     exclude_owner=True,
                                     out_parent_candidates=hop_parents,
+                                    include_reply_to_mentions=allow_deleted_parent_profile_target,
                                 )
                                 append_collected_items(hop_found, f"親ホップ{hop_count}:@{next_u}", collected)
                                 for hpu in hop_parents:
@@ -1328,7 +1336,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         if parent_txt:
                             log(f"   🧵 [会話コンテキスト取得] 元ポスト: 「{parent_txt[:35]}...」 / 対象返信: 「{post_txt[:35]}...」")
 
-                        custom_p = acc_prompt_setting or ai_prompt_extra
+                        custom_p = acc_prompt_setting if acc_ai_prompt_cfg.get("has_sheet") else (acc_prompt_setting or ai_prompt_extra)
                         use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
                         if use_win_flow:
                             ok_ai, ai_res = AIDedicatedWindowManager.generate_and_copy_via_ai_window(
@@ -1635,8 +1643,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                 return False, "NO_ACTION"
 
-            def wait_between_targets(wait_time: float, label_prefix: str, cur_cnt: int, goal_cnt: int, act_min: float, act_max: float):
-                log(f"☕ [{label_prefix}] 次のターゲットまで {wait_time:.1f} 秒待機します（実行間隔 {act_min:.0f}秒〜{act_max:.0f}秒 / 進捗: {cur_cnt}/{goal_cnt}件）...")
+            def wait_between_targets(wait_time: float, label_prefix: str, cur_cnt: int, goal_cnt: int, act_min: float, act_max: float, wait_kind: str = "ランダムインターバル"):
+                log(f"☕ [{label_prefix}] 次のターゲットまで {wait_time:.1f} 秒待機します（{wait_kind} {act_min:.0f}秒〜{act_max:.0f}秒 / 進捗: {cur_cnt}/{goal_cnt}件）...")
                 start_wait = time.time()
                 close_threshold = 60.0 if low_spec_mode else 300.0
                 close_during_wait = wait_time >= close_threshold
@@ -1665,12 +1673,14 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         log(f"   ⚠️ ブラウザ再起動エラー: {se}")
 
             total_actions_performed = 0
+            batch_cooldown_pending = None
+            target_wait_pending = False
 
             # --- 各アクションを「アクションごとに設定されたモード」で順番実行 ---
             for act_key, act_title, a_cfg in active_action_jobs:
                 act_modes = parse_mode_list(a_cfg.get("mode") or target_mode or "検索最新")
-                act_min_int = float(a_cfg.get("min_interval", 60.0))
-                act_max_int = float(a_cfg.get("max_interval", 180.0))
+                act_min_int = float(a_cfg.get("min_interval", 300.0))
+                act_max_int = float(a_cfg.get("max_interval", 900.0))
                 if act_min_int > act_max_int:
                     act_min_int, act_max_int = act_max_int, act_min_int
                 act_min_b = max(1, int(a_cfg.get("min_batch", 1)))
@@ -1683,7 +1693,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 log(f"{'='*58}")
                 log(f"⚡ 【アクション実行開始: {act_title}】")
                 log(f"   設定モード ({len(act_modes)}個): {', '.join([lbl for _, lbl in act_modes])}")
-                log(f"   実行間隔: {act_min_int:.0f}〜{act_max_int:.0f}秒 / 連続処理目標: 最小{act_min_b}〜最大{act_max_b}件 / AI生成: {'ON' if use_ai else 'OFF'} / いいね: {'ON' if do_like else 'OFF'} / フォロー: {'ON' if do_follow else 'OFF'}")
+                log(f"   連続処理目標: 最小{act_min_b}〜最大{act_max_b}件 / 1件ごと待機(ランダムインターバル): {target_min_sec:.0f}〜{target_max_sec:.0f}秒 / 連続処理後・実行間隔: {act_min_int:.0f}〜{act_max_int:.0f}秒 / AI生成: {'ON' if use_ai else 'OFF'} / いいね: {'ON' if do_like else 'OFF'} / フォロー: {'ON' if do_follow else 'OFF'}")
                 log(f"{'='*58}")
 
                 for mode_idx, (m_type, m_label) in enumerate(act_modes, start=1):
@@ -1702,6 +1712,18 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         continue
 
                     batch_target_count = random.randint(act_min_b, act_max_b)
+                    if batch_cooldown_pending is not None:
+                        cd_title, cd_min, cd_max, cd_done, cd_goal = batch_cooldown_pending
+                        batch_wait = random.uniform(cd_min, cd_max)
+                        log(f"⏸️ [{cd_title}] 連続処理 {cd_done}件完了のため、次の処理前に実行間隔 {batch_wait:.1f} 秒待機します（実行間隔 {cd_min:.0f}秒〜{cd_max:.0f}秒）...")
+                        wait_between_targets(batch_wait, cd_title, cd_done, cd_goal, cd_min, cd_max, wait_kind="連続処理後・実行間隔")
+                        batch_cooldown_pending = None
+                        target_wait_pending = False
+                    elif target_wait_pending:
+                        t_wait = random.uniform(target_min_sec, target_max_sec)
+                        wait_between_targets(t_wait, act_title, 0, batch_target_count, target_min_sec, target_max_sec, wait_kind="ランダムインターバル")
+                        target_wait_pending = False
+
                     log(f"📋 [{act_title} / {m_label}] 取得新規ターゲット: {len(mode_targets)}件 / 目標連続処理数: {batch_target_count}件")
 
                     mode_success_count = 0
@@ -1724,8 +1746,14 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             mode_success_count += 1
                             total_actions_performed += 1
                             if mode_success_count < batch_target_count and t_idx < len(mode_targets):
-                                wait_time = random.uniform(act_min_int, act_max_int)
-                                wait_between_targets(wait_time, act_title, mode_success_count, batch_target_count, act_min_int, act_max_int)
+                                wait_time = random.uniform(target_min_sec, target_max_sec)
+                                wait_between_targets(wait_time, act_title, mode_success_count, batch_target_count, target_min_sec, target_max_sec, wait_kind="ランダムインターバル")
+
+                    if mode_success_count >= batch_target_count:
+                        batch_cooldown_pending = (act_title, act_min_int, act_max_int, mode_success_count, batch_target_count)
+                        target_wait_pending = False
+                    elif mode_success_count > 0:
+                        target_wait_pending = True
 
                     log(f"✅ [{act_title} / {m_label}] 完了 (成功: {mode_success_count}件 / 目標: {batch_target_count}件)")
 
@@ -1760,8 +1788,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
                     if existing_targets:
                         act_key, act_title, a_cfg = active_action_jobs[0]
-                        act_min_int = float(a_cfg.get("min_interval", 60.0))
-                        act_max_int = float(a_cfg.get("max_interval", 180.0))
+                        act_min_int = float(a_cfg.get("min_interval", 300.0))
+                        act_max_int = float(a_cfg.get("max_interval", 900.0))
                         act_min_b = max(1, int(a_cfg.get("min_batch", 1)))
                         act_max_b = max(act_min_b, int(a_cfg.get("max_batch", act_min_b)))
                         batch_target_count = random.randint(act_min_b, act_max_b)
@@ -1777,7 +1805,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 fb_success_count += 1
                                 total_actions_performed += 1
                                 if fb_success_count < batch_target_count and t_idx < len(existing_targets):
-                                    wait_between_targets(random.uniform(act_min_int, act_max_int), act_title, fb_success_count, batch_target_count, act_min_int, act_max_int)
+                                    wait_between_targets(random.uniform(target_min_sec, target_max_sec), act_title, fb_success_count, batch_target_count, target_min_sec, target_max_sec, wait_kind="ランダムインターバル")
                     else:
                         log("ℹ️ 有効なターゲットが見つかりませんでした（サンプル/ダミーターゲットは除外）。再読み込み後も取得できなかったため安全に終了します。")
 

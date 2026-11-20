@@ -236,18 +236,25 @@ class AIGenerator:
             out = out.replace("{元ポスト}", safe_parent if safe_parent else "なし")
             return out
 
-        if isinstance(prompt_config, dict) and any(k in prompt_config for k in ("character", "post_format", "instruction", "output_rule")):
+        internal_selection_rule = (
+            "【作成方針（自動選定）】\n"
+            "設定されたキャラ・指示に沿った切り口を内部で3パターン（共感・補足・視点の共有など）検討し、"
+            f"対象の投稿に最も自然で噛み合っている1つだけを選んでください。\n"
+            f"※検討過程や他案・比較・番号（1. 2. 3. 等）は一切書かず、選んだ1つの{action_label}本文のみを出力してください。"
+        )
+
+        if isinstance(prompt_config, dict) and any(k in prompt_config for k in ("character", "tone_style", "post_format", "instruction", "examples", "ng_rules", "output_rule")):
             parts = []
             action_intro = f"以下の投稿に対して、魅力的な{action_label}のメッセージを作成してください。"
             char_raw = str(prompt_config.get("character", "") or "").strip()
+            if not char_raw or ("{アクション}" not in char_raw and "作成してください" not in char_raw):
+                parts.append(action_intro)
             if char_raw:
                 rendered_char = _apply_tags(char_raw)
-                if "{アクション}" not in char_raw and "作成してください" not in char_raw:
-                    parts.append(f"{rendered_char}\n{action_intro}")
-                else:
+                if rendered_char.lstrip().startswith(("【キャラ", "【役割")):
                     parts.append(rendered_char)
-            else:
-                parts.append(action_intro)
+                else:
+                    parts.append(f"【キャラ設定】\n{rendered_char}")
 
             post_raw = str(prompt_config.get("post_format", "") or "").strip()
             if post_raw:
@@ -258,19 +265,52 @@ class AIGenerator:
             else:
                 parts.append(default_context_block)
 
+            tone_raw = str(prompt_config.get("tone_style", "") or "").strip()
+            if tone_raw:
+                rendered_tone = _apply_tags(tone_raw)
+                if rendered_tone.lstrip().startswith(("【口調", "【文体")):
+                    parts.append(rendered_tone)
+                else:
+                    parts.append(f"【口調・文体ルール】\n{rendered_tone}")
+
+            has_ai_sheet = bool(prompt_config.get("has_sheet"))
             instr_raw = str(prompt_config.get("instruction", "") or "").strip()
-            if not instr_raw and custom_instruction:
+            if not has_ai_sheet and not instr_raw and custom_instruction:
                 instr_raw = str(custom_instruction).strip()
             if instr_raw:
                 rendered_instr = _apply_tags(instr_raw) + context_note
-                if rendered_instr.lstrip().startswith("【指示】"):
+                if rendered_instr.lstrip().startswith(("【指示】", "【プロンプト】")):
                     parts.append(rendered_instr)
                 else:
                     parts.append(f"【指示】\n{rendered_instr}")
+            elif context_note.strip():
+                parts.append(context_note.strip())
+
+            examples_raw = str(prompt_config.get("examples", "") or "").strip()
+            if examples_raw:
+                rendered_examples = _apply_tags(examples_raw)
+                if rendered_examples.lstrip().startswith(("【お手本", "【サンプル", "【参考例")):
+                    parts.append(rendered_examples)
+                else:
+                    parts.append(f"【お手本サンプル（参考例）】\n{rendered_examples}")
+
+            ng_raw = str(prompt_config.get("ng_rules", "") or "").strip()
+            if ng_raw:
+                rendered_ng = _apply_tags(ng_raw)
+                if rendered_ng.lstrip().upper().startswith("【NG"):
+                    parts.append(rendered_ng)
+                else:
+                    parts.append(f"【NGルール】\n{rendered_ng}")
+
+            parts.append(internal_selection_rule)
 
             rule_raw = str(prompt_config.get("output_rule", "") or "").strip()
             if rule_raw:
-                parts.append(_apply_tags(rule_raw))
+                rendered_rule = _apply_tags(rule_raw)
+                if rendered_rule.lstrip().startswith("【出力"):
+                    parts.append(rendered_rule)
+                else:
+                    parts.append(f"【出力ルール】\n{rendered_rule}")
 
             if parts:
                 return "\n\n".join(parts)
@@ -299,6 +339,8 @@ class AIGenerator:
 
 {instr_heading}
 {instruction}{context_note}
+
+{internal_selection_rule}
 
 【出力ルール（厳守）】
 ・実際にXへ投稿する本文のみを1つ返してください。
@@ -700,14 +742,24 @@ class AIGenerator:
         if not clean:
             return ""
 
+        # 万が一3案の比較後に「最適案」「最終案」等を出力した場合は、その後の本文を優先抽出
+        final_pick_match = re.search(
+            r"(?:^|\n)\s*(?:【\s*(?:最適案|最終案|選んだ(?:返信|案|メッセージ)|採用案|ベスト案)\s*】|\*{0,2}(?:最適案|最終案|選んだ(?:返信|案|メッセージ)|採用案|ベスト案)\*{0,2}\s*[:：])\s*\n?(.*)$",
+            clean,
+            re.DOTALL,
+        )
+        if final_pick_match and final_pick_match.group(1).strip():
+            clean = final_pick_match.group(1).strip()
+
         # 複数案が出力された場合は最初の案のみ採用
         split_multi = re.split(
-            r"\n\s*(?:【\s*(?:案|候補|パターン)?\s*[2２②][^】]*】|(?:案|候補|パターン)\s*[2２②]\s*[:：]|---+\s*\n)",
+            r"\n\s*(?:【\s*(?:案|候補|パターン)?\s*[2２②][^】]*】|(?:案|候補|パターン)\s*[2２②]\s*[:：]|[2２][\.．\)）]\s+|②\s*|---+\s*\n)",
             clean,
             maxsplit=1,
         )
         if len(split_multi) > 1 and split_multi[0].strip():
             clean = split_multi[0].strip()
+            clean = re.sub(r"^(?:[1１][\.．\)）]\s+|①\s*)", "", clean).strip()
 
         # 先頭の前置き行・ラベル行（【返信案】、了解しました。、**返信案** 等）を段階的に除去
         header_line_re = re.compile(

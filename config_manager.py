@@ -798,13 +798,16 @@ class ConfigManager:
     def load_ai_prompt_config(self, target_path_override: str = None, legacy_extra_prompt: str = "") -> dict:
         """
         アカウント名.xlsx (例: wqwq1320.xlsx) の「AIプロンプト」シートから
-        キャラ設定 / 取得URL・投稿情報 / プロンプト / 出力ルール を読込。
+        キャラ設定 / 口調・文体ルール / 取得URL・投稿情報 / プロンプト / お手本サンプル / NGルール / 出力ルール を読込。
         旧構成（プロンプト設定 / プロンプト枠組み / AIプロンプト追加指示）も自動フォールバック対応。
         """
         default_cfg = {
             "character": "あなたはX(Twitter)の親しみやすく礼儀正しいユーザーです。",
+            "tone_style": "",
             "post_format": "",
             "instruction": "取得する文章はXのポストです。相手に寄り添って文章を生成して 140文字以内で",
+            "examples": "",
+            "ng_rules": "",
             "output_rule": (
                 "※出力は送信するメッセージ本文のみを1〜2行（140文字以内）で返してください。"
                 "挨拶や前置き（例: 「了解しました」「返信案:」）や引用符などの余計な注釈は一切含めないでください。"
@@ -828,8 +831,16 @@ class ConfigManager:
                         ai_sheet = wb[sname]
                         break
                 if ai_sheet is not None:
-                    res = dict(default_cfg)
-                    res["has_sheet"] = True
+                    res = {
+                        "character": "",
+                        "tone_style": "",
+                        "post_format": "",
+                        "instruction": "",
+                        "examples": "",
+                        "ng_rules": "",
+                        "output_rule": "",
+                        "has_sheet": True,
+                    }
                     rows = list(ai_sheet.iter_rows(values_only=True))
                     for row in rows:
                         if not row:
@@ -843,6 +854,12 @@ class ConfigManager:
                         val = str(row[1]).strip() if len(row) > 1 and row[1] is not None else ""
                         if any(m in k_clean for m in ["キャラ", "役割", "立場", "前提", "冒頭", "persona", "character"]):
                             res["character"] = val
+                        elif any(m in k_clean for m in ["口調", "文体", "トーン", "語り口", "一人称", "絵文字", "tonestyle", "tone"]):
+                            res["tone_style"] = val
+                        elif any(m in k_clean for m in ["お手本", "サンプル", "返信例", "例文", "fewshot", "example", "sample"]):
+                            res["examples"] = val
+                        elif any(m in k_clean for m in ["ngルール", "ng表現", "禁止ワード", "禁止表現", "避ける", "ngrule", "ng"]):
+                            res["ng_rules"] = val
                         elif any(m in k_clean for m in ["取得url", "投稿情報", "ポスト情報", "投稿フォーマット", "urlフォーマット", "postformat"]):
                             res["post_format"] = val
                         elif any(m in k_clean for m in ["出力ルール", "出力形式", "禁止", "末尾", "outputrule", "output"]):
@@ -882,6 +899,8 @@ class ConfigManager:
     def load_prompt_settings(self, target_path_override: str = None) -> str:
         """「アカウント名.xlsx」の「AIプロンプト」（または旧「プロンプト設定」）シートから指示プロンプトを読込"""
         cfg = self.load_ai_prompt_config(target_path_override=target_path_override)
+        if cfg.get("has_sheet"):
+            return str(cfg.get("instruction") or "").strip()
         return str(cfg.get("instruction") or "").strip() or "取得する文章はXのポストです。相手に寄り添って文章を生成して 140文字以内で"
 
     def _get_target_sheet(self, wb):

@@ -1996,7 +1996,6 @@ class XBrowserController:
             dm_button.click(force=True)
 
         print("   🖱️ DMボタンをクリックしました。")
-        print("   ⏳ 【ラグ待機中】DMチャット画面・ドロワー・ダイアログの表示完了まで待機しています（最大30秒）...")
 
         def check_and_dismiss_rejection_dialog() -> tuple[bool, str]:
             """送信不可画面・認証限定・DM拒否ダイアログ・受信トレイ閉鎖（Xナンバー）の高速検知＆自動閉鎖"""
@@ -2088,153 +2087,227 @@ class XBrowserController:
                 pass
             return False, ""
 
-        # 4. DM画面および各種ダイアログの描画待機 (最大30秒、ラグを完全に吸収)
+        # 4. DM画面（XChat / 従来DM / ドロワー / モーダル）の高速検出 & 未表示時のみ待機→再読み込み
         composer_selectors = [
             'div[data-testid="dmComposerTextInput"]',
+            'textarea[data-testid="dmComposerTextInput"]',
             'div[role="textbox"][data-testid="dmComposerTextInput"]',
             'div[data-testid="DMDrawer"] div[role="textbox"]',
+            'div[data-testid="DMDrawer"] textarea',
             'div[role="dialog"] div[role="textbox"]',
+            'div[role="dialog"] textarea',
             'div[data-testid="messageEntry"] div[role="textbox"]',
+            'div[data-testid="messageEntry"] textarea',
             'div[aria-label*="新しいメッセージを入力"]',
             'div[aria-label*="メッセージを入力"]',
             'div[aria-label*="Start a new message"]',
             'div[aria-label*="Direct message text"]',
+            'textarea[placeholder*="メッセージ"]',
+            'textarea[placeholder*="Message" i]',
+            'textarea[aria-label*="メッセージ"]',
+            'textarea[aria-label*="Message" i]',
             'aside[aria-label*="メッセージ"] div[role="textbox"]',
-            'div[role="textbox"][contenteditable="true"]'
+            'aside[aria-label*="メッセージ"] textarea',
+            'div[role="textbox"][contenteditable="true"]',
         ]
 
-        composer = None
-        start_wait = time.time()
-        timeout = 30.0
-        passcode_handled = False
-        has_retried_click = False
-
-        while time.time() - start_wait < timeout:
-            # 0. DM拒否 / 送信不可ダイアログの高速検知＆スキップ
-            is_rej, rej_msg = check_and_dismiss_rejection_dialog()
-            if is_rej:
-                is_closed_inbox = "受信トレイ閉鎖" in rej_msg or "Xナンバー" in rej_msg
-                status_code = "INBOX_CLOSED" if is_closed_inbox else "DM_REJECTED"
-                print(f"   ⏩ [スキップ実行] {rej_msg} のため、送信カウントに含めず次のターゲットへ進みます。", flush=True)
-                return status_code, rej_msg
-
-            # 1. DMテキスト入力欄 (composer) の存在チェック (最優先)
+        def _find_visible_dm_composer():
             for c_sel in composer_selectors:
-                c_loc = page.locator(c_sel)
-                if c_loc.count() > 0:
-                    for ci in range(c_loc.count()):
-                        c_cand = c_loc.nth(ci)
+                try:
+                    c_loc = page.locator(c_sel)
+                    cnt = c_loc.count()
+                    if cnt > 0:
+                        for ci in range(cnt):
+                            c_cand = c_loc.nth(ci)
+                            try:
+                                if c_cand.is_visible():
+                                    return c_cand
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+            # /messages や /chat (XChat) 遷移済みまたはDMコンテナ表示済み時の汎用テキスト欄チェック
+            try:
+                cur_u = (page.url or "").lower()
+                in_dm_route = ("/messages" in cur_u) or ("/chat" in cur_u)
+                has_dm_container = in_dm_route or (
+                    page.locator('div[data-testid="DMDrawer"], div[role="dialog"], [data-testid="messageEntry"], aside[aria-label*="メッセージ"], aside[aria-label*="Message" i]').count() > 0
+                )
+                if has_dm_container:
+                    gen_loc = page.locator('div[role="textbox"]:not([data-testid*="Search"]), textarea:not([data-testid*="Search"])')
+                    for gi in range(min(gen_loc.count(), 4)):
+                        g_cand = gen_loc.nth(gi)
                         try:
-                            if c_cand.is_visible():
-                                composer = c_cand
+                            if g_cand.is_visible():
+                                return g_cand
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+            return None
+
+        def _is_dm_ui_open() -> bool:
+            if _find_visible_dm_composer() is not None:
+                return True
+            try:
+                cur_u = (page.url or "").lower()
+                if "/messages" in cur_u or "/chat" in cur_u:
+                    return True
+                if page.locator('div[data-testid="DMDrawer"], div[role="dialog"], [data-testid="messageEntry"], [data-testid="dmComposerSendButton"], aside[aria-label*="メッセージ"], aside[aria-label*="Message" i]').count() > 0:
+                    return True
+                if self.is_passcode_prompt_active():
+                    return True
+            except Exception:
+                pass
+            return False
+
+        # クリック直後に即チェック：既に開いていれば待機・再クリックを行わずそのまま送信へ進む
+        time.sleep(0.6)
+        is_rej_now, rej_msg_now = check_and_dismiss_rejection_dialog()
+        if is_rej_now:
+            is_closed_inbox = "受信トレイ閉鎖" in rej_msg_now or "Xナンバー" in rej_msg_now
+            status_code = "INBOX_CLOSED" if is_closed_inbox else "DM_REJECTED"
+            print(f"   ⏩ [スキップ実行] {rej_msg_now} のため、送信カウントに含めず次のターゲットへ進みます。", flush=True)
+            return status_code, rej_msg_now
+
+        composer = _find_visible_dm_composer()
+        if composer:
+            print("   ✨ DMチャット画面（入力欄）の展開を確認しました。", flush=True)
+            time.sleep(0.5)
+        else:
+            print("   ⏳ DM画面が開いていないため表示を待機しています（最大30秒）...", flush=True)
+            start_wait = time.time()
+            timeout = 30.0
+            passcode_handled = False
+            has_retried_click = False
+            has_reloaded_for_dm = False
+
+            while time.time() - start_wait < timeout:
+                # 0. DM拒否 / 送信不可ダイアログの高速検知＆スキップ
+                is_rej, rej_msg = check_and_dismiss_rejection_dialog()
+                if is_rej:
+                    is_closed_inbox = "受信トレイ閉鎖" in rej_msg or "Xナンバー" in rej_msg
+                    status_code = "INBOX_CLOSED" if is_closed_inbox else "DM_REJECTED"
+                    print(f"   ⏩ [スキップ実行] {rej_msg} のため、送信カウントに含めず次のターゲットへ進みます。", flush=True)
+                    return status_code, rej_msg
+
+                # 1. DMテキスト入力欄 (composer) の存在チェック (最優先)
+                composer = _find_visible_dm_composer()
+                if composer:
+                    print("   ✨ 【表示完了】DMチャット画面（入力欄）の展開を確認しました！（待機完了）", flush=True)
+                    time.sleep(0.8)
+                    break
+
+                # 2. 「新しいメッセージを送信」画面の「次へ」ボタン自動進行
+                try:
+                    next_btns = page.locator('[data-testid="nextButton"], [role="button"]:has-text("次へ"), button:has-text("次へ"), [role="button"]:has-text("Next"), button:has-text("Next")')
+                    if next_btns.count() > 0:
+                        for ni in range(next_btns.count()):
+                            nb = next_btns.nth(ni)
+                            if nb.is_visible() and nb.is_enabled() and nb.get_attribute("aria-disabled") != "true":
+                                print("   ➡️ 「新しいメッセージ」画面を検知。「次へ」をクリックして会話へ進みます...", flush=True)
+                                nb.click()
+                                time.sleep(1.5)
                                 break
-                        except Exception:
-                            pass
-                    if composer:
-                        break
+                except Exception:
+                    pass
 
-            if composer:
-                print("   ✨ 【表示完了】DMチャット画面（入力欄）の展開を確認しました！（ラグ待機完了）", flush=True)
-                time.sleep(1.2)  # React DraftJSの初期化完了を待機
-                break
-
-            # 2. 「新しいメッセージを送信」画面の「次へ」ボタン自動進行
-            try:
-                next_btns = page.locator('[data-testid="nextButton"], [role="button"]:has-text("次へ"), button:has-text("次へ"), [role="button"]:has-text("Next"), button:has-text("Next")')
-                if next_btns.count() > 0:
-                    for ni in range(next_btns.count()):
-                        nb = next_btns.nth(ni)
-                        if nb.is_visible() and nb.is_enabled() and nb.get_attribute("aria-disabled") != "true":
-                            print("   ➡️ 「新しいメッセージ」画面を検知。「次へ」をクリックして会話へ進みます...", flush=True)
-                            nb.click()
-                            time.sleep(1.5)
-                            break
-            except Exception:
-                pass
-
-            # 3. 会話開始 / チャット開始 / 同意ダイアログの自動同意
-            try:
-                start_btns = page.locator('[data-testid="startConversationButton"], button:has-text("会話を開始"), [role="button"]:has-text("会話を開始"), button:has-text("チャットを開始"), [role="button"]:has-text("チャットを開始"), button:has-text("メッセージを作成")')
-                if start_btns.count() > 0 and start_btns.first.is_visible():
-                    print("   💬 「会話を開始」をクリックします...", flush=True)
-                    start_btns.first.click()
-                    time.sleep(1.5)
-
-                agree_btn = page.locator('button:has-text("同意して続ける"), [role="button"]:has-text("同意して続ける"), button:has-text("リクエストを送信"), [role="button"]:has-text("リクエストを送信"), button:has-text("OK"), button:has-text("確認"), button:has-text("続ける")')
-                if agree_btn.count() > 0 and agree_btn.first.is_visible():
-                    agree_btn.first.click()
-                    time.sleep(1.2)
-            except Exception:
-                pass
-
-            # 4. 暗号化DMパスコード / PIN入力要求の自動検知＆入力
-            if self.is_passcode_prompt_active():
-                effective_passcode = passcode or self.current_passcode
-                effective_account = self.current_account_id or clean_target
-                unlocked = self.handle_passcode_prompt(passcode=effective_passcode, account_id=effective_account, context_label="暗号化DMロック解除")
-                if unlocked:
-                    passcode_handled = True
-                    print("   ⏳ パスコード解除完了を確認。DM入力欄の描画を待機しています...", flush=True)
-                    time.sleep(2.0)
-                    if "/chat/pin" in page.url or "/pin/recovery" in page.url:
-                        try:
-                            import urllib.parse
-                            qs = urllib.parse.parse_qs(urllib.parse.urlparse(page.url).query)
-                            if "from" in qs and qs["from"]:
-                                redirect_path = qs["from"][0]
-                                full_dest = f"https://x.com{redirect_path}" if redirect_path.startswith("/") else redirect_path
-                                print(f"   🚀 パスコード解除後、対象のDM会話画面へ遷移します: {full_dest}", flush=True)
-                                page.goto(full_dest, wait_until="domcontentloaded")
-                                time.sleep(2.5)
-                        except Exception:
-                            pass
-                else:
-                    print("   🚫 暗号化パスコードが未解除のため、このターゲットのDM送信を安全にスキップします。", flush=True)
-                    try:
-                        page.goto(f"https://x.com/{clean_target}", wait_until="domcontentloaded")
+                # 3. 会話開始 / チャット開始 / 同意ダイアログの自動同意
+                try:
+                    start_btns = page.locator('[data-testid="startConversationButton"], button:has-text("会話を開始"), [role="button"]:has-text("会話を開始"), button:has-text("チャットを開始"), [role="button"]:has-text("チャットを開始"), button:has-text("メッセージを作成")')
+                    if start_btns.count() > 0 and start_btns.first.is_visible():
+                        print("   💬 「会話を開始」をクリックします...", flush=True)
+                        start_btns.first.click()
                         time.sleep(1.5)
-                    except Exception:
-                        pass
-                    return "DM_REJECTED", "パスコード未解除 (暗号化DMロック)"
 
-            # 5. もし8秒経っても全く反応がない場合のみ、1回だけ慎重にDMボタンを再クリック
-            elapsed = time.time() - start_wait
-            if elapsed > 8.0 and not has_retried_click and not composer:
-                has_retried_click = True
-                has_any_dm_ui = page.locator('div[data-testid="DMDrawer"], div[role="dialog"], [data-testid="messageEntry"]').count() > 0
-                if not has_any_dm_ui and not ("/messages" in page.url):
-                    print("   🔄 [通信ラグ対応] DM画面がまだ開かないため、DMボタンをもう一度クリックします...", flush=True)
+                    agree_btn = page.locator('button:has-text("同意して続ける"), [role="button"]:has-text("同意して続ける"), button:has-text("リクエストを送信"), [role="button"]:has-text("リクエストを送信"), button:has-text("OK"), button:has-text("確認"), button:has-text("続ける")')
+                    if agree_btn.count() > 0 and agree_btn.first.is_visible():
+                        agree_btn.first.click()
+                        time.sleep(1.2)
+                except Exception:
+                    pass
+
+                # 4. 暗号化DMパスコード / PIN入力要求の自動検知＆入力
+                if self.is_passcode_prompt_active():
+                    effective_passcode = passcode or self.current_passcode
+                    effective_account = self.current_account_id or clean_target
+                    unlocked = self.handle_passcode_prompt(passcode=effective_passcode, account_id=effective_account, context_label="暗号化DMロック解除")
+                    if unlocked:
+                        passcode_handled = True
+                        print("   ⏳ パスコード解除完了を確認。DM入力欄の描画を待機しています...", flush=True)
+                        time.sleep(2.0)
+                        if "/chat/pin" in page.url or "/pin/recovery" in page.url:
+                            try:
+                                import urllib.parse
+                                qs = urllib.parse.parse_qs(urllib.parse.urlparse(page.url).query)
+                                if "from" in qs and qs["from"]:
+                                    redirect_path = qs["from"][0]
+                                    full_dest = f"https://x.com{redirect_path}" if redirect_path.startswith("/") else redirect_path
+                                    print(f"   🚀 パスコード解除後、対象のDM会話画面へ遷移します: {full_dest}", flush=True)
+                                    page.goto(full_dest, wait_until="domcontentloaded")
+                                    time.sleep(2.5)
+                            except Exception:
+                                pass
+                    else:
+                        print("   🚫 暗号化パスコードが未解除のため、このターゲットのDM送信を安全にスキップします。", flush=True)
+                        try:
+                            page.goto(f"https://x.com/{clean_target}", wait_until="domcontentloaded")
+                            time.sleep(1.5)
+                        except Exception:
+                            pass
+                        return "DM_REJECTED", "パスコード未解除 (暗号化DMロック)"
+
+                # 5. DM UI自体が全く開いていない場合のみ再クリック、それでも表示されない場合はページ再読み込み
+                elapsed = time.time() - start_wait
+                if elapsed > 6.0 and not has_retried_click and not passcode_handled and not _is_dm_ui_open():
+                    has_retried_click = True
+                    print("   🔄 DM画面がまだ開かないため、DMボタンをもう一度クリックします...", flush=True)
                     try:
                         dm_button.click(force=True)
                     except Exception:
                         pass
-                    time.sleep(1.5)
+                    time.sleep(1.2)
+                elif elapsed > 14.0 and not has_reloaded_for_dm and not passcode_handled:
+                    has_reloaded_for_dm = True
+                    print("   🔄 DM画面がまだ表示されないため、ページを再読み込み（リロード）して再確認します...", flush=True)
+                    try:
+                        cur_u = (page.url or "").lower()
+                        page.reload(timeout=25000, wait_until="domcontentloaded")
+                        time.sleep(1.8)
+                        if "/messages" not in cur_u and "/chat" not in cur_u:
+                            self.wait_for_profile_ready(clean_target, timeout=15.0)
+                            for sel in dm_selectors:
+                                loc = page.locator(sel)
+                                if loc.count() > 0:
+                                    for idx in range(loc.count()):
+                                        cand_btn = loc.nth(idx)
+                                        try:
+                                            if cand_btn.is_visible():
+                                                cand_btn.click(force=True)
+                                                break
+                                        except Exception:
+                                            pass
+                                    break
+                            time.sleep(1.5)
+                    except Exception as rel_err:
+                        print(f"   ⚠️ DM画面再読み込み通知: {rel_err}", flush=True)
 
-            time.sleep(0.5)
+                time.sleep(0.4)
 
         if not composer or not composer.is_visible():
-            # 最後の再確認
-            for c_sel in composer_selectors:
-                comp_loc = page.locator(c_sel)
-                if comp_loc.count() > 0 and comp_loc.first.is_visible():
-                    composer = comp_loc.first
-                    break
+            composer = _find_visible_dm_composer()
 
-            if not composer or not composer.is_visible():
-                alt_comp = page.locator('div[role="textbox"], textarea')
-                if alt_comp.count() > 0 and alt_comp.first.is_visible():
-                    composer = alt_comp.first
+        if not composer or not composer.is_visible():
+            print("   🚫 DMテキスト入力欄が表示されません (DM拒否設定 または 読み込みタイムアウト)。")
+            try:
+                close_btn = page.locator('button[aria-label="閉じる"], button[aria-label="Close"], [data-testid="app-bar-close"]')
+                if close_btn.count() > 0 and close_btn.first.is_visible():
+                    close_btn.first.click()
                 else:
-                    print("   🚫 DMテキスト入力欄が表示されません (DM拒否設定 または 読み込みタイムアウト)。")
-                    try:
-                        close_btn = page.locator('button[aria-label="閉じる"], button[aria-label="Close"], [data-testid="app-bar-close"]')
-                        if close_btn.count() > 0 and close_btn.first.is_visible():
-                            close_btn.first.click()
-                        else:
-                            page.keyboard.press("Escape")
-                    except Exception:
-                        pass
-                    return "DM_REJECTED", "入力エリア非活性 (DM拒否またはタイムアウト)"
+                    page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return "DM_REJECTED", "入力エリア非活性 (DM拒否またはタイムアウト)"
 
         # 8. 入力エリアをクリック＆安全・確実な全文章入力 (insert_text)
         c_box = composer.first.bounding_box()
@@ -3298,7 +3371,7 @@ class XBrowserController:
                 return true;
             }''', {"text": clean_text})
             time.sleep(0.5)
-            cur_val = page.evaluate("() => (document.activeElement ? document.activeElement.innerText || document.activeElement.textContent : '')")
+            cur_val = page.evaluate("() => { const el = document.activeElement; if (!el) return ''; return (typeof el.value === 'string') ? el.value : (el.innerText || el.textContent || ''); }")
             if len(str(cur_val).strip()) >= len(clean_text) * 0.7:
                 pasted = True
             else:
@@ -3746,6 +3819,74 @@ class XBrowserController:
 
         return discovered[:max_targets] if max_targets > 0 else discovered
 
+    def _extract_reply_to_handles_from_article(self, tweet, owner_user: str = "", system_names: set = None) -> list[str]:
+        """
+        リプライツイート <article> 内の「返信先: @usernameさん / Replying to @username」領域から
+        返信先ユーザーID（@なし・順序維持・重複除外）を抽出する。
+        元ポストが削除・非表示で親ツイートカードがDOM上に描画されない場合の救済用。
+        """
+        sys_set = {str(s).lower() for s in (system_names or set())}
+        owner_low = (owner_user or "").strip().lstrip("@").lower()
+        handles = []
+        seen_h = set()
+        try:
+            raw_hrefs = tweet.evaluate("""
+                (article) => {
+                    const results = [];
+                    const nodes = Array.from(article.querySelectorAll('div, span'));
+                    for (const el of nodes) {
+                        if (el.closest('[data-testid="tweetText"], [data-testid="User-Name"], [data-testid="card.wrapper"]')) continue;
+                        if (el.querySelector('[data-testid="tweetText"], [data-testid="User-Name"], [data-testid="card.wrapper"], time')) continue;
+                        const rl = el.closest('div[role="link"]');
+                        if (rl && article.contains(rl)) continue;
+                        const txt = (el.innerText || '').trim();
+                        if (!txt || txt.length > 250) continue;
+                        if (!/^(返信先\\s*[:：]?|Replying\\s+to\\b)/i.test(txt)) continue;
+                        const links = Array.from(el.querySelectorAll('a[href]'));
+                        for (const a of links) {
+                            results.push({
+                                href: a.getAttribute('href') || '',
+                                text: (a.innerText || '').trim()
+                            });
+                        }
+                    }
+                    return results;
+                }
+            """)
+            for item in (raw_hrefs or []):
+                if not isinstance(item, dict):
+                    continue
+                href = str(item.get("href") or "").strip()
+                ltxt = str(item.get("text") or "").strip()
+                cand = ""
+                if href:
+                    path = href
+                    if path.startswith("https://x.com/"):
+                        path = path[len("https://x.com"):]
+                    elif path.startswith("https://twitter.com/"):
+                        path = path[len("https://twitter.com"):]
+                    if (
+                        path.startswith("/")
+                        and not path.startswith("/i/")
+                        and "/status/" not in path
+                        and not path.startswith("/search")
+                        and not path.startswith("/hashtag")
+                    ):
+                        seg = path.strip("/").split("/")[0].split("?")[0].split("#")[0]
+                        cand = normalize_screen_name(seg)
+                if not cand and ltxt.startswith("@"):
+                    cand = normalize_screen_name(ltxt)
+                if not cand:
+                    continue
+                low = cand.lower()
+                if low == owner_low or low in sys_set or low in seen_h:
+                    continue
+                seen_h.add(low)
+                handles.append(cand)
+        except Exception:
+            pass
+        return handles
+
     def collect_targets_from_replies(
         self,
         replies_url: str,
@@ -3754,10 +3895,13 @@ class XBrowserController:
         should_skip_fn=None,
         exclude_owner: bool = True,
         out_parent_candidates: list = None,
+        include_reply_to_mentions: bool = False,
     ) -> list[dict]:
         """
         2. リプライURLからターゲットをスクロール収集 (例: https://x.com/tplt0rN3nM15069/with_replies)
         - /with_replies URL の場合（exclude_owner=True）: 登録アカウント本人（返信主側）は除外し、親ポスト側（@ririka__hana 等）のみを抽出
+        - include_reply_to_mentions=True の場合（DM/フォロー等プロフィール遷移アクション）:
+          親ポストが削除/非表示で本人リプライの「返信先: @〇〇さん」だけが残っている場合も @〇〇 をターゲットとして救済抽出
         - out_parent_candidates が渡された場合: ホップ用の親ポストURL候補（DBスキップ済み含む）を順序付きで追記
         """
         page = self.ensure_page()
@@ -3794,6 +3938,7 @@ class XBrowserController:
 
         discovered = []
         seen_users = set()
+        seen_db_users = set()
         seen_dom = set()
         system_names = {"home", "explore", "notifications", "messages", "search", "settings", "i", "privacy", "tos", "elonmusk"}
 
@@ -3880,6 +4025,45 @@ class XBrowserController:
                     if exclude_owner and is_profile_replies and clean_u.lower() == owner_user:
                         if out_parent_candidates is not None and tweet_url and tweet_url not in fallback_owner_status_urls:
                             fallback_owner_status_urls.append(tweet_url)
+                        if include_reply_to_mentions:
+                            owner_dom_key = f"owner_reply:{tweet_url.lower()}" if tweet_url else ""
+                            if owner_dom_key and owner_dom_key in seen_dom:
+                                continue
+                            reply_handles = self._extract_reply_to_handles_from_article(
+                                tweet,
+                                owner_user=owner_user,
+                                system_names=system_names,
+                            )
+                            if owner_dom_key:
+                                seen_dom.add(owner_dom_key)
+                            elif reply_handles:
+                                fallback_dom_key = f"owner_reply_to:{clean_u.lower()}:{','.join(h.lower() for h in reply_handles)}"
+                                if fallback_dom_key in seen_dom:
+                                    continue
+                                seen_dom.add(fallback_dom_key)
+                            for reply_u in reply_handles:
+                                r_low = reply_u.lower()
+                                if r_low in seen_users or r_low in seen_db_users:
+                                    continue
+                                if should_skip_fn and should_skip_fn(reply_u, ""):
+                                    seen_db_users.add(r_low)
+                                    scroll_db_skipped += 1
+                                    total_db_skipped += 1
+                                    continue
+                                seen_users.add(r_low)
+                                discovered.append({
+                                    "screen_name": reply_u,
+                                    "tweet_url": "",
+                                    "display_name": "",
+                                    "tweet_text": "",
+                                    "parent_tweet_text": "",
+                                    "is_reply": False
+                                })
+                                print(f"   💬 [返信先抽出] 元ポスト非表示/削除のため「返信先」からターゲット抽出: @{reply_u}")
+                                if max_targets > 0 and len(discovered) >= max_targets:
+                                    break
+                            if max_targets > 0 and len(discovered) >= max_targets:
+                                break
                         continue
 
                     dom_key = (tweet_url or clean_u).lower()
@@ -3896,6 +4080,7 @@ class XBrowserController:
                         continue
 
                     if should_skip_fn and should_skip_fn(clean_u, tweet_url):
+                        seen_db_users.add(clean_u.lower())
                         scroll_db_skipped += 1
                         total_db_skipped += 1
                         continue
