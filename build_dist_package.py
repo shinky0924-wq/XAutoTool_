@@ -447,6 +447,7 @@ silent_vbs = os.path.join(out_dir, "ツール起動_CMDなし.vbs")
 launch_bat = os.path.join(out_dir, "ツール起動.bat")
 bypass_bat = os.path.join(out_dir, "ツール起動_ブロック回避版.bat")
 debug_bat = os.path.join(out_dir, "【エラー確認用】コマンドプロンプトで起動.bat")
+chrome_bat = os.path.join(out_dir, "chrome_launcher.bat")
 
 launch_bat_content = (
     "@echo off\r\n"
@@ -723,12 +724,144 @@ silent_vbs_content = (
     "End If\r\n"
 )
 
+chrome_bat_content = (
+    "@echo off\r\n"
+    "setlocal\r\n"
+    "title Chrome Custom Profile Launcher (chrome_launcher)\r\n"
+    'set "BASE_DIR=%~dp0"\r\n'
+    'pushd "%BASE_DIR%" >nul 2>&1 || cd /d "%BASE_DIR%"\r\n'
+    'set "X_AUTO_DM_BASE_DIR=%BASE_DIR%"\r\n'
+    'if exist "%BASE_DIR%_internal\\ms-playwright" set "PLAYWRIGHT_BROWSERS_PATH=%BASE_DIR%_internal\\ms-playwright"\r\n'
+    "\r\n"
+    'set "TARGET_PY="\r\n'
+    'if exist "%BASE_DIR%chrome_launcher.py" set "TARGET_PY=%BASE_DIR%chrome_launcher.py"\r\n'
+    'if not defined TARGET_PY if exist "%BASE_DIR%_app\\chrome_launcher.py" set "TARGET_PY=%BASE_DIR%_app\\chrome_launcher.py"\r\n'
+    "\r\n"
+    "if not defined TARGET_PY goto :TryExeFallback\r\n"
+    "\r\n"
+    "call :FindPythonCli\r\n"
+    "if %errorlevel%==0 goto :RunPyCli\r\n"
+    "\r\n"
+    ":TryExeFallback\r\n"
+    'if not exist "%BASE_DIR%x_auto_dm_gui.exe" goto :NoLauncher\r\n'
+    'reg query "HKLM\\SYSTEM\\CurrentControlSet\\Control\\CI\\Policy" /v VerifiedAndReputablePolicyState 2>nul | find "0x1" >nul\r\n'
+    "if %errorlevel%==0 goto :BlockedBySac\r\n"
+    'set "PROF_ARG=%~1"\r\n'
+    'if not "%PROF_ARG%"=="" goto :LaunchExeProfile\r\n'
+    "echo ========================================================\r\n"
+    "echo  Chrome Custom Profile Launcher (EXE Mode)\r\n"
+    "echo ========================================================\r\n"
+    'set /p "PROF_ARG=Enter profile / account ID (e.g. wqwq1320): "\r\n'
+    'if "%PROF_ARG%"=="" goto :NoProfileEntered\r\n'
+    ":LaunchExeProfile\r\n"
+    'echo Launching Chrome profile "%PROF_ARG%" via x_auto_dm_gui.exe...\r\n'
+    "echo Please log in to X in Chrome, then close the Chrome window.\r\n"
+    'start /wait "" /D "%BASE_DIR%" "%BASE_DIR%x_auto_dm_gui.exe" --cli-profile "%PROF_ARG%"\r\n'
+    "if errorlevel 1 goto :ExeFailed\r\n"
+    'echo Done. Profile saved in browser_profiles\\%PROF_ARG%\r\n'
+    "popd >nul 2>&1\r\n"
+    "pause\r\n"
+    "exit /b 0\r\n"
+    "\r\n"
+    ":RunPyCli\r\n"
+    "chcp 65001 >nul\r\n"
+    "set PYTHONIOENCODING=utf-8\r\n"
+    "set PYTHONUTF8=1\r\n"
+    'if "%PY_ARG%"=="" goto :RunPyCliNoArg\r\n'
+    '"%PY%" %PY_ARG% "%TARGET_PY%" %*\r\n'
+    "goto :AfterPyCli\r\n"
+    ":RunPyCliNoArg\r\n"
+    '"%PY%" "%TARGET_PY%" %*\r\n'
+    ":AfterPyCli\r\n"
+    "popd >nul 2>&1\r\n"
+    "pause\r\n"
+    "exit /b 0\r\n"
+    "\r\n"
+    ":BlockedBySac\r\n"
+    "echo ========================================================\r\n"
+    "echo  [INFO] Smart App Control blocked EXE, and Python is not installed.\r\n"
+    "echo  Run tool launcher once to install signed Python 3.12,\r\n"
+    "echo  or launch from GUI after Python setup.\r\n"
+    "echo ========================================================\r\n"
+    "popd >nul 2>&1\r\n"
+    "pause\r\n"
+    "exit /b 1\r\n"
+    "\r\n"
+    ":NoProfileEntered\r\n"
+    "echo [ERROR] Profile name was not entered.\r\n"
+    "popd >nul 2>&1\r\n"
+    "pause\r\n"
+    "exit /b 1\r\n"
+    "\r\n"
+    ":ExeFailed\r\n"
+    "echo ========================================================\r\n"
+    "echo  [ERROR] Failed to launch via x_auto_dm_gui.exe.\r\n"
+    "echo  Please check Chrome installation or launch from GUI.\r\n"
+    "echo ========================================================\r\n"
+    "popd >nul 2>&1\r\n"
+    "pause\r\n"
+    "exit /b 1\r\n"
+    "\r\n"
+    ":NoLauncher\r\n"
+    "echo ========================================================\r\n"
+    "echo  [ERROR] Python or chrome_launcher.py was not found.\r\n"
+    "echo  On another PC without Python, launch x_auto_dm_gui.exe\r\n"
+    "echo  and click the [Chrome Profile Launcher] button in GUI.\r\n"
+    "echo ========================================================\r\n"
+    "popd >nul 2>&1\r\n"
+    "pause\r\n"
+    "exit /b 1\r\n"
+    "\r\n"
+    ":FindPythonCli\r\n"
+    'set "PY="\r\n'
+    'set "PY_ARG="\r\n'
+    'if exist "%BASE_DIR%.venv\\Scripts\\python.exe" call :TryPyCli "%BASE_DIR%.venv\\Scripts\\python.exe" ""\r\n'
+    'if not defined PY if exist "%BASE_DIR%venv\\Scripts\\python.exe" call :TryPyCli "%BASE_DIR%venv\\Scripts\\python.exe" ""\r\n'
+    'if not defined PY if exist "%LocalAppData%\\Programs\\Python\\Python314\\python.exe" call :TryPyCli "%LocalAppData%\\Programs\\Python\\Python314\\python.exe" ""\r\n'
+    'if not defined PY if exist "%LocalAppData%\\Programs\\Python\\Python313\\python.exe" call :TryPyCli "%LocalAppData%\\Programs\\Python\\Python313\\python.exe" ""\r\n'
+    'if not defined PY if exist "%LocalAppData%\\Programs\\Python\\Python312\\python.exe" call :TryPyCli "%LocalAppData%\\Programs\\Python\\Python312\\python.exe" ""\r\n'
+    'if not defined PY if exist "%LocalAppData%\\Programs\\Python\\Python311\\python.exe" call :TryPyCli "%LocalAppData%\\Programs\\Python\\Python311\\python.exe" ""\r\n'
+    'if not defined PY if exist "%LocalAppData%\\Programs\\Python\\Python310\\python.exe" call :TryPyCli "%LocalAppData%\\Programs\\Python\\Python310\\python.exe" ""\r\n'
+    'if not defined PY if exist "C:\\Python313\\python.exe" call :TryPyCli "C:\\Python313\\python.exe" ""\r\n'
+    'if not defined PY if exist "C:\\Python312\\python.exe" call :TryPyCli "C:\\Python312\\python.exe" ""\r\n'
+    'if not defined PY if exist "C:\\Python311\\python.exe" call :TryPyCli "C:\\Python311\\python.exe" ""\r\n'
+    'if not defined PY if exist "%ProgramFiles%\\Python313\\python.exe" call :TryPyCli "%ProgramFiles%\\Python313\\python.exe" ""\r\n'
+    'if not defined PY if exist "%ProgramFiles%\\Python312\\python.exe" call :TryPyCli "%ProgramFiles%\\Python312\\python.exe" ""\r\n'
+    'if not defined PY call :TryPyCli "py" "-3.14"\r\n'
+    'if not defined PY call :TryPyCli "py" "-3.13"\r\n'
+    'if not defined PY call :TryPyCli "py" "-3.12"\r\n'
+    'if not defined PY call :TryPyCli "py" "-3.11"\r\n'
+    'if not defined PY call :TryPyCli "py" "-3"\r\n'
+    'if not defined PY call :TryPyCli "py" ""\r\n'
+    'if not defined PY call :TryPyCli "python" ""\r\n'
+    "if not defined PY exit /b 1\r\n"
+    "exit /b 0\r\n"
+    "\r\n"
+    ":TryPyCli\r\n"
+    'set "_CAND=%~1"\r\n'
+    'set "_CARG=%~2"\r\n'
+    'if not "%_CARG%"=="" goto :TryPyCliArg\r\n'
+    '"%_CAND%" -c "import sys; sys.exit(0)" >nul 2>&1\r\n'
+    'if %errorlevel%==0 set "PY=%_CAND%"\r\n'
+    "exit /b 0\r\n"
+    ":TryPyCliArg\r\n"
+    '"%_CAND%" %_CARG% -c "import sys; sys.exit(0)" >nul 2>&1\r\n'
+    "if %errorlevel%==0 goto :TryPyCliSetArg\r\n"
+    "exit /b 0\r\n"
+    ":TryPyCliSetArg\r\n"
+    'set "PY=%_CAND%"\r\n'
+    'set "PY_ARG=%_CARG%"\r\n'
+    "exit /b 0\r\n"
+)
+
 with open(launch_bat, "wb") as f:
     f.write(launch_bat_content.encode("ascii"))
 with open(bypass_bat, "wb") as f:
     f.write(bypass_bat_content.encode("ascii"))
 with open(debug_bat, "wb") as f:
     f.write(debug_bat_content.encode("ascii"))
+with open(chrome_bat, "wb") as f:
+    f.write(chrome_bat_content.encode("ascii"))
 with open(silent_vbs, "w", encoding="utf-16", newline="") as f:
     f.write(silent_vbs_content)
 
@@ -752,7 +885,7 @@ with open(readme_txt, "w", encoding="utf-8") as f:
    ・ 「ツール起動.bat」         ← 初回セットアップや自動判定が必要な場合用（起動後CMDは自動で閉じます）
    ・ 「x_auto_dm_gui.exe」      ← スマート アプリ コントロール無効環境ではこれ単体で起動可能
    ※ ZIPのまま中を開かず、必ず右クリック「すべて展開」したフォルダ内で起動してください。
-   ※ 手動ログイン用ブラウザもGUI内の「👤 Chromeプロファイル起動」ボタンから直接使えます。
+   ※ 手動ログイン用ブラウザは「chrome_launcher.bat」またはGUI内の「👤 Chromeプロファイル起動」ボタンから直接使えます。
 
 【スマート アプリ コントロール (Device Guard) でEXEがブロックされる場合】
   Windows 11 の「スマート アプリ コントロール」が有効なPCでは、証明書のない
@@ -823,11 +956,12 @@ try:
         names = set(zf.namelist())
         has_exe = any(n.endswith("/x_auto_dm_gui.exe") for n in names)
         has_bat = any(n.endswith("/ツール起動.bat") for n in names)
+        has_chrome_bat = any(n.endswith("/chrome_launcher.bat") for n in names)
         has_vbs = any(n.endswith("/ツール起動_CMDなし.vbs") for n in names)
         has_app = any(n.endswith("/_app/gui_launcher.py") for n in names)
         has_ss = any("/スクショフォルダ/" in n for n in names)
-        if not (has_exe and has_bat and has_vbs and has_app and has_ss):
-            raise RuntimeError("ZIP内に必要ファイル (x_auto_dm_gui.exe / ツール起動.bat / ツール起動_CMDなし.vbs / _app/gui_launcher.py / スクショフォルダ) が不足しています。")
+        if not (has_exe and has_bat and has_chrome_bat and has_vbs and has_app and has_ss):
+            raise RuntimeError("ZIP内に必要ファイル (x_auto_dm_gui.exe / ツール起動.bat / chrome_launcher.bat / ツール起動_CMDなし.vbs / _app/gui_launcher.py / スクショフォルダ) が不足しています。")
 
     os.replace(zip_tmp, zip_dest)
     print(f"   ✅ 最新ZIP圧縮が完了しました (サイズ: {os.path.getsize(zip_dest):,} bytes)")
@@ -857,6 +991,7 @@ print(r"""
    ├── ツール起動_CMDなし.vbs                 ← ★黒いCMDゼロ！アプリ画面だけ即起動(推奨)
    ├── ツール起動.bat                         ← 自動判定・初回ライブラリ自動導入対応
    ├── ツール起動_ブロック回避版.bat          ← Device Guard有効PC向けの直接起動
+   ├── chrome_launcher.bat                    ← 正規Chrome手動ログインプロファイル起動
    ├── 【エラー確認用】コマンドプロンプトで起動.bat ← トラブル確認用
    ├── x_auto_dm_gui.exe                      ← 単一EXE (SAC無効PC / 署名済み環境用)
    ├── BUILD_INFO.txt                         ← ビルド日時・収録ファイル情報
