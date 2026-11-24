@@ -1134,8 +1134,16 @@ class AppLauncherGUI:
             self.tree_urls.insert("", tk.END, values=("フォローURL", u, ""))
 
         # 文面＆AIプロンプトテキスト表示
+        try:
+            preview_acc_set = self.config_mgr.load_account_settings("", target_path_override=name_path)
+        except Exception:
+            preview_acc_set = {}
+        p_eng = preview_acc_set.get("ai_engine", "gemini")
+        p_mod = str(preview_acc_set.get("ai_model", "") or "").strip()
+        p_fb = str(preview_acc_set.get("ai_fallback_models", "") or "").strip()
         self.txt_messages.delete("1.0", tk.END)
         self.txt_messages.insert(tk.END, f"=== 🤖 AIプロンプト ({self.current_target_file_name}) ===\n")
+        self.txt_messages.insert(tk.END, f"AIエンジン: {p_eng} | 固定モデル: {p_mod or '(空欄: 既定自動)'} | 自動切替: {p_fb or '自動'}\n\n")
         self.txt_messages.insert(tk.END, f"【キャラ設定】\n{self.ai_prompt_config.get('character', '') or '(未設定)'}\n\n")
         self.txt_messages.insert(tk.END, f"【口調・文体ルール】\n{self.ai_prompt_config.get('tone_style', '') or '(未設定)'}\n\n")
         self.txt_messages.insert(tk.END, f"【プロンプト（指示）】\n{self.ai_prompt_config.get('instruction', '') or '(未設定)'}\n\n")

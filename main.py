@@ -529,6 +529,29 @@ def select_ready_first_candidate(candidates: list[tuple[float, int, dict]], now_
     return min(candidates, key=lambda x: (0 if x[0] <= now_ts else 1, x[0], x[1]))
 
 
+def compute_effective_ready_at(
+    normal_ready_at: float,
+    auto_delete_cfg: dict,
+    acc_db_mgr: DatabaseManager,
+    now_ts: float = None,
+) -> tuple[float, bool]:
+    """
+    通常周回予定時刻(normal_ready_at)と自動削除キュー最短予定時刻を比較し、
+    (実効起動予定時刻, 削除専用早期起動フラグ) を返す。
+    """
+    now = float(now_ts) if now_ts is not None else time.time()
+    if not isinstance(auto_delete_cfg, dict) or acc_db_mgr is None:
+        return normal_ready_at, False
+    key_map = (("follow", "FOLLOW"), ("like", "LIKE"), ("reply", "REPLY"), ("quote", "QUOTE"))
+    enabled_acts = [db_act for cfg_k, db_act in key_map if (auto_delete_cfg.get(cfg_k) or {}).get("enabled")]
+    if not enabled_acts:
+        return normal_ready_at, False
+    earliest_del = acc_db_mgr.get_earliest_pending_delete_ts(enabled_actions=enabled_acts)
+    if earliest_del is not None and normal_ready_at > now and earliest_del < normal_ready_at:
+        return earliest_del, True
+    return normal_ready_at, False
+
+
 def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, account_ready_times: dict = None) -> tuple[float, float]:
     if account_ready_times is None:
         account_ready_times = {}
@@ -598,7 +621,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             return "", raw_id
         return (normalize_screen_name(raw_id) or f"acc_{idx}"), raw_id
 
-    def process_single_account(acc, acc_idx: int, total_acc_count: int, active_slot: int = 1, slot_semaphore=None, skip_interval_wait: bool = False):
+    def process_single_account(acc, acc_idx: int, total_acc_count: int, active_slot: int = 1, slot_semaphore=None, skip_interval_wait: bool = False, delete_only_mode: bool = False):
         nonlocal cycle_executed_count
         def get_acc_val(acc_dict, keywords, default=""):
             for k, val in acc_dict.items():
@@ -657,6 +680,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         block_media = True if low_spec_mode else acc_settings.get("block_media", True)
         active_hours_spec = str(acc_settings.get("active_hours", "") or get_acc_val(acc, ["稼働時間帯", "稼働時間", "営業時間", "実行時間帯", "activehours"], "") or "").strip()
         ai_engine = acc_settings.get("ai_engine", "gemini")
+        ai_model = str(acc_settings.get("ai_model", "") or "").strip()
+        ai_fallback_models = str(acc_settings.get("ai_fallback_models", "") or "").strip()
         ai_dedicated_window = bool(acc_settings.get("ai_dedicated_window", True))
         ai_api_key = acc_settings.get("ai_api_key", "")
         ai_prompt_extra = acc_settings.get("ai_prompt", "")
@@ -764,7 +789,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
         log(f"   ⏰ 稼働時間帯: {active_hours_spec or '24時間 (終日稼働)'}")
         log(f"   ⚡ メディア読込ブロック: {'ON (省メモリ・超高速)' if block_media else 'OFF (通常)'}" + (" | 🪶 低スペ超軽量モード: ON" if low_spec_mode else ""))
         log(f"   スクロール上限: {scroll_limit}回 / 読み込みターゲット件数上限: {target_read_limit}件 / URLリプライ巡回上限: {'全件' if reply_url_loop_limit == 0 else str(reply_url_loop_limit) + '件'} / 親ホップ上限: {reply_parent_hop_limit}回")
-        log(f"   AIエンジン: {ai_engine}")
+        log(f"   AIエンジン: {ai_engine}" + (f" (固定モデル: {ai_model})" if ai_model else " (モデル: 既定自動)") + (f" | フォールバック: {ai_fallback_models}" if ai_fallback_models else " | フォールバック: 自動切替ON"))
         log(f"   AI専用ウィンドウ連携: {'ON (専用ウィンドウ起動・連携)' if ai_dedicated_window else 'OFF (API直接生成)'}")
         log(f"   📋 アクション個別設定 (アカウント名.xlsx「動作設定」シート準拠):")
         action_label_map = {
@@ -789,9 +814,37 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 log(f"      ・{act_title}: モード=[{act_mode_str}], 間隔={a_cfg.get('min_interval', 0):.0f}〜{a_cfg.get('max_interval', 0):.0f}秒, 連続={a_cfg.get('min_batch', 1)}〜{a_cfg.get('max_batch', 1)}件, AI生成={ai_flag_lbl}, いいね={like_flag_lbl}, フォロー={follow_flag_lbl}")
         if not active_action_jobs:
             log("      ・⚠️ 有効なアクションがありません（すべてOFF設定）")
+        auto_delete_cfg = acc_settings.get("auto_delete", {}) or {}
+        try:
+            db_mgr.sync_pending_auto_delete_schedules(auto_delete_cfg)
+        except Exception:
+            pass
+        auto_del_labels = [
+            ("follow", "FOLLOW", "フォロー解除"),
+            ("like", "LIKE", "いいね解除"),
+            ("reply", "REPLY", "リプライ削除"),
+            ("quote", "QUOTE", "引用RT削除"),
+        ]
+        enabled_del_summaries = []
+        for d_key, d_act, d_lbl in auto_del_labels:
+            dc = auto_delete_cfg.get(d_key) or {}
+            if dc.get("enabled"):
+                u_lbl = dc.get("unit", "分")
+                m_lim = int(dc.get("max_per_run", 10) or 0)
+                lim_str = "全件" if m_lim == 0 else f"最大{m_lim}件/回"
+                pend_cnt = db_mgr.count_pending_auto_deletes(d_act)
+                enabled_del_summaries.append(
+                    f"{d_lbl}({dc.get('min_delay', 0):g}〜{dc.get('max_delay', 0):g}{u_lbl}/{lim_str}/待機:{pend_cnt}件)"
+                )
+        if enabled_del_summaries:
+            log(f"      ・自動削除・解除: {' | '.join(enabled_del_summaries)}")
+        else:
+            log("      ・自動削除・解除: すべてOFF")
         log(f"      ・DMパスコード: {'登録済み (暗号化DM自動認証有効)' if dm_passcode else '⚠️ 未登録'}")
         log(f"      ・アカウント次回周回待機: {account_min_sec:.0f}秒 〜 {account_max_sec:.0f}秒")
         log(f"      ・ターゲット間ランダム待機: {target_min_sec:.0f}秒 〜 {target_max_sec:.0f}秒")
+        if delete_only_mode:
+            log("      ・🧹 [起動モード] 自動削除・解除 期限到来のため削除処理のみ先行実行します")
         log(f"{'='*58}")
 
         # ★ 起動時の待機なし＆周回時個別待機制御（1窓スケジューラ時は待機完了後に呼ばれるためスキップ可）
@@ -858,6 +911,113 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
             # アカウントログイン直後の一時停止チェック (アカウント編集したい場合に対応)
             check_pause_state(f"アカウント @{account_id} ログイン直後")
+
+            def _format_delay_human(delay_sec: float) -> str:
+                sec = max(0, int(round(delay_sec)))
+                if sec < 60:
+                    return f"約{sec}秒後"
+                mins = sec // 60
+                if sec < 3600:
+                    return f"約{mins}分 ({sec}秒) 後"
+                hrs = mins // 60
+                rem_m = mins % 60
+                return f"約{mins}分 ({hrs}時間{rem_m}分 / {sec}秒) 後"
+
+            def enqueue_delete_if_applicable(act_type: str, target_screen_name: str, target_url: str = "", own_post_url: str = "", snippet: str = ""):
+                act_u = str(act_type or "").upper()
+                cfg_key = {"FOLLOW": "follow", "LIKE": "like", "REPLY": "reply", "QUOTE": "quote"}.get(act_u)
+                if not cfg_key:
+                    return None
+                d_cfg = auto_delete_cfg.get(cfg_key) or {}
+                if not d_cfg.get("enabled"):
+                    return None
+                try:
+                    q_info = db_mgr.enqueue_auto_delete(
+                        action_type=act_u,
+                        target_screen_name=target_screen_name,
+                        account_id=account_id,
+                        min_seconds=float(d_cfg.get("min_seconds", 0.0)),
+                        max_seconds=float(d_cfg.get("max_seconds", 0.0)),
+                        target_url=target_url,
+                        own_post_url=own_post_url,
+                        snippet=snippet,
+                    )
+                    if q_info:
+                        act_jp = {"FOLLOW": "フォロー解除", "LIKE": "いいね解除", "REPLY": "リプライ削除", "QUOTE": "引用RT削除"}.get(act_u, act_u)
+                        exec_dt_str = datetime.fromtimestamp(q_info.get("executed_at", time.time())).strftime("%Y/%m/%d %H:%M:%S")
+                        sched_dt_str = datetime.fromtimestamp(q_info["scheduled_delete_at"]).strftime("%Y/%m/%d %H:%M:%S")
+                        delay_label = _format_delay_human(q_info["delay_seconds"])
+                        target_ref = q_info.get("own_post_url") or q_info.get("target_url") or f"@{q_info['target_screen_name']}"
+                        log(f"   🕒 [自動削除予定/{act_jp}] @{q_info['target_screen_name']} | 実行: {exec_dt_str} → 削除予定: {sched_dt_str} ({delay_label}) | 対象: {target_ref}")
+                        db_mgr.mark_history_auto_delete_scheduled(
+                            act_u,
+                            q_info["target_key"],
+                            q_info["scheduled_delete_at"],
+                            is_unlink=(act_u in ("FOLLOW", "LIKE")),
+                        )
+                    return q_info
+                except Exception as q_err:
+                    log(f"   ⚠️ [自動削除予約通知/{act_type}] 予約登録エラー: {q_err}")
+                    return None
+
+            def process_due_auto_deletes(stage_label: str = "") -> int:
+                handled = 0
+                del_specs = [
+                    ("follow", "FOLLOW", "フォロー解除", "[自動解除済]"),
+                    ("like", "LIKE", "いいね解除", "[自動解除済]"),
+                    ("reply", "REPLY", "リプライ削除", "[自動削除済]"),
+                    ("quote", "QUOTE", "引用RT削除", "[自動削除済]"),
+                ]
+                for d_key, db_act, del_lbl, hist_tag in del_specs:
+                    d_cfg = auto_delete_cfg.get(d_key) or {}
+                    if not d_cfg.get("enabled"):
+                        continue
+                    max_run = max(0, int(d_cfg.get("max_per_run", 10) or 0))
+                    due_tasks = db_mgr.get_due_auto_delete_tasks(action_type=db_act, now_ts=time.time(), limit=max_run)
+                    if not due_tasks:
+                        continue
+                    log(f"🧹 [自動{del_lbl}] {stage_label}: 期限到来 {len(due_tasks)}件の処理を開始します...")
+                    for task_idx, task in enumerate(due_tasks, start=1):
+                        check_pause_state(f"自動{del_lbl} ({task_idx}/{len(due_tasks)}) 実行前", browser_ctrl)
+                        t_name = task.get("target_screen_name") or ""
+                        t_url = task.get("target_url") or ""
+                        own_u = task.get("own_post_url") or ""
+                        snip = task.get("snippet") or ""
+                        try:
+                            if db_act == "FOLLOW":
+                                d_st, d_det = browser_ctrl.unfollow_user(t_name)
+                            elif db_act == "LIKE":
+                                d_st, d_det = browser_ctrl.unlike_post(t_name, tweet_url=t_url)
+                            else:
+                                d_st, d_det = browser_ctrl.delete_reply_or_quote(
+                                    db_act,
+                                    clean_account_id,
+                                    own_post_url=own_u,
+                                    target_url=t_url,
+                                    snippet=snip,
+                                )
+                        except Exception as del_err:
+                            d_st, d_det = "FAILED", f"例外: {del_err}"
+
+                        db_mgr.mark_auto_delete_result(task["id"], d_st, error_msg=d_det, retry_delay_sec=180.0)
+                        if d_st in ("DELETED", "ALREADY_REMOVED"):
+                            db_mgr.mark_history_auto_deleted(db_act, task["target_key"], tag=hist_tag)
+                            handled += 1
+                            target_desc = own_u or t_url or f"@{t_name}"
+                            log(f"   ✅ [自動{del_lbl} {d_st}] {target_desc} ({d_det}) [重複防止DBは維持]")
+                        else:
+                            log(f"   ⚠️ [自動{del_lbl}保留] @{t_name} ({d_det}) → 次回以降に安全リトライ")
+                        if task_idx < len(due_tasks):
+                            time.sleep(random.uniform(1.2, 2.5))
+                return handled
+
+            # ログイン直後に期限到来済みの自動削除・解除を実行
+            process_due_auto_deletes("ログイン直後")
+
+            if delete_only_mode:
+                log("🧹 [自動削除専用セッション] 削除処理のみ完了したため、通常アクションをスキップして終了します。")
+                health_mgr.record_success(clean_account_id)
+                return min_sec, max_sec
 
             # AIアクションが有効な場合、専用ウィンドウ連携ONまたはWeb AIエンジン/URL指定時は即座に専用ウィンドウを起動・遷移しておく
             uses_ai_in_jobs = any((a_cfg.get("ai_gen") or a_key.endswith("_ai")) for a_key, _, a_cfg in active_action_jobs)
@@ -1337,42 +1497,39 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             log(f"   🧵 [会話コンテキスト取得] 元ポスト: 「{parent_txt[:35]}...」 / 対象返信: 「{post_txt[:35]}...」")
 
                         custom_p = acc_prompt_setting if acc_ai_prompt_cfg.get("has_sheet") else (acc_prompt_setting or ai_prompt_extra)
-                        use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
-                        if use_win_flow:
-                            ok_ai, ai_res = AIDedicatedWindowManager.generate_and_copy_via_ai_window(
-                                playwright=browser_ctrl.playwright,
-                                post_url=tweet_url,
-                                post_text=post_txt,
-                                engine=ai_engine,
-                                action_type="reply" if kind == "reply" else "quote",
-                                target_name=resolved_disp or target_screen_name,
-                                api_key=ai_api_key,
-                                custom_prompt=custom_p,
-                                headless=False,
-                                base_dir=base_dir,
-                                slot_id=active_slot,
-                                parent_post_text=parent_txt,
-                                prompt_config=acc_ai_prompt_cfg
-                            )
-                        else:
-                            ok_ai, ai_res = AIGenerator.generate_comment(
-                                engine=ai_engine,
-                                post_url=tweet_url,
-                                post_text=post_txt,
-                                action_type="reply" if kind == "reply" else "quote",
-                                target_name=resolved_disp or target_screen_name,
-                                api_key=ai_api_key,
-                                custom_prompt=custom_p,
-                                page=browser_ctrl.page,
-                                parent_post_text=parent_txt,
-                                prompt_config=acc_ai_prompt_cfg
-                            )
+                        ok_ai, ai_res, used_ai_label = AIGenerator.generate_comment_with_fallback(
+                            engine=ai_engine,
+                            post_url=tweet_url,
+                            post_text=post_txt,
+                            action_type="reply" if kind == "reply" else "quote",
+                            target_name=resolved_disp or target_screen_name,
+                            api_key=ai_api_key,
+                            custom_prompt=custom_p,
+                            playwright=browser_ctrl.playwright,
+                            page=browser_ctrl.page,
+                            use_dedicated_window=ai_dedicated_window,
+                            base_dir=base_dir,
+                            slot_id=active_slot,
+                            headless=False,
+                            parent_post_text=parent_txt,
+                            prompt_config=acc_ai_prompt_cfg,
+                            model_name=ai_model,
+                            fallback_spec=ai_fallback_models,
+                            logger=log
+                        )
                         if ok_ai and ai_res and ai_res.strip():
-                            prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if use_win_flow else "🤖 [AI生成成功"
-                            log(f"   {prefix_icon}/{ai_engine}] 「{ai_res.strip()[:45]}...」")
+                            prim_spec_eng, prim_spec_mod, prim_spec_ov = AIGenerator.parse_engine_list(ai_engine, ai_model)[0]
+                            prim_norm, _ = AIGenerator.resolve_engine_and_url(prim_spec_eng, prim_spec_ov or ai_api_key)
+                            prim_lbl = f"{prim_norm} ({prim_spec_mod})" if prim_spec_mod else prim_norm
+                            if used_ai_label != prim_lbl:
+                                prefix_icon = "🔄 [AI自動切替生成成功"
+                            else:
+                                use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
+                                prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if use_win_flow else "🤖 [AI生成成功"
+                            log(f"   {prefix_icon}/{used_ai_label}] 「{ai_res.strip()[:45]}...」")
                             return ai_res.strip()
                         else:
-                            log(f"   ⚠️ AI生成フォールバック (理由: {ai_res}) → 定型テンプレートを使用します")
+                            log(f"   ⚠️ AI生成フォールバック (全候補失敗 / 最終理由: {ai_res}) → 定型テンプレートを使用します")
                     except Exception as ai_e:
                         log(f"   ⚠️ AI生成通知 ({ai_e}) → 定型テンプレートを使用します")
 
@@ -1492,6 +1649,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 log(f"   ❤️ [連動いいね結果] {l_st} ({l_det})")
                                 eff_like_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or like_url) or like_url
                                 db_mgr.record_sent(target_screen_name, account_id, "LIKE", l_st, l_det, target_url=eff_like_url)
+                                if l_st == "SUCCESS":
+                                    enqueue_delete_if_applicable("LIKE", target_screen_name, target_url=eff_like_url)
                         except Exception as l_err:
                             log(f"   ⚠️ [連動いいね通知] @{target_screen_name} のいいね実行中にエラー: {l_err}")
                     if do_follow and not db_mgr.is_user_unavailable(target_screen_name):
@@ -1503,6 +1662,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 f_st, f_det = browser_ctrl.follow_user(target_screen_name)
                                 log(f"   👤 [連動フォロー結果] {f_st} ({f_det})")
                                 db_mgr.record_sent(target_screen_name, account_id, "FOLLOW", f_st, f_det)
+                                if f_st == "SUCCESS":
+                                    enqueue_delete_if_applicable("FOLLOW", target_screen_name)
                         except Exception as f_err:
                             log(f"   ⚠️ [連動フォロー通知] @{target_screen_name} のフォロー実行中にエラー: {f_err}")
 
@@ -1512,6 +1673,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         log(f"   👤 [フォロー結果] {st} ({det})")
                         get_target_name()
                         db_mgr.record_sent(target_screen_name, account_id, "FOLLOW", st, det, target_url=target_tweet_url)
+                        if st == "SUCCESS":
+                            enqueue_delete_if_applicable("FOLLOW", target_screen_name, target_url=target_tweet_url)
                         status_label = "フォロー済" if st in ["SUCCESS", "ALREADY_FOLLOWING"] else f"フォロー:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st in ["SUCCESS", "ALREADY_FOLLOWING"]:
@@ -1527,6 +1690,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         get_target_name()
                         eff_like_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
                         db_mgr.record_sent(target_screen_name, account_id, "LIKE", st, det, target_url=eff_like_url)
+                        if st == "SUCCESS":
+                            enqueue_delete_if_applicable("LIKE", target_screen_name, target_url=eff_like_url)
                         status_label = "いいね済" if st in ["SUCCESS", "ALREADY_LIKED"] else f"いいね:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st in ["SUCCESS", "ALREADY_LIKED"]:
@@ -1548,9 +1713,12 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         st, det = browser_ctrl.send_reply(target_screen_name, rep_msg, tweet_url=target_tweet_url)
                         log(f"   💬 [リプライ結果] {st} ({det})")
                         eff_rep_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
+                        own_rep_url = normalize_tweet_url(getattr(browser_ctrl, "last_created_post_url", "") or "")
                         if eff_rep_url:
                             target_tweet_url = eff_rep_url
                         db_mgr.record_sent(target_screen_name, account_id, "REPLY", st, rep_msg[:40] if st == "SUCCESS" else det, target_url=eff_rep_url)
+                        if st == "SUCCESS":
+                            enqueue_delete_if_applicable("REPLY", target_screen_name, target_url=eff_rep_url, own_post_url=own_rep_url, snippet=preview_log[:120])
                         status_label = "リプライ完了" if st == "SUCCESS" else f"リプライ:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st == "SUCCESS":
@@ -1611,9 +1779,12 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         st, det = browser_ctrl.quote_tweet(target_screen_name, q_msg, tweet_url=target_tweet_url)
                         log(f"   🔁 [引用RT結果] {st} ({det})")
                         eff_quote_url = normalize_tweet_url(getattr(browser_ctrl, "last_acted_tweet_url", "") or target_tweet_url) or target_tweet_url
+                        own_quote_url = normalize_tweet_url(getattr(browser_ctrl, "last_created_post_url", "") or "")
                         if eff_quote_url:
                             target_tweet_url = eff_quote_url
                         db_mgr.record_sent(target_screen_name, account_id, "QUOTE", st, q_msg[:40] if st == "SUCCESS" else det, target_url=eff_quote_url)
+                        if st == "SUCCESS":
+                            enqueue_delete_if_applicable("QUOTE", target_screen_name, target_url=eff_quote_url, own_post_url=own_quote_url, snippet=preview_log[:120])
                         status_label = "引用RT完了" if st == "SUCCESS" else f"引用RT:{st}"
                         config_mgr.update_target_status(target_screen_name, status_label, target_path_override=acc_target_path)
                         if st == "SUCCESS":
@@ -1671,6 +1842,11 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         browser_ctrl.start()
                     except Exception as se:
                         log(f"   ⚠️ ブラウザ再起動エラー: {se}")
+
+                try:
+                    process_due_auto_deletes("待機終了後")
+                except Exception:
+                    pass
 
             total_actions_performed = 0
             batch_cooldown_pending = None
@@ -1810,6 +1986,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         log("ℹ️ 有効なターゲットが見つかりませんでした（サンプル/ダミーターゲットは除外）。再読み込み後も取得できなかったため安全に終了します。")
 
             if not session_failed:
+                try:
+                    process_due_auto_deletes("セッション終了前")
+                except Exception:
+                    pass
                 health_mgr.record_success(clean_account_id)
 
         except Exception as e:
@@ -1848,10 +2028,11 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             log(f"   ✨ メモリ完全開放完了（スロット{active_slot}解放 / 低スペックPC対応）")
             set_current_logger(None)
 
-            # このアカウントの次回実行可能時刻（アカウント固有の実行間隔後）を記録
-            next_interval = random.uniform(account_min_sec, account_max_sec)
-            account_ready_times[clean_account_id] = time.time() + next_interval
-            log(f"⏰ 次回のアカウント [{account_id}] 実行可能時間: 約{next_interval:.1f}秒後 (実行間隔設定: {account_min_sec:.0f}秒 〜 {account_max_sec:.0f}秒)")
+            # 通常実行完了時のみ次回周回待機時刻を更新（自動削除専用起動では本来の通常周回時刻を維持）
+            if not delete_only_mode:
+                next_interval = random.uniform(account_min_sec, account_max_sec)
+                account_ready_times[clean_account_id] = time.time() + next_interval
+                log(f"⏰ 次回のアカウント [{account_id}] 実行可能時間: 約{next_interval:.1f}秒後 (実行間隔設定: {account_min_sec:.0f}秒 〜 {account_max_sec:.0f}秒)")
 
     # === 実行モード判定 (1窓〜最大5窓同時並列実行 / 低スペPC超軽量モード時は1窓固定) ===
     env_concurrent = os.environ.get("TOOL_MAX_CONCURRENT", "").strip()
@@ -1887,6 +2068,8 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 "active_hours": ah_spec,
                 "min_sec": min(e_mins) if e_mins else 300.0,
                 "max_sec": max(e_maxs) if e_maxs else 900.0,
+                "auto_delete": acc_s.get("auto_delete", {}),
+                "acc_db": DatabaseManager(get_account_db_path(base_dir, clean_id)),
             })
 
         while pending:
@@ -1895,6 +2078,7 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
             now_ts = time.time()
             eligible = []
             still_pending = []
+            delete_only_flags = {}
             for item in pending:
                 cid = item["clean_id"]
                 is_paused, p_info = health_mgr.is_paused(cid, now_ts=now_ts)
@@ -1906,8 +2090,15 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                 if not ok_hr:
                     log(f"🌙 [稼働時間外スキップ] アカウント [@{cid}] は稼働時間帯 ({item['active_hours']}) 外のため今回スキップします（次回開始まで約{max(1, wait_hr // 60)}分）")
                     continue
-                ready_at = account_ready_times.get(cid, 0.0)
-                eligible.append((ready_at, item["acc_idx"], item))
+                normal_ready_at = account_ready_times.get(cid, 0.0)
+                eff_ready_at, is_del_only = compute_effective_ready_at(
+                    normal_ready_at,
+                    item.get("auto_delete") or {},
+                    item.get("acc_db"),
+                    now_ts=now_ts,
+                )
+                delete_only_flags[(cid, item["acc_idx"])] = is_del_only
+                eligible.append((eff_ready_at, item["acc_idx"], item))
                 still_pending.append(item)
 
             pending = still_pending
@@ -1916,15 +2107,26 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
 
             # 準備完了済み (ready_at <= now) を最優先。無ければ最短待ち時刻のアカウントを選択
             chosen_ready_at, chosen_idx, chosen_item = select_ready_first_candidate(eligible, now_ts)
+            chosen_is_del_only = bool(delete_only_flags.get((chosen_item["clean_id"], chosen_idx), False))
             remaining_wait = chosen_ready_at - time.time()
             if remaining_wait > 0:
-                log(f"⏳ [最短待ち優先] 実行可能な他アカウントがないため、最短待機アカウント [@{chosen_item['clean_id']}] の準備完了まで {remaining_wait:.1f} 秒待機します...")
-                wait_for_account_interval(chosen_item["clean_id"], remaining_wait, chosen_item["min_sec"], chosen_item["max_sec"], base_dir, f"第{cycle_count}周回 最短待ち優先")
+                wait_ctx = f"第{cycle_count}周回 自動削除期限待機" if chosen_is_del_only else f"第{cycle_count}周回 最短待ち優先"
+                log(f"⏳ [{'自動削除期限待機' if chosen_is_del_only else '最短待ち優先'}] 実行可能な他アカウントがないため、最短待機アカウント [@{chosen_item['clean_id']}] の{'自動削除予定時刻' if chosen_is_del_only else '準備完了'}まで {remaining_wait:.1f} 秒待機します...")
+                wait_for_account_interval(chosen_item["clean_id"], remaining_wait, chosen_item["min_sec"], chosen_item["max_sec"], base_dir, wait_ctx)
             else:
-                log(f"⚡ [即時起動] アカウント [@{chosen_item['clean_id']}] は準備完了済みのため待ち時間0秒で開始します（残り待機キュー: {len(pending) - 1}件）")
+                log(f"⚡ [{'自動削除即時起動' if chosen_is_del_only else '即時起動'}] アカウント [@{chosen_item['clean_id']}] は準備完了済みのため待ち時間0秒で開始します（残り待機キュー: {len(pending) - 1}件）")
 
-            pending = [it for it in pending if it["clean_id"] != chosen_item["clean_id"] or it["acc_idx"] != chosen_idx]
-            process_single_account(chosen_item["acc"], chosen_idx, total_acc_count, active_slot=1, slot_semaphore=None, skip_interval_wait=True)
+            if not chosen_is_del_only:
+                pending = [it for it in pending if it["clean_id"] != chosen_item["clean_id"] or it["acc_idx"] != chosen_idx]
+            process_single_account(
+                chosen_item["acc"],
+                chosen_idx,
+                total_acc_count,
+                active_slot=1,
+                slot_semaphore=None,
+                skip_interval_wait=True,
+                delete_only_mode=chosen_is_del_only,
+            )
     else:
         log(f"⚡ 【{global_max_concurrent}窓同時並列実行】時間が被ったアカウントは最大{global_max_concurrent}画面まで同時に独立ブラウザ（独立Cookie/独立DB/独立ログ）で並行稼働します。")
         log(f"   ※{global_max_concurrent}枠が埋まっている間に待機時間が到来した場合は、待機キューでスタンバイし、空き枠が出次第0秒即時起動します。")

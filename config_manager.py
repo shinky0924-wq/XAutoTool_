@@ -147,6 +147,61 @@ def is_within_active_hours(spec: str, now_dt: datetime = None) -> tuple[bool, in
             min_wait = diff
     return False, max(1, int(min_wait))
 
+
+def normalize_time_unit(unit_val: str, default_unit: str = "分") -> str:
+    """時間単位文字列を '秒' | '分' | '時間' に正規化"""
+    u = str(unit_val or "").strip().lower()
+    if any(k in u for k in ("秒", "sec")) or u == "s":
+        return "秒"
+    if any(k in u for k in ("時", "hour", "hr")) or u == "h":
+        return "時間"
+    if any(k in u for k in ("分", "min")) or u == "m":
+        return "分"
+    du = str(default_unit or "分").strip().lower()
+    if any(k in du for k in ("秒", "sec")) or du == "s":
+        return "秒"
+    if any(k in du for k in ("時", "hour", "hr")) or du == "h":
+        return "時間"
+    return "分"
+
+
+def parse_delay_to_seconds(val_str, default_unit: str = "分") -> float:
+    """
+    遅延時間文字列（例: '60', '60分', '1.5時間', '30秒', '90m', '2h', '45s'）を秒数へ変換。
+    数値に単位が明記されている場合はその単位を優先し、数値のみの場合は default_unit を適用する。
+    """
+    raw = str(val_str if val_str is not None else "").translate(_FULLWIDTH_TRANS).strip()
+    if not raw:
+        return 0.0
+    m = re.search(r'(\d+(?:\.\d+)?)', raw)
+    if not m:
+        return 0.0
+    try:
+        num = float(m.group(1))
+    except Exception:
+        return 0.0
+    low = raw.lower()
+    if re.search(r'(?:秒|sec|s)\b', low) or "秒" in low:
+        mult = 1.0
+    elif re.search(r'(?:時間|時|hour|hrs|hr|h)\b', low) or "時間" in low or "時" in low:
+        mult = 3600.0
+    elif re.search(r'(?:分|min|mins|m)\b', low) or "分" in low:
+        mult = 60.0
+    else:
+        norm_u = normalize_time_unit(default_unit, "分")
+        mult = 1.0 if norm_u == "秒" else (3600.0 if norm_u == "時間" else 60.0)
+    return max(0.0, num * mult)
+
+
+def _default_auto_delete_settings() -> dict:
+    return {
+        "follow": {"enabled": False, "min_delay": 60.0, "max_delay": 180.0, "unit": "分", "min_seconds": 3600.0, "max_seconds": 10800.0, "max_per_run": 10},
+        "like": {"enabled": False, "min_delay": 60.0, "max_delay": 180.0, "unit": "分", "min_seconds": 3600.0, "max_seconds": 10800.0, "max_per_run": 10},
+        "reply": {"enabled": False, "min_delay": 120.0, "max_delay": 360.0, "unit": "分", "min_seconds": 7200.0, "max_seconds": 21600.0, "max_per_run": 10},
+        "quote": {"enabled": False, "min_delay": 120.0, "max_delay": 360.0, "unit": "分", "min_seconds": 7200.0, "max_seconds": 21600.0, "max_per_run": 10},
+    }
+
+
 class ConfigManager:
     def __init__(self, account_config_path: str = "", target_list_path: str = "", base_dir: str = ""):
         # 1引数のみでディレクトリが渡された場合、または空引数に対応 (例: ConfigManager(self.base_dir))
@@ -394,6 +449,8 @@ class ConfigManager:
             "reply_url_loop_limit": 0,
             "reply_parent_hop_limit": 15,
             "ai_engine": "gemini",
+            "ai_model": "",
+            "ai_fallback_models": "",
             "ai_dedicated_window": True,
             "ai_api_key": "",
             "ai_prompt": "",
@@ -408,7 +465,8 @@ class ConfigManager:
                 "quote": {"enabled": False, "mode": "話題の検索,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": False, "like_enabled": False, "follow_enabled": False},
                 "reply_ai": {"enabled": False, "mode": "検索最新,HOMEおすすめ,トレンド", "min_interval": 180.0, "max_interval": 600.0, "min_batch": 2, "max_batch": 5, "ai_gen": True, "like_enabled": False, "follow_enabled": False},
                 "quote_ai": {"enabled": False, "mode": "ニュース,トレンド", "min_interval": 300.0, "max_interval": 900.0, "min_batch": 1, "max_batch": 3, "ai_gen": True, "like_enabled": False, "follow_enabled": False},
-            }
+            },
+            "auto_delete": _default_auto_delete_settings(),
         }
 
         # 1. fallback_acc から初期ロード (互換性)
@@ -436,6 +494,10 @@ class ConfigManager:
                     except: pass
                 elif "aiエンジン" in kc:
                     res["ai_engine"] = str(v).strip()
+                elif "aiモデル" in kc or kc in ["モデル", "モデル名", "aimodel", "model"]:
+                    res["ai_model"] = str(v).strip()
+                elif any(m in kc for m in ["aiフォールバック", "フォールバック", "予備ai", "予備モデル", "切替ai", "aifallback", "fallback"]):
+                    res["ai_fallback_models"] = str(v).strip()
                 elif "メディア" in kc:
                     res["block_media"] = str(v).strip().lower() not in ["0", "false", "off", "無効"]
                 elif any(m in kc for m in ["稼働時間帯", "稼働時間", "営業時間", "実行時間帯", "activehours", "activehour"]):
@@ -450,6 +512,7 @@ class ConfigManager:
                 elif "引用リツイートai生成" in kc: res["actions"]["quote_ai"]["enabled"] = s_on
 
         # 2. アカウント専用Excel (例: wqwq1320.xlsx) の「動作設定」シートから優先読込
+        found_auto_delete_section = False
         if target_path and os.path.exists(target_path):
             try:
                 wb = self._safe_load_workbook(target_path, read_only=True)
@@ -461,13 +524,35 @@ class ConfigManager:
                 if op_sheet:
                     rows = list(op_sheet.iter_rows(values_only=True))
                     col_map = None
+                    auto_del_col_map = None
                     for r in rows:
                         if not r or not any(r): continue
                         col0 = str(r[0] or "").strip()
                         col0_clean = col0.replace(" ", "").replace("　", "").replace("_", "").lower()
 
+                        if "自動削除" in col0 or "自動解除" in col0:
+                            found_auto_delete_section = True
+
                         # 注記・セクション見出し行はアクション誤認を防ぐためスキップ
                         if col0.startswith("※") or col0.startswith("【"):
+                            continue
+
+                        # 自動削除表のヘッダー行を検出して列インデックスを動的マッピング
+                        if col0_clean in ["自動削除アクション", "自動削除", "削除アクション", "自動解除アクション", "autodelete", "autodeleteaction"]:
+                            found_auto_delete_section = True
+                            auto_del_col_map = {}
+                            for idx, h_cell in enumerate(r):
+                                h_clean = str(h_cell or "").replace(" ", "").replace("　", "").replace("_", "").lower()
+                                if any(k in h_clean for k in ["件数", "上限", "perrun", "maxper"]):
+                                    auto_del_col_map["max_per_run"] = idx
+                                elif any(k in h_clean for k in ["単位", "unit"]):
+                                    auto_del_col_map["unit"] = idx
+                                elif any(k in h_clean for k in ["最小", "最短", "mindelay"]):
+                                    auto_del_col_map["min_delay"] = idx
+                                elif any(k in h_clean for k in ["最大", "最長", "maxdelay"]):
+                                    auto_del_col_map["max_delay"] = idx
+                                elif idx > 0 and any(k in h_clean for k in ["自動削除", "自動解除", "on/off", "enabled", "実行", "有効"]):
+                                    auto_del_col_map["enabled"] = idx
                             continue
 
                         # アクション表のヘッダー行を検出して列インデックスを動的マッピング
@@ -494,8 +579,12 @@ class ConfigManager:
                                 elif "フォロー" in h_clean or "follow" in h_clean:
                                     col_map["follow_enabled"] = idx
                             continue
-                        
-                        if len(r) > 1 and r[1] is not None and str(r[1]).strip() != "":
+
+                        is_auto_delete_row = any(m in col0_clean for m in [
+                            "自動削除", "自動解除", "フォロー解除", "いいね解除", "リプライ削除", "引用リツイート削除", "引用rt削除"
+                        ])
+
+                        if not is_auto_delete_row and len(r) > 1 and r[1] is not None and str(r[1]).strip() != "":
                             val1 = str(r[1]).strip()
                             if any(m in col0_clean for m in ["dmパスコード", "パスコード", "暗号化パスコード", "暗号化キー", "dmpin", "dmpasscode", "passcode"]):
                                 res["dm_passcode"] = val1[:-2] if val1.endswith(".0") and val1[:-2].isdigit() else val1
@@ -521,6 +610,10 @@ class ConfigManager:
                                 except: pass
                             elif "aiエンジン" in col0_clean:
                                 res["ai_engine"] = val1
+                            elif "aiモデル" in col0_clean or col0_clean in ["モデル", "モデル名", "aimodel", "model"]:
+                                res["ai_model"] = val1
+                            elif any(m in col0_clean for m in ["aiフォールバック", "フォールバック", "予備ai", "予備モデル", "切替ai", "aifallback", "fallback"]):
+                                res["ai_fallback_models"] = val1
                             elif "ai専用ウィンドウ" in col0_clean:
                                 res["ai_dedicated_window"] = val1.lower() not in ["0", "false", "off", "無効"]
                             elif "aiapiキー" in col0_clean or "接続url" in col0_clean:
@@ -532,9 +625,76 @@ class ConfigManager:
                             elif any(m in col0_clean for m in ["稼働時間帯", "稼働時間", "営業時間", "実行時間帯", "activehours", "activehour"]):
                                 res["active_hours"] = val1
 
+                        def _parse_row_cell(idx, def_val):
+                            if idx is not None and len(r) > idx and r[idx] is not None and str(r[idx]).strip() != "":
+                                return str(r[idx]).strip()
+                            return def_val
+
+                        if is_auto_delete_row and len(r) >= 3:
+                            found_auto_delete_section = True
+                            del_key = None
+                            if "フォロー" in col0_clean or "follow" in col0_clean:
+                                del_key = "follow"
+                            elif "いいね" in col0_clean or "like" in col0_clean:
+                                del_key = "like"
+                            elif "リプライ" in col0_clean or "reply" in col0_clean:
+                                del_key = "reply"
+                            elif "引用" in col0_clean or "quote" in col0_clean:
+                                del_key = "quote"
+
+                            if del_key:
+                                d_cfg = res["auto_delete"][del_key]
+                                if auto_del_col_map is not None:
+                                    idx_en = auto_del_col_map.get("enabled", 2)
+                                    idx_min = auto_del_col_map.get("min_delay", 3)
+                                    idx_max = auto_del_col_map.get("max_delay", 4)
+                                    idx_max_run = auto_del_col_map.get("max_per_run", 5)
+                                    idx_unit = auto_del_col_map.get("unit", 6)
+                                else:
+                                    idx_en, idx_min, idx_max, idx_max_run, idx_unit = 2, 3, 4, 5, 6
+
+                                flag_str = _parse_row_cell(idx_en, "0").lower()
+                                d_cfg["enabled"] = flag_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
+
+                                raw_unit = _parse_row_cell(idx_unit, d_cfg["unit"])
+                                norm_unit = normalize_time_unit(raw_unit, d_cfg["unit"])
+                                d_cfg["unit"] = norm_unit
+
+                                raw_min = _parse_row_cell(idx_min, str(d_cfg["min_delay"]))
+                                raw_max = _parse_row_cell(idx_max, str(d_cfg["max_delay"]))
+                                min_sec = parse_delay_to_seconds(raw_min, default_unit=norm_unit)
+                                max_sec = parse_delay_to_seconds(raw_max, default_unit=norm_unit)
+
+                                try:
+                                    m_min = re.search(r'(\d+(?:\.\d+)?)', str(raw_min).translate(_FULLWIDTH_TRANS))
+                                    min_num = float(m_min.group(1)) if m_min else float(d_cfg["min_delay"])
+                                except Exception:
+                                    min_num = float(d_cfg["min_delay"])
+                                try:
+                                    m_max = re.search(r'(\d+(?:\.\d+)?)', str(raw_max).translate(_FULLWIDTH_TRANS))
+                                    max_num = float(m_max.group(1)) if m_max else float(d_cfg["max_delay"])
+                                except Exception:
+                                    max_num = float(d_cfg["max_delay"])
+
+                                if min_sec > max_sec:
+                                    min_sec, max_sec = max_sec, min_sec
+                                    min_num, max_num = max_num, min_num
+
+                                d_cfg["min_delay"] = min_num
+                                d_cfg["max_delay"] = max_num
+                                d_cfg["min_seconds"] = min_sec
+                                d_cfg["max_seconds"] = max_sec
+
+                                raw_mpr = _parse_row_cell(idx_max_run, str(d_cfg["max_per_run"]))
+                                try:
+                                    d_cfg["max_per_run"] = max(0, int(float(str(raw_mpr).translate(_FULLWIDTH_TRANS))))
+                                except Exception:
+                                    pass
+                            continue
+
                         is_passcode_row = any(m in col0_clean for m in ["パスコード", "passcode", "暗号化", "pin"])
                         act_key = None
-                        if not is_passcode_row:
+                        if not is_passcode_row and not is_auto_delete_row:
                             if "dm" in col0_clean: act_key = "dm"
                             elif "いいね" in col0_clean: act_key = "like"
                             elif "フォロー" in col0_clean: act_key = "follow"
@@ -544,11 +704,6 @@ class ConfigManager:
                             elif "引用" in col0_clean: act_key = "quote"
 
                         if act_key and len(r) >= 2:
-                            def _parse_cell(idx, def_val):
-                                if idx is not None and len(r) > idx and r[idx] is not None and str(r[idx]).strip() != "":
-                                    return str(r[idx]).strip()
-                                return def_val
-
                             if col_map is not None:
                                 idx_mode = col_map.get("mode")
                                 idx_en = col_map.get("enabled", 2 if idx_mode == 1 else 1)
@@ -577,34 +732,153 @@ class ConfigManager:
                                     idx_like, idx_follow = None, None
 
                             if idx_mode is not None:
-                                m_val = _parse_cell(idx_mode, "")
+                                m_val = _parse_row_cell(idx_mode, "")
                                 if m_val:
                                     res["actions"][act_key]["mode"] = m_val
                             elif res["target_mode"]:
                                 res["actions"][act_key]["mode"] = res["target_mode"]
 
-                            flag_str = _parse_cell(idx_en, "1" if res["actions"][act_key]["enabled"] else "0").lower()
+                            flag_str = _parse_row_cell(idx_en, "1" if res["actions"][act_key]["enabled"] else "0").lower()
                             res["actions"][act_key]["enabled"] = flag_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
                             
-                            try: res["actions"][act_key]["min_interval"] = float(_parse_cell(idx_min_i, res["actions"][act_key]["min_interval"]))
+                            try: res["actions"][act_key]["min_interval"] = float(_parse_row_cell(idx_min_i, res["actions"][act_key]["min_interval"]))
                             except: pass
-                            try: res["actions"][act_key]["max_interval"] = float(_parse_cell(idx_max_i, res["actions"][act_key]["max_interval"]))
+                            try: res["actions"][act_key]["max_interval"] = float(_parse_row_cell(idx_max_i, res["actions"][act_key]["max_interval"]))
                             except: pass
-                            try: res["actions"][act_key]["min_batch"] = int(float(_parse_cell(idx_min_b, res["actions"][act_key]["min_batch"])))
+                            try: res["actions"][act_key]["min_batch"] = int(float(_parse_row_cell(idx_min_b, res["actions"][act_key]["min_batch"])))
                             except: pass
-                            try: res["actions"][act_key]["max_batch"] = int(float(_parse_cell(idx_max_b, res["actions"][act_key]["max_batch"])))
+                            try: res["actions"][act_key]["max_batch"] = int(float(_parse_row_cell(idx_max_b, res["actions"][act_key]["max_batch"])))
                             except: pass
-                            ai_str = _parse_cell(idx_ai, "1" if res["actions"][act_key]["ai_gen"] else "0").lower()
+                            ai_str = _parse_row_cell(idx_ai, "1" if res["actions"][act_key]["ai_gen"] else "0").lower()
                             res["actions"][act_key]["ai_gen"] = ai_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
-                            like_str = _parse_cell(idx_like, "1" if res["actions"][act_key].get("like_enabled") else "0").lower()
+                            like_str = _parse_row_cell(idx_like, "1" if res["actions"][act_key].get("like_enabled") else "0").lower()
                             res["actions"][act_key]["like_enabled"] = like_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
-                            follow_str = _parse_cell(idx_follow, "1" if res["actions"][act_key].get("follow_enabled") else "0").lower()
+                            follow_str = _parse_row_cell(idx_follow, "1" if res["actions"][act_key].get("follow_enabled") else "0").lower()
                             res["actions"][act_key]["follow_enabled"] = follow_str in ["1", "1.0", "true", "yes", "on", "実行", "有効", "○", "〇", "o"]
                 wb.close()
             except Exception:
                 pass
 
+            if not found_auto_delete_section:
+                try:
+                    self.ensure_auto_delete_section(target_path)
+                except Exception:
+                    pass
+
         return res
+
+    def ensure_auto_delete_section(self, target_path: str) -> bool:
+        """
+        既存の「<アカウント名>.xlsx」の「動作設定」シートに
+        【実行後の自動削除・解除設定】セクションが無い場合のみ、初期値(すべてOFF=0)で自動追記する。
+        Excel編集中(PermissionError)の場合は安全にスキップする。
+        """
+        if not target_path or not os.path.exists(target_path):
+            return False
+        try:
+            from openpyxl.styles import PatternFill, Font, Alignment, Border, Side
+
+            wb = openpyxl.load_workbook(target_path)
+            op_sheet = None
+            for sname in ["動作設定", "設定", "アクション設定", "基本設定"]:
+                if sname in wb.sheetnames:
+                    op_sheet = wb[sname]
+                    break
+            if op_sheet is None:
+                wb.close()
+                return False
+
+            for r_idx in range(1, op_sheet.max_row + 1):
+                c0 = str(op_sheet.cell(row=r_idx, column=1).value or "").strip()
+                if "自動削除" in c0 or "自動解除" in c0 or "フォロー解除" in c0:
+                    wb.close()
+                    return False
+
+            last_row = 0
+            for r_idx in range(1, op_sheet.max_row + 1):
+                if any(op_sheet.cell(row=r_idx, column=c_idx).value not in (None, "") for c_idx in range(1, 12)):
+                    last_row = r_idx
+
+            spacer_row = last_row + 1
+            sec_row = spacer_row + 1
+            hdr_row = sec_row + 1
+            data_start = hdr_row + 1
+
+            thin = Side(style="thin", color="94A3B8")
+            border_std = Border(top=thin, left=thin, bottom=thin, right=thin)
+            rose_side = Side(style="thin", color="9F1239")
+            border_sec = Border(top=rose_side, left=rose_side, bottom=rose_side, right=rose_side)
+            note_side = Side(style="thin", color="FDA4AF")
+            border_note = Border(top=note_side, left=note_side, bottom=note_side, right=note_side)
+
+            op_sheet.row_dimensions[spacer_row].height = 12
+            op_sheet.row_dimensions[sec_row].height = 26
+            op_sheet.cell(row=sec_row, column=1, value="【実行後の自動削除・解除設定（指定ランダム時間経過後に自動実行）】")
+            for c_idx in range(1, 12):
+                cell = op_sheet.cell(row=sec_row, column=c_idx)
+                cell.fill = PatternFill(start_color="9F1239", end_color="9F1239", fill_type="solid")
+                cell.font = Font(name="Meiryo UI", size=11, bold=True, color="FFFFFF")
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+                cell.border = border_sec
+
+            headers = [
+                ("自動削除アクション", "334155", "FFF1F2", "left", True),
+                ("対象説明", "475569", "F8FAFC", "left", False),
+                ("自動削除(1=ON/0=OFF)", "BE123C", "FFE4E6", "right", True),
+                ("削除までの最小時間", "0F766E", "CCFBF1", "right", True),
+                ("削除までの最大時間", "0F766E", "CCFBF1", "right", True),
+                ("1回の最大削除件数(0=全件)", "0369A1", "E0F2FE", "right", True),
+                ("時間単位(分/秒/時間)", "B45309", "FEF3C7", "right", True),
+                ("備考", "475569", "F8FAFC", "left", False),
+                ("", "475569", "F8FAFC", "left", False),
+                ("", "475569", "F8FAFC", "left", False),
+                ("安全仕様・補足", "475569", "F8FAFC", "left", False),
+            ]
+            op_sheet.row_dimensions[hdr_row].height = 28
+            for c_idx, (h_lbl, h_fill, _, h_align, _) in enumerate(headers, start=1):
+                cell = op_sheet.cell(row=hdr_row, column=c_idx, value=h_lbl)
+                cell.fill = PatternFill(start_color=h_fill, end_color=h_fill, fill_type="solid")
+                cell.font = Font(name="Meiryo UI", size=10, bold=True, color="FFFFFF")
+                cell.alignment = Alignment(horizontal=h_align, vertical="center", wrap_text=True)
+                cell.border = border_std
+
+            matrix = [
+                ["自動削除 フォロー解除", "ツールでフォローした相手を指定ランダム時間後に自動フォロー解除", 0, 60, 180, 10, "分", "ツール実行分のみ対象", "", "", "既存フォローは解除せずツール履歴(follow)のみ解除（1=ON / 0=OFF）"],
+                ["自動削除 いいね解除", "ツールでいいねした投稿を指定ランダム時間後に自動いいね解除", 0, 60, 180, 10, "分", "ツール実行分のみ対象", "", "", "連動いいね・単体いいね両方を対象に指定時間後に取り消し"],
+                ["自動削除 リプライ削除", "ツールが送信した自分のリプライを指定ランダム時間後に自動削除", 0, 120, 360, 10, "分", "自分の送信リプライのみ", "", "", "AI生成リプライ・定型リプライ両方の自ポストのみを削除（重複防止DBは維持）"],
+                ["自動削除 引用リツイート削除", "ツールが投稿した自分の引用RTを指定ランダム時間後に自動削除", 0, 120, 360, 10, "分", "自分の投稿引用RTのみ", "", "", "AI生成引用RT・定型引用RT両方の自ポストのみを削除（重複防止DBは維持）"],
+            ]
+            for r_off, row_vals in enumerate(matrix):
+                r_num = data_start + r_off
+                op_sheet.row_dimensions[r_num].height = 28
+                for c_idx, val in enumerate(row_vals, start=1):
+                    _, _, c_fill, c_align, c_bold = headers[c_idx - 1]
+                    cell = op_sheet.cell(row=r_num, column=c_idx, value=val)
+                    cell.fill = PatternFill(start_color=c_fill, end_color=c_fill, fill_type="solid")
+                    cell.font = Font(name="Meiryo UI", size=10, bold=c_bold, color="0F172A")
+                    cell.alignment = Alignment(horizontal=c_align, vertical="center", wrap_text=(c_idx in (2, 11)))
+                    cell.border = border_std
+
+            note_spacer = data_start + len(matrix)
+            note_row = note_spacer + 1
+            op_sheet.row_dimensions[note_spacer].height = 10
+            op_sheet.row_dimensions[note_row].height = 26
+            op_sheet.cell(row=note_row, column=1, value="※時間単位の指定方法")
+            op_sheet.cell(row=note_row, column=2, value="G列に「分」「秒」「時間」を指定可（例: 30秒〜60秒、60分〜180分、2時間〜6時間 / 最小〜最大の間でランダム決定）")
+            for c_idx in range(1, 12):
+                cell = op_sheet.cell(row=note_row, column=c_idx)
+                cell.fill = PatternFill(start_color="FFF1F2", end_color="FFF1F2", fill_type="solid")
+                cell.font = Font(name="Meiryo UI", size=10, bold=(c_idx == 1), color="881337")
+                cell.alignment = Alignment(horizontal="left", vertical="center")
+                cell.border = border_note
+
+            wb.save(target_path)
+            wb.close()
+            return True
+        except PermissionError:
+            return False
+        except Exception:
+            return False
 
     def _extract_sheet_messages(self, sheet) -> list[str]:
         """シートから登録文章（全文）を確実に抽出。列順（タイトル先頭等）や空行に柔軟対応"""

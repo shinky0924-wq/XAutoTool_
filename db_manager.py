@@ -10,6 +10,7 @@ import sys
 import re
 import json
 import time
+import random
 import threading
 from datetime import datetime
 
@@ -426,6 +427,38 @@ class DatabaseManager:
                             VALUES (?, ?)
                         """, (cn, f"{r_st}: {r_snip or ''}"[:120]))
 
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS auto_delete_queue (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    action_type TEXT NOT NULL,
+                    target_key TEXT NOT NULL COLLATE NOCASE,
+                    target_screen_name TEXT NOT NULL DEFAULT '',
+                    target_url TEXT DEFAULT '',
+                    tweet_id TEXT DEFAULT '',
+                    own_post_url TEXT DEFAULT '',
+                    own_tweet_id TEXT DEFAULT '',
+                    account_id_used TEXT DEFAULT '',
+                    snippet TEXT DEFAULT '',
+                    executed_at REAL NOT NULL,
+                    delete_after_seconds REAL NOT NULL DEFAULT 0,
+                    scheduled_delete_at REAL NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'PENDING',
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_error TEXT DEFAULT '',
+                    deleted_at REAL DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(action_type, target_key)
+                )
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_auto_delete_due
+                ON auto_delete_queue(status, scheduled_delete_at)
+            """)
+            cursor.execute("""
+                CREATE INDEX IF NOT EXISTS idx_auto_delete_act
+                ON auto_delete_queue(action_type, status)
+            """)
+
             conn.commit()
 
     def is_user_unavailable(self, target_screen_name: str) -> bool:
@@ -677,6 +710,387 @@ class DatabaseManager:
             if f.lower().endswith(".db"):
                 files.append(os.path.join(db_dir, f))
         return sorted(files)
+
+    # ================================================================
+    # 自動削除・自動解除キュー管理 (auto_delete_queue)
+    # ================================================================
+    AUTO_DELETE_ACTIONS = {"FOLLOW", "LIKE", "REPLY", "QUOTE"}
+
+    def _build_auto_delete_target_identity(
+        self,
+        action_type: str,
+        target_screen_name: str,
+        target_url: str = "",
+        own_post_url: str = "",
+    ) -> tuple[str, str, str, str, str, str, str]:
+        act = normalize_action_type(action_type)
+        norm_url, tweet_id = normalize_tweet_url_and_id(target_url)
+        if not norm_url and "/status/" in str(target_screen_name or ""):
+            norm_url, tweet_id = normalize_tweet_url_and_id(target_screen_name)
+        norm_own_url, own_tweet_id = normalize_tweet_url_and_id(own_post_url)
+        clean_name = normalize_screen_name(target_screen_name) or normalize_screen_name(norm_url)
+
+        if act == "FOLLOW":
+            target_key = clean_name.lower()
+            stored_url = norm_url or (f"https://x.com/{clean_name}" if clean_name else "")
+            stored_tid = tweet_id
+        else:
+            if norm_url and tweet_id:
+                target_key = norm_url.lower()
+                stored_url = norm_url
+                stored_tid = tweet_id
+            elif norm_own_url and own_tweet_id:
+                target_key = norm_own_url.lower()
+                stored_url = norm_own_url
+                stored_tid = own_tweet_id
+            else:
+                target_key = f"https://x.com/{clean_name.lower()}" if clean_name else ""
+                stored_url = f"https://x.com/{clean_name}" if clean_name else ""
+                stored_tid = ""
+        return act, target_key, clean_name, stored_url, stored_tid, norm_own_url, own_tweet_id
+
+    def enqueue_auto_delete(
+        self,
+        action_type: str,
+        target_screen_name: str,
+        account_id: str,
+        min_seconds: float,
+        max_seconds: float,
+        target_url: str = "",
+        own_post_url: str = "",
+        snippet: str = "",
+        executed_at: float = None,
+    ) -> dict | None:
+        """ツールが実際に成功(SUCCESS)させたアクションのみをランダム遅延付きで自動削除キューへ登録"""
+        act, target_key, clean_name, stored_url, stored_tid, norm_own_url, own_tweet_id = (
+            self._build_auto_delete_target_identity(action_type, target_screen_name, target_url, own_post_url)
+        )
+        if act not in self.AUTO_DELETE_ACTIONS or not target_key:
+            return None
+
+        lo = max(0.0, float(min_seconds))
+        hi = max(0.0, float(max_seconds))
+        if lo > hi:
+            lo, hi = hi, lo
+        delay_sec = round(random.uniform(lo, hi), 2)
+        exec_ts = float(executed_at) if executed_at is not None else time.time()
+        sched_ts = exec_ts + delay_sec
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                INSERT INTO auto_delete_queue (
+                    action_type, target_key, target_screen_name, target_url, tweet_id,
+                    own_post_url, own_tweet_id, account_id_used, snippet,
+                    executed_at, delete_after_seconds, scheduled_delete_at,
+                    status, attempts, last_error, deleted_at, created_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, '', 0, datetime('now', 'localtime'))
+                ON CONFLICT(action_type, target_key)
+                DO UPDATE SET
+                    target_screen_name = excluded.target_screen_name,
+                    target_url = excluded.target_url,
+                    tweet_id = excluded.tweet_id,
+                    own_post_url = CASE WHEN excluded.own_post_url != '' THEN excluded.own_post_url ELSE auto_delete_queue.own_post_url END,
+                    own_tweet_id = CASE WHEN excluded.own_tweet_id != '' THEN excluded.own_tweet_id ELSE auto_delete_queue.own_tweet_id END,
+                    account_id_used = excluded.account_id_used,
+                    snippet = CASE WHEN excluded.snippet != '' THEN excluded.snippet ELSE auto_delete_queue.snippet END,
+                    executed_at = excluded.executed_at,
+                    delete_after_seconds = excluded.delete_after_seconds,
+                    scheduled_delete_at = excluded.scheduled_delete_at,
+                    status = 'PENDING',
+                    attempts = 0,
+                    last_error = '',
+                    deleted_at = 0
+                """,
+                (
+                    act, target_key, clean_name, stored_url, stored_tid,
+                    norm_own_url, own_tweet_id, str(account_id or ""), str(snippet or "")[:200],
+                    exec_ts, delay_sec, sched_ts,
+                ),
+            )
+            conn.commit()
+
+        return {
+            "action_type": act,
+            "target_key": target_key,
+            "target_screen_name": clean_name,
+            "target_url": stored_url,
+            "own_post_url": norm_own_url,
+            "executed_at": exec_ts,
+            "delay_seconds": delay_sec,
+            "scheduled_delete_at": sched_ts,
+        }
+
+    def sync_pending_auto_delete_schedules(self, auto_delete_cfg: dict) -> int:
+        """
+        Excel側で遅延時間が変更された場合、現在待機中(PENDING)かつ範囲外になった
+        アイテムの予定時刻を新しい [min_seconds, max_seconds] に合わせて再計算する。
+        """
+        if not isinstance(auto_delete_cfg, dict):
+            return 0
+        updated = 0
+        key_map = {"follow": "FOLLOW", "like": "LIKE", "reply": "REPLY", "quote": "QUOTE"}
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            for cfg_key, db_act in key_map.items():
+                item_cfg = auto_delete_cfg.get(cfg_key) or {}
+                if not item_cfg.get("enabled"):
+                    continue
+                lo = max(0.0, float(item_cfg.get("min_seconds", 0.0)))
+                hi = max(lo, float(item_cfg.get("max_seconds", lo)))
+                cursor.execute(
+                    """
+                    SELECT id, executed_at, delete_after_seconds
+                    FROM auto_delete_queue
+                    WHERE action_type = ? AND status = 'PENDING'
+                    """,
+                    (db_act,),
+                )
+                for q_id, exec_ts, cur_delay in cursor.fetchall():
+                    cur_d = float(cur_delay or 0.0)
+                    if cur_d < lo - 0.5 or cur_d > hi + 0.5:
+                        new_delay = round(random.uniform(lo, hi), 2)
+                        new_sched = float(exec_ts or time.time()) + new_delay
+                        cursor.execute(
+                            """
+                            UPDATE auto_delete_queue
+                            SET delete_after_seconds = ?, scheduled_delete_at = ?
+                            WHERE id = ?
+                            """,
+                            (new_delay, new_sched, q_id),
+                        )
+                        updated += 1
+            if updated > 0:
+                conn.commit()
+        return updated
+
+    def get_due_auto_delete_tasks(self, action_type: str = "", now_ts: float = None, limit: int = 0) -> list[dict]:
+        """指定時刻時点で削除予定時刻が到来している PENDING レコード一覧を取得"""
+        now = float(now_ts) if now_ts is not None else time.time()
+        params = [now]
+        where_extra = ""
+        if action_type:
+            act = normalize_action_type(action_type)
+            where_extra = " AND action_type = ?"
+            params.append(act)
+        limit_sql = ""
+        if int(limit or 0) > 0:
+            limit_sql = " LIMIT ?"
+            params.append(int(limit))
+
+        rows_out = []
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(
+                f"""
+                SELECT id, action_type, target_key, target_screen_name, target_url, tweet_id,
+                       own_post_url, own_tweet_id, account_id_used, snippet,
+                       executed_at, delete_after_seconds, scheduled_delete_at,
+                       status, attempts, last_error, deleted_at, created_at
+                FROM auto_delete_queue
+                WHERE status = 'PENDING' AND scheduled_delete_at <= ?{where_extra}
+                ORDER BY scheduled_delete_at ASC, id ASC{limit_sql}
+                """,
+                tuple(params),
+            )
+            for r in cursor.fetchall():
+                rows_out.append({
+                    "id": r[0],
+                    "action_type": r[1],
+                    "target_key": r[2],
+                    "target_screen_name": r[3],
+                    "target_url": r[4],
+                    "tweet_id": r[5],
+                    "own_post_url": r[6],
+                    "own_tweet_id": r[7],
+                    "account_id_used": r[8],
+                    "snippet": r[9],
+                    "executed_at": r[10],
+                    "delete_after_seconds": r[11],
+                    "scheduled_delete_at": r[12],
+                    "status": r[13],
+                    "attempts": r[14],
+                    "last_error": r[15],
+                    "deleted_at": r[16],
+                    "created_at": r[17],
+                })
+        return rows_out
+
+    def get_earliest_pending_delete_ts(self, enabled_actions: list[str] = None) -> float | None:
+        """有効な自動削除対象アクションの中で最も早い予定時刻(Unix秒)を返す"""
+        if enabled_actions is not None:
+            acts = [normalize_action_type(a) for a in enabled_actions if a]
+            if not acts:
+                return None
+            placeholders = ",".join("?" for _ in acts)
+            sql = f"SELECT MIN(scheduled_delete_at) FROM auto_delete_queue WHERE status = 'PENDING' AND action_type IN ({placeholders})"
+            params = tuple(acts)
+        else:
+            sql = "SELECT MIN(scheduled_delete_at) FROM auto_delete_queue WHERE status = 'PENDING'"
+            params = ()
+
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(sql, params)
+            row = cursor.fetchone()
+            if row and row[0] is not None:
+                return float(row[0])
+        return None
+
+    def count_pending_auto_deletes(self, action_type: str = "") -> int:
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if action_type:
+                act = normalize_action_type(action_type)
+                cursor.execute("SELECT COUNT(*) FROM auto_delete_queue WHERE status = 'PENDING' AND action_type = ?", (act,))
+            else:
+                cursor.execute("SELECT COUNT(*) FROM auto_delete_queue WHERE status = 'PENDING'")
+            row = cursor.fetchone()
+            return int(row[0] or 0) if row else 0
+
+    def mark_auto_delete_result(
+        self,
+        queue_id: int,
+        new_status: str,
+        error_msg: str = "",
+        retry_delay_sec: float = 300.0,
+        max_attempts: int = 5,
+    ):
+        """自動削除・解除の実行結果を更新（一時失敗はリトライ予約、上限到達または完了時は確定）"""
+        st = str(new_status or "").strip().upper()
+        now_ts = time.time()
+        err = str(error_msg or "")[:200]
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if st in ("DELETED", "ALREADY_REMOVED", "CANCELLED"):
+                cursor.execute(
+                    """
+                    UPDATE auto_delete_queue
+                    SET status = ?, attempts = attempts + 1, last_error = ?, deleted_at = ?
+                    WHERE id = ?
+                    """,
+                    (st, err, now_ts, int(queue_id)),
+                )
+            else:
+                cursor.execute("SELECT attempts FROM auto_delete_queue WHERE id = ?", (int(queue_id),))
+                row = cursor.fetchone()
+                cur_att = int(row[0] or 0) if row else 0
+                next_att = cur_att + 1
+                if next_att >= max(1, int(max_attempts)):
+                    cursor.execute(
+                        """
+                        UPDATE auto_delete_queue
+                        SET status = 'FAILED', attempts = ?, last_error = ?
+                        WHERE id = ?
+                        """,
+                        (next_att, err, int(queue_id)),
+                    )
+                else:
+                    next_sched = now_ts + max(30.0, float(retry_delay_sec))
+                    cursor.execute(
+                        """
+                        UPDATE auto_delete_queue
+                        SET status = 'PENDING', attempts = ?, last_error = ?, scheduled_delete_at = ?
+                        WHERE id = ?
+                        """,
+                        (next_att, err, next_sched, int(queue_id)),
+                    )
+            conn.commit()
+
+    def mark_history_auto_delete_scheduled(
+        self, action_type: str, target_key: str, scheduled_ts: float, is_unlink: bool = False
+    ) -> bool:
+        """命令実行時点で *_history テーブルの snippet に削除/解除予定時刻タグを記録"""
+        act = normalize_action_type(action_type)
+        table_name = self.ACTION_TABLE_MAP.get(act)
+        if not table_name or not target_key:
+            return False
+        sched_label = datetime.fromtimestamp(float(scheduled_ts)).strftime("%m/%d %H:%M")
+        tag = f"[{'解除予定' if is_unlink else '削除予定'} {sched_label}]"
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT id, snippet FROM {table_name} WHERE LOWER(target_key) = ?", (str(target_key).lower(),))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            rec_id, old_snip = row[0], str(row[1] or "")
+            cleaned = re.sub(r'^\[(?:解除予定|削除予定)\s+[^\]]+\]\s*', '', old_snip).strip()
+            new_snip = f"{tag} {cleaned}".strip() if cleaned else tag
+            cursor.execute(f"UPDATE {table_name} SET snippet = ? WHERE id = ?", (new_snip[:200], rec_id))
+            conn.commit()
+            return True
+
+    def mark_history_auto_deleted(self, action_type: str, target_key: str, tag: str = "[自動削除済]") -> bool:
+        """
+        *_history テーブルの重複防止ステータス(SUCCESS等)やレコード自体は維持したまま、
+        snippet に自動削除・解除済みタグを追記する（同じ相手・投稿への再実行を確実に防ぐため）。
+        """
+        act = normalize_action_type(action_type)
+        table_name = self.ACTION_TABLE_MAP.get(act)
+        if not table_name or not target_key:
+            return False
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute(f"SELECT id, snippet FROM {table_name} WHERE LOWER(target_key) = ?", (str(target_key).lower(),))
+            row = cursor.fetchone()
+            if not row:
+                return False
+            rec_id, old_snip = row[0], str(row[1] or "")
+            if tag not in old_snip:
+                cleaned = re.sub(r'^\[(?:解除予定|削除予定)\s+[^\]]+\]\s*', '', old_snip).strip()
+                new_snip = f"{tag} {cleaned}".strip() if cleaned else tag
+                cursor.execute(f"UPDATE {table_name} SET snippet = ? WHERE id = ?", (new_snip[:200], rec_id))
+                conn.commit()
+            return True
+
+    def fetch_auto_delete_queue(self, status_filter: str = "ALL", limit: int = 200) -> list[dict]:
+        """自動削除キュー一覧を取得（管理・デバッグ用）"""
+        sf = str(status_filter or "ALL").strip().upper()
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            if sf != "ALL":
+                cursor.execute(
+                    """
+                    SELECT id, action_type, target_key, target_screen_name, target_url, own_post_url,
+                           executed_at, delete_after_seconds, scheduled_delete_at, status, attempts, last_error, deleted_at
+                    FROM auto_delete_queue
+                    WHERE status = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (sf, int(limit)),
+                )
+            else:
+                cursor.execute(
+                    """
+                    SELECT id, action_type, target_key, target_screen_name, target_url, own_post_url,
+                           executed_at, delete_after_seconds, scheduled_delete_at, status, attempts, last_error, deleted_at
+                    FROM auto_delete_queue
+                    ORDER BY id DESC
+                    LIMIT ?
+                    """,
+                    (int(limit),),
+                )
+            out = []
+            for r in cursor.fetchall():
+                out.append({
+                    "id": r[0],
+                    "action_type": r[1],
+                    "target_key": r[2],
+                    "target_screen_name": r[3],
+                    "target_url": r[4],
+                    "own_post_url": r[5],
+                    "executed_at": r[6],
+                    "delete_after_seconds": r[7],
+                    "scheduled_delete_at": r[8],
+                    "status": r[9],
+                    "attempts": r[10],
+                    "last_error": r[11],
+                    "deleted_at": r[12],
+                })
+            return out
 
 
 def load_launcher_prefs(base_dir: str) -> dict:

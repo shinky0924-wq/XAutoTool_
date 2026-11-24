@@ -283,6 +283,7 @@ class XBrowserController:
         self.context = None
         self.page: Page = None
         self.last_acted_tweet_url = ""
+        self.last_created_post_url = ""
         self.last_unavailable_reason = ""
         self.last_error_screenshot = ""
         self.last_login_failure_reason = ""
@@ -2702,6 +2703,7 @@ class XBrowserController:
         """
         page = self.ensure_page()
         self.last_acted_tweet_url = ""
+        self.last_created_post_url = ""
         clean_target = normalize_screen_name(target_screen_name)
         if not clean_target and not tweet_url:
             return "FAILED", "ターゲット情報不正"
@@ -2761,11 +2763,21 @@ class XBrowserController:
                             page.mouse.click(s_box["x"] + s_box["width"] / 2, s_box["y"] + s_box["height"] / 2)
                         else:
                             send_btn.first.click()
-                        time.sleep(random.uniform(2.5, 4.0))
+                        self._capture_created_post_url_after_submit(
+                            page,
+                            target_url=self.last_acted_tweet_url or tweet_url,
+                            sent_text=reply_text,
+                            wait_sec=random.uniform(2.5, 4.0),
+                        )
                         return "SUCCESS", "取得ツイートにリプライ完了"
                     else:
                         page.keyboard.press("Control+Enter")
-                        time.sleep(2.5)
+                        self._capture_created_post_url_after_submit(
+                            page,
+                            target_url=self.last_acted_tweet_url or tweet_url,
+                            sent_text=reply_text,
+                            wait_sec=2.8,
+                        )
                         return "SUCCESS", "取得ツイートにリプライ完了"
                 else:
                     print("   ⚠️ 取得ツイートのリプライ入力欄起動に失敗しました。")
@@ -2863,11 +2875,21 @@ class XBrowserController:
                 page.mouse.click(s_box["x"] + s_box["width"] / 2, s_box["y"] + s_box["height"] / 2)
             else:
                 send_btn.first.click()
-            time.sleep(random.uniform(2.5, 4.0))
+            self._capture_created_post_url_after_submit(
+                page,
+                target_url=self.last_acted_tweet_url,
+                sent_text=reply_text,
+                wait_sec=random.uniform(2.5, 4.0),
+            )
             return "SUCCESS", "リプライ完了"
         else:
             page.keyboard.press("Control+Enter")
-            time.sleep(2.5)
+            self._capture_created_post_url_after_submit(
+                page,
+                target_url=self.last_acted_tweet_url,
+                sent_text=reply_text,
+                wait_sec=2.8,
+            )
             return "SUCCESS", "リプライ完了"
 
     def like_recent_post(self, target_screen_name: str, tweet_url: str = "") -> tuple[str, str]:
@@ -3196,6 +3218,7 @@ class XBrowserController:
         """
         page = self.ensure_page()
         self.last_acted_tweet_url = ""
+        self.last_created_post_url = ""
         clean_target = normalize_screen_name(target_screen_name)
         if not clean_target and not tweet_url:
             return "FAILED", "ユーザー名不正"
@@ -3238,7 +3261,12 @@ class XBrowserController:
                             send_btn = page.locator('button[data-testid="tweetButton"]')
                             if send_btn.count() > 0:
                                 send_btn.first.click()
-                                time.sleep(3.0)
+                                self._capture_created_post_url_after_submit(
+                                    page,
+                                    target_url=self.last_acted_tweet_url or tweet_url,
+                                    sent_text=quote_text,
+                                    wait_sec=3.2,
+                                )
                                 return "SUCCESS", "取得ツイートに引用RT完了"
                 else:
                     print("   ⚠️ 取得ツイートにリツイートボタンが見つかりません。")
@@ -3306,9 +3334,426 @@ class XBrowserController:
                 send_btn = page.locator('button[data-testid="tweetButton"]')
                 if send_btn.count() > 0:
                     send_btn.first.click()
-                    time.sleep(3.0)
+                    self._capture_created_post_url_after_submit(
+                        page,
+                        target_url=self.last_acted_tweet_url,
+                        sent_text=quote_text,
+                        wait_sec=3.2,
+                    )
                     return "SUCCESS", "引用RT完了"
         return "FAILED", "引用RT失敗"
+
+    def _extract_tweet_id(self, url: str) -> str:
+        if not url:
+            return ""
+        m = re.search(r'/status/(\d+)', str(url))
+        return m.group(1) if m else ""
+
+    def _get_tweet_author_handle(self, tweet_el) -> str:
+        """article要素から投稿者のハンドルID(@なし・小文字)を取得"""
+        if tweet_el is None:
+            return ""
+        try:
+            handle = tweet_el.evaluate("""(el) => {
+                const userBox = el.querySelector('[data-testid="User-Name"]');
+                if (!userBox) return '';
+                const links = Array.from(userBox.querySelectorAll('a[role="link"]'));
+                for (const a of links) {
+                    const h = (a.getAttribute('href') || '').trim();
+                    if (h.startsWith('/') && !h.startsWith('/i/') && !h.includes('/status/')) {
+                        const seg = h.replace(/^\\/+/, '').split('/')[0].split('?')[0].trim();
+                        if (seg) return seg.toLowerCase();
+                    }
+                }
+                return '';
+            }""")
+            return str(handle or "").strip().lstrip("@").lower()
+        except Exception:
+            return ""
+
+    def _capture_created_post_url_after_submit(
+        self,
+        page,
+        target_url: str = "",
+        sent_text: str = "",
+        wait_sec: float = 3.2,
+    ) -> str:
+        """リプライ/引用RT送信直後にトーストリンクまたは画面上の自分投稿から投稿URLを捕捉"""
+        clean_own = normalize_screen_name(self.current_account_id).lower()
+        target_tid = self._extract_tweet_id(target_url)
+        snip_clean = re.sub(r'\s+', '', str(sent_text or ""))[:24]
+        start_ts = time.time()
+        found_url = ""
+
+        while time.time() - start_ts < wait_sec:
+            try:
+                toast_links = page.locator('div[data-testid="toast"] a[href*="/status/"]')
+                for idx in range(toast_links.count()):
+                    href = toast_links.nth(idx).get_attribute("href") or ""
+                    cand_tid = self._extract_tweet_id(href)
+                    if cand_tid and cand_tid != target_tid:
+                        clean_href = href.split("?")[0].split("#")[0]
+                        found_url = f"https://x.com{clean_href}" if clean_href.startswith("/") else clean_href
+                        break
+                if found_url:
+                    break
+            except Exception:
+                pass
+
+            if clean_own:
+                try:
+                    articles = page.locator('article[data-testid="tweet"]')
+                    cnt = min(articles.count(), 12)
+                    for idx in range(cnt - 1, -1, -1):
+                        art = articles.nth(idx)
+                        cand_url = self._extract_tweet_url_from_article(art)
+                        cand_tid = self._extract_tweet_id(cand_url)
+                        if not cand_tid or cand_tid == target_tid:
+                            continue
+                        author = self._get_tweet_author_handle(art)
+                        if author and author == clean_own:
+                            t_txt = ""
+                            try:
+                                t_el = art.locator('div[data-testid="tweetText"]')
+                                if t_el.count() > 0:
+                                    t_txt = re.sub(r'\s+', '', t_el.first.inner_text() or "")
+                            except Exception:
+                                pass
+                            if (not snip_clean) or (t_txt and snip_clean[:min(10, len(snip_clean))] in t_txt) or idx > 0:
+                                found_url = cand_url
+                                break
+                    if found_url:
+                        break
+                except Exception:
+                    pass
+            time.sleep(0.3)
+
+        elapsed = time.time() - start_ts
+        min_wait = min(wait_sec, 2.5)
+        if elapsed < min_wait:
+            time.sleep(min_wait - elapsed)
+
+        if found_url:
+            self.last_created_post_url = found_url
+        return found_url
+
+    def unfollow_user(self, target_screen_name: str) -> tuple[str, str]:
+        """指定ユーザーのフォローを解除 (戻り値: 'DELETED' | 'ALREADY_REMOVED' | 'FAILED', 詳細)"""
+        page = self.ensure_page()
+        clean_target = normalize_screen_name(target_screen_name)
+        if not clean_target:
+            return "FAILED", "ユーザー名不正"
+
+        print(f"🧹 [自動フォロー解除] https://x.com/{clean_target}")
+        self.wait_for_profile_ready(clean_target, timeout=20.0)
+
+        unavail = self.last_unavailable_reason or self._detect_unavailable_account_reason(page)
+        if unavail:
+            return "ALREADY_REMOVED", f"アカウント利用不可のため解除済扱い ({unavail})"
+
+        unfollow_selectors = [
+            'button[data-testid$="-unfollow"]',
+            'div[data-testid="placementTracking"] button:has-text("フォロー中")',
+            'div[data-testid="placementTracking"] button:has-text("Following")',
+            'button[aria-label*="Following"]',
+            'button[aria-label*="フォロー中"]',
+            'button:has-text("リクエスト送信済み")',
+            'button:has-text("Requested")',
+        ]
+        follow_selectors = [
+            'button[data-testid$="-follow"]',
+            'div[data-testid="placementTracking"] button:has-text("フォローする")',
+            'div[data-testid="placementTracking"] button:has-text("Follow")',
+        ]
+
+        target_unfollow_btn = None
+        start_find = time.time()
+        while time.time() - start_find < 10.0:
+            for sel in unfollow_selectors:
+                u_loc = page.locator(sel)
+                if u_loc.count() > 0:
+                    try:
+                        if u_loc.first.is_visible():
+                            target_unfollow_btn = u_loc.first
+                            break
+                    except Exception:
+                        pass
+            if target_unfollow_btn:
+                break
+
+            for fsel in follow_selectors:
+                f_loc = page.locator(fsel)
+                if f_loc.count() > 0:
+                    try:
+                        if f_loc.first.is_visible():
+                            txt = (f_loc.first.inner_text() or "").strip()
+                            if "フォロー中" not in txt and "Following" not in txt:
+                                return "ALREADY_REMOVED", "既にフォロー解除済み"
+                    except Exception:
+                        pass
+            time.sleep(0.4)
+
+        if not target_unfollow_btn:
+            return "FAILED", "フォロー解除ボタンが見つかりません"
+
+        try:
+            target_unfollow_btn.scroll_into_view_if_needed(timeout=4000)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+        u_box = target_unfollow_btn.bounding_box()
+        if u_box:
+            self.bezier_mouse_move(u_box["x"] + u_box["width"] / 2, u_box["y"] + u_box["height"] / 2)
+            time.sleep(0.3)
+            page.mouse.click(u_box["x"] + u_box["width"] / 2, u_box["y"] + u_box["height"] / 2)
+        else:
+            target_unfollow_btn.click(force=True)
+
+        time.sleep(0.8)
+        confirm_btn = page.locator('button[data-testid="confirmationSheetConfirm"]')
+        try:
+            confirm_btn.first.wait_for(timeout=5000)
+            if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
+                confirm_btn.first.click(force=True)
+        except Exception:
+            pass
+
+        time.sleep(random.uniform(1.8, 2.8))
+        return "DELETED", "フォロー解除完了"
+
+    def unlike_post(self, target_screen_name: str = "", tweet_url: str = "") -> tuple[str, str]:
+        """指定投稿のいいねを解除 (戻り値: 'DELETED' | 'ALREADY_REMOVED' | 'FAILED', 詳細)"""
+        page = self.ensure_page()
+        clean_target = normalize_screen_name(target_screen_name)
+        if not tweet_url or "/status/" not in tweet_url:
+            return "FAILED", "いいね解除対象ポストURLが未指定"
+
+        print(f"🧹 [自動いいね解除] {tweet_url}")
+        target_tweet = self._find_tweet_on_status_page(tweet_url)
+        if target_tweet is None:
+            if self.last_unavailable_reason:
+                return "ALREADY_REMOVED", f"元投稿が削除/利用不可 ({self.last_unavailable_reason})"
+            try:
+                btxt = page.locator("body").inner_text()
+                if any(k in btxt for k in ["このポストは削除されました", "存在しません", "This Post was deleted", "Post is unavailable", "Hmm...this page"]):
+                    return "ALREADY_REMOVED", "元投稿は既に削除済み"
+            except Exception:
+                pass
+            return "FAILED", "対象ポストを読み込めません"
+
+        try:
+            target_tweet.scroll_into_view_if_needed(timeout=3000)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+        unlike_btn = target_tweet.locator('button[data-testid="unlike"], div[data-testid="unlike"]')
+        if unlike_btn.count() > 0:
+            btn = unlike_btn.first
+            l_box = btn.bounding_box()
+            if l_box:
+                self.bezier_mouse_move(l_box["x"] + l_box["width"] / 2, l_box["y"] + l_box["height"] / 2)
+                time.sleep(0.3)
+                page.mouse.click(l_box["x"] + l_box["width"] / 2, l_box["y"] + l_box["height"] / 2)
+            else:
+                btn.click(force=True)
+            time.sleep(random.uniform(1.8, 2.8))
+            return "DELETED", "いいね解除完了"
+
+        like_btn = target_tweet.locator('button[data-testid="like"], div[data-testid="like"]')
+        if like_btn.count() > 0:
+            return "ALREADY_REMOVED", "既にいいね解除済み"
+
+        return "FAILED", f"@{clean_target or 'target'} のいいねボタンが見つかりません"
+
+    def _delete_own_tweet_article(self, page, article_el, clean_own: str) -> tuple[bool, str]:
+        """投稿者が自分自身であることを検証した上で、caretメニュー→削除→確定を実行"""
+        if article_el is None:
+            return False, "対象ポストなし"
+        author = self._get_tweet_author_handle(article_el)
+        if clean_own and author and author != clean_own.lower():
+            return False, f"他人のポスト(@{author})のため削除中止"
+
+        try:
+            article_el.scroll_into_view_if_needed(timeout=3000)
+            time.sleep(0.3)
+        except Exception:
+            pass
+
+        caret_btn = article_el.locator('button[data-testid="caret"]')
+        if caret_btn.count() == 0:
+            return False, "メニューボタン(caret)なし"
+
+        c_box = caret_btn.first.bounding_box()
+        if c_box:
+            self.bezier_mouse_move(c_box["x"] + c_box["width"] / 2, c_box["y"] + c_box["height"] / 2)
+            time.sleep(0.3)
+            page.mouse.click(c_box["x"] + c_box["width"] / 2, c_box["y"] + c_box["height"] / 2)
+        else:
+            caret_btn.first.click(force=True)
+
+        time.sleep(0.8)
+        del_item = None
+        menu_items = page.locator('div[role="menuitem"]')
+        for idx in range(menu_items.count()):
+            mi = menu_items.nth(idx)
+            try:
+                if not mi.is_visible():
+                    continue
+                txt = (mi.inner_text() or "").strip()
+                if txt in ("削除", "Delete") or ((txt.startswith("削除") or txt.startswith("Delete")) and "リスト" not in txt and "List" not in txt):
+                    del_item = mi
+                    break
+            except Exception:
+                pass
+
+        if del_item is None:
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            return False, "削除メニュー項目なし（自投稿以外または削除不可）"
+
+        del_item.click(force=True)
+        time.sleep(0.8)
+        confirm_btn = page.locator('button[data-testid="confirmationSheetConfirm"]')
+        try:
+            confirm_btn.first.wait_for(timeout=5000)
+            if confirm_btn.count() > 0 and confirm_btn.first.is_visible():
+                confirm_btn.first.click(force=True)
+                time.sleep(random.uniform(2.0, 3.0))
+                return True, "削除完了"
+        except Exception as e:
+            return False, f"削除確定ボタン待機失敗: {e}"
+        return False, "削除確定失敗"
+
+    def delete_reply_or_quote(
+        self,
+        action_type: str,
+        own_account_id: str,
+        own_post_url: str = "",
+        target_url: str = "",
+        snippet: str = "",
+    ) -> tuple[str, str]:
+        """
+        自分が送信したリプライまたは引用リツイートを削除。
+        Stage A: own_post_url の直接アクセス＆削除
+        Stage B: 対象ポストスレッドまたは自プロフィールからの安全照合削除
+        戻り値: ('DELETED' | 'ALREADY_REMOVED' | 'FAILED', 詳細)
+        """
+        page = self.ensure_page()
+        clean_own = normalize_screen_name(own_account_id or self.current_account_id).lower()
+        if not clean_own:
+            return "FAILED", "自アカウントID不明のため削除中止"
+
+        act_label = "引用RT削除" if str(action_type or "").upper() == "QUOTE" else "リプライ削除"
+        target_tid = self._extract_tweet_id(target_url)
+        own_tid = self._extract_tweet_id(own_post_url)
+        snip_clean = re.sub(r'\s+', '', str(snippet or ""))
+        for prefix in ("[自動削除済]", "[自動解除済]"):
+            snip_clean = snip_clean.replace(prefix, "")
+        snip_key = snip_clean[:18]
+
+        # Stage A: 自分のポストURLが記録されている場合
+        if own_post_url and "/status/" in own_post_url:
+            print(f"🧹 [自動{act_label}] 自ポストURLへアクセス: {own_post_url}")
+            art = self._find_tweet_on_status_page(own_post_url)
+            if art is not None:
+                found_url = self._extract_tweet_url_from_article(art)
+                found_tid = self._extract_tweet_id(found_url)
+                if not own_tid or not found_tid or found_tid == own_tid:
+                    ok, det = self._delete_own_tweet_article(page, art, clean_own)
+                    if ok:
+                        return "DELETED", f"自ポスト削除完了 ({own_post_url})"
+                    return "FAILED", det
+            else:
+                try:
+                    btxt = page.locator("body").inner_text()
+                    if any(k in btxt for k in ["このポストは削除されました", "存在しません", "This Post was deleted", "Post is unavailable", "Hmm...this page"]):
+                        return "ALREADY_REMOVED", "自ポストは既に削除済み"
+                except Exception:
+                    pass
+
+        # Stage B-1: リプライの場合、元ツイート詳細画面から自分の返信を探す
+        if str(action_type or "").upper() == "REPLY" and target_url and "/status/" in target_url:
+            print(f"🧹 [自動{act_label}] 元ポストスレッドから自分の返信を探索: {target_url}")
+            self._find_tweet_on_status_page(target_url)
+            articles = page.locator('article[data-testid="tweet"]')
+            for idx in range(min(articles.count(), 15)):
+                art = articles.nth(idx)
+                cand_tid = self._extract_tweet_id(self._extract_tweet_url_from_article(art))
+                if target_tid and cand_tid == target_tid:
+                    continue
+                author = self._get_tweet_author_handle(art)
+                if author != clean_own:
+                    continue
+                t_txt = ""
+                try:
+                    te = art.locator('div[data-testid="tweetText"]')
+                    if te.count() > 0:
+                        t_txt = re.sub(r'\s+', '', te.first.inner_text() or "")
+                except Exception:
+                    pass
+                if (len(snip_key) >= 6 and snip_key[:min(12, len(snip_key))] in t_txt) or (target_tid and len(snip_key) == 0):
+                    ok, det = self._delete_own_tweet_article(page, art, clean_own)
+                    if ok:
+                        return "DELETED", "元スレッドから自リプライ削除完了"
+
+        # Stage B-2: 自分のプロフィール /with_replies (or プロフィール) から安全照合して削除
+        if not target_tid and len(snip_key) < 6:
+            return "FAILED", "自ポストURL・元URL・本文スニペットがいずれも不足しているため安全のため削除を見送ります"
+
+        scan_url = f"https://x.com/{clean_own}/with_replies" if str(action_type or "").upper() == "REPLY" else f"https://x.com/{clean_own}"
+        print(f"🧹 [自動{act_label}] 自アカウントタイムライン探索: {scan_url}")
+        try:
+            page.goto(scan_url, timeout=35000, wait_until="domcontentloaded")
+            time.sleep(random.uniform(2.5, 3.8))
+        except Exception as e:
+            return "FAILED", f"自タイムライン読込失敗: {e}"
+
+        for scroll_pass in range(3):
+            articles = page.locator('div[data-testid="primaryColumn"] article[data-testid="tweet"]')
+            if articles.count() == 0:
+                articles = page.locator('article[data-testid="tweet"]')
+            for idx in range(min(articles.count(), 18)):
+                art = articles.nth(idx)
+                author = self._get_tweet_author_handle(art)
+                if author != clean_own:
+                    continue
+                cand_tid = self._extract_tweet_id(self._extract_tweet_url_from_article(art))
+                if target_tid and cand_tid == target_tid:
+                    continue
+
+                matched = False
+                if target_tid:
+                    try:
+                        if art.locator(f'a[href*="/status/{target_tid}"]').count() > 0:
+                            matched = True
+                    except Exception:
+                        pass
+                if not matched and len(snip_key) >= 6:
+                    try:
+                        te = art.locator('div[data-testid="tweetText"]')
+                        t_txt = re.sub(r'\s+', '', te.first.inner_text() or "") if te.count() > 0 else ""
+                        if snip_key[:min(14, len(snip_key))] in t_txt:
+                            matched = True
+                    except Exception:
+                        pass
+                if matched:
+                    ok, det = self._delete_own_tweet_article(page, art, clean_own)
+                    if ok:
+                        return "DELETED", f"タイムライン照合により{act_label}完了"
+                    return "FAILED", det
+
+            if scroll_pass < 2:
+                try:
+                    page.mouse.wheel(0, 900)
+                    time.sleep(1.5)
+                except Exception:
+                    break
+
+        return "FAILED", f"削除対象の自ポストが見つかりませんでした"
 
     def bezier_mouse_move(self, end_x: float, end_y: float, steps: int = 25):
         """

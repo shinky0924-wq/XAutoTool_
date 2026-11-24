@@ -53,6 +53,12 @@ class AIGenerator:
         "duckai": "https://duck.ai/",
         "duck": "https://duck.ai/",
         "duckduckgo": "https://duck.ai/",
+        "venice": "https://venice.ai/chat",
+        "venice_ai": "https://venice.ai/chat",
+        "deepai": "https://deepai.org/chat",
+        "deep_ai": "https://deepai.org/chat",
+        "talkai": "https://talkai.info/",
+        "talk_ai": "https://talkai.info/",
         "qwen": "https://chat.qwen.ai/",
         "mistral": "https://chat.mistral.ai/",
         "lechat": "https://chat.mistral.ai/",
@@ -63,15 +69,175 @@ class AIGenerator:
         "chrome_ai": "https://gemini.google.com/app",
     }
 
+    DEFAULT_HTTP_USER_AGENT = (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    )
+
+    OPENAI_SYSTEM_PROMPTS = {
+        "groq": "あなたはX(Twitter)の親切なユーザーです。自然で好意的な日本語の返信本文のみを出力します。",
+        "openrouter": "あなたはX(Twitter)の自然なユーザーです。返信本文のみを出力します。",
+        "deepseek": "あなたはX(Twitter)の親しみやすいユーザーです。返信本文のみを出力します。",
+        "grok": "あなたは親しみやすいXユーザーです。返信本文のみを出力します。",
+        "lmstudio": "返信本文のみを出力してください。",
+    }
+
+    _last_call_meta = threading.local()
+
+    @staticmethod
+    def estimate_tokens(text: str) -> int:
+        s = text or ""
+        if not s:
+            return 0
+        ascii_chars = sum(1 for ch in s if ord(ch) < 128)
+        non_ascii_chars = len(s) - ascii_chars
+        est = int(round((ascii_chars / 4.0) + (non_ascii_chars * 0.9)))
+        return max(1, est)
+
+    @classmethod
+    def _reset_last_call_meta(cls, prompt_chars: int = 0):
+        cls._last_call_meta.data = {
+            "engine": "",
+            "model": "",
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "thoughts_tokens": None,
+            "total_tokens": None,
+            "prompt_chars": prompt_chars,
+            "output_chars": 0,
+            "estimated": False,
+        }
+
+    @classmethod
+    def _set_last_call_meta(
+        cls,
+        engine: str = "",
+        model: str = "",
+        prompt_tokens: Optional[int] = None,
+        completion_tokens: Optional[int] = None,
+        thoughts_tokens: Optional[int] = None,
+        total_tokens: Optional[int] = None,
+        prompt_chars: int = 0,
+        output_chars: int = 0,
+        estimated: bool = False,
+    ):
+        pt = int(prompt_tokens) if prompt_tokens is not None else None
+        ct = int(completion_tokens) if completion_tokens is not None else None
+        th = int(thoughts_tokens) if thoughts_tokens is not None else None
+        tt = int(total_tokens) if total_tokens is not None else None
+        if tt is None and pt is not None and ct is not None:
+            tt = pt + ct + (th or 0)
+        cls._last_call_meta.data = {
+            "engine": engine or "",
+            "model": model or "",
+            "prompt_tokens": pt,
+            "completion_tokens": ct,
+            "thoughts_tokens": th,
+            "total_tokens": tt,
+            "prompt_chars": int(prompt_chars or 0),
+            "output_chars": int(output_chars or 0),
+            "estimated": bool(estimated),
+        }
+
+    @classmethod
+    def get_last_call_meta(cls) -> dict:
+        data = getattr(cls._last_call_meta, "data", None)
+        return dict(data) if isinstance(data, dict) else {}
+
+    @classmethod
+    def format_last_usage_log(
+        cls,
+        used_label: str,
+        prompt_text: str = "",
+        output_text: str = "",
+    ) -> str:
+        meta = cls.get_last_call_meta()
+        in_chars = meta.get("prompt_chars") or len(prompt_text or "")
+        out_chars = len(output_text or "")
+        pt = meta.get("prompt_tokens")
+        ct = meta.get("completion_tokens")
+        th = meta.get("thoughts_tokens")
+        tt = meta.get("total_tokens")
+        resolved_model = (meta.get("model") or "").strip()
+        label_disp = used_label
+        if resolved_model and resolved_model not in used_label:
+            label_disp = f"{used_label} / {resolved_model}"
+
+        if pt is not None or ct is not None:
+            in_str = f"{pt} tok" if pt is not None else f"約{cls.estimate_tokens(prompt_text)} tok"
+            out_str = f"{ct} tok" if ct is not None else f"約{cls.estimate_tokens(output_text)} tok"
+            thought_str = f" (+思考: {th} tok)" if th else ""
+            if tt is None and pt is not None and ct is not None:
+                tt = pt + ct + (th or 0)
+            tot_str = f"{tt} tok" if tt is not None else "-"
+            tag = "目安" if meta.get("estimated") else "実績"
+            if meta.get("estimated"):
+                in_str = f"約{pt} tok" if pt is not None else in_str
+                out_str = f"約{ct} tok" if ct is not None else out_str
+                tot_str = f"約{tt} tok" if tt is not None else tot_str
+            return (
+                f"   📊 [AIトークン数{tag} / {label_disp}] "
+                f"入力: {in_str} / 出力: {out_str}{thought_str} / 合計: {tot_str} "
+                f"(文字数: {in_chars}→{out_chars}文字)"
+            )
+
+        est_in = cls.estimate_tokens(prompt_text)
+        est_out = cls.estimate_tokens(output_text)
+        return (
+            f"   📊 [AIトークン数目安 / {label_disp}] "
+            f"入力: 約{est_in} tok / 出力: 約{est_out} tok / 合計: 約{est_in + est_out} tok "
+            f"(文字数: {in_chars}→{out_chars}文字)"
+        )
+
     WEB_ONLY_ENGINES = {
         "chatgpt", "openai", "gpt",
         "claude", "anthropic",
         "duckai", "duck", "duckduckgo",
+        "venice", "venice_ai",
+        "deepai", "deep_ai",
+        "talkai", "talk_ai",
         "qwen",
         "mistral", "lechat",
         "perplexity",
         "copilot", "bing",
     }
+
+    @staticmethod
+    def _clean_secret_value(val: str) -> str:
+        s = (val or "").strip()
+        for ch in ("\u200b", "\u200c", "\u200d", "\ufeff", "\u00a0", "\u3000"):
+            s = s.replace(ch, "")
+        return s.strip().strip('"\' ')
+
+    @staticmethod
+    def _format_http_error(he: urllib.error.HTTPError, provider: str = "API") -> str:
+        code = getattr(he, "code", "?")
+        reason = getattr(he, "reason", "") or ""
+        raw_body = ""
+        try:
+            raw_body = he.read().decode("utf-8", errors="ignore").strip()
+        except Exception:
+            raw_body = ""
+        detail = ""
+        if raw_body:
+            try:
+                err_json = json.loads(raw_body)
+                if isinstance(err_json, dict):
+                    err_obj = err_json.get("error")
+                    if isinstance(err_obj, dict):
+                        detail = str(err_obj.get("message") or err_obj.get("code") or "").strip()
+                    elif err_obj:
+                        detail = str(err_obj).strip()
+                    elif err_json.get("message"):
+                        detail = str(err_json.get("message")).strip()
+            except Exception:
+                pass
+            if not detail:
+                compact = re.sub(r"\s+", " ", raw_body)
+                detail = compact[:180]
+        if detail:
+            return f"{provider} HTTP {code}: {detail}"
+        return f"{provider} HTTP {code}: {reason}".strip()
 
     @staticmethod
     def is_local_url(val: str) -> bool:
@@ -112,6 +278,12 @@ class AIGenerator:
             return "copilot"
         if "duck.ai" in s or "duckduckgo.com" in s:
             return "duckai"
+        if "venice.ai" in s:
+            return "venice"
+        if "deepai.org" in s:
+            return "deepai"
+        if "talkai.info" in s:
+            return "talkai"
         if "chat.qwen.ai" in s or "qwen.ai" in s:
             return "qwen"
         if "chat.mistral.ai" in s or "mistral.ai" in s:
@@ -128,6 +300,8 @@ class AIGenerator:
         aliases = {
             "gemini_api": "gemini",
             "google": "gemini",
+            "gemni": "gemini",
+            "gemma": "gemini",
             "openai": "chatgpt",
             "gpt": "chatgpt",
             "anthropic": "claude",
@@ -135,8 +309,12 @@ class AIGenerator:
             "bing": "copilot",
             "duck": "duckai",
             "duckduckgo": "duckai",
+            "venice_ai": "venice",
+            "deep_ai": "deepai",
+            "talk_ai": "talkai",
             "lechat": "mistral",
             "groq_cloud": "groq",
+            "groc": "groq",
             "open_router": "openrouter",
             "local_ollama": "ollama",
             "lm_studio": "lmstudio",
@@ -149,24 +327,117 @@ class AIGenerator:
         return aliases.get(eng, eng)
 
     @classmethod
+    def infer_engine_from_model(cls, model_name: str, default_engine: str = "") -> str:
+        m = (model_name or "").strip().lower()
+        if not m:
+            return cls.normalize_engine(default_engine) if default_engine else ""
+        if m.endswith(":free") or any(p in m for p in ["anthropic/", "deepseek/deepseek-chat-v3", "google/gemini-"]):
+            return "openrouter"
+        if any(k in m for k in ["gpt-oss", "qwen3", "qwen/qwen", "llama-3", "llama-4", "meta-llama/", "whisper", "mixtral"]):
+            return "groq"
+        if m.startswith("gemma-") or m.startswith("gemini-"):
+            return "gemini"
+        if m.startswith("deepseek-"):
+            return "deepseek"
+        if m.startswith("grok-"):
+            return "grok"
+        return cls.normalize_engine(default_engine) if default_engine else ""
+
+    @classmethod
+    def _detect_engine_from_key_prefix(cls, token: str) -> str:
+        t = (token or "").strip()
+        if not t:
+            return ""
+        if t.startswith("gsk_"):
+            return "groq"
+        if t.startswith("AIza"):
+            return "gemini"
+        if t.startswith("sk-or-"):
+            return "openrouter"
+        if t.startswith("xai-"):
+            return "grok"
+        if cls.is_web_url(t) or cls.is_local_url(t):
+            return cls.detect_engine_from_url(t)
+        return ""
+
+    @classmethod
+    def extract_provider_keys(cls, raw_api_key: str = "") -> Tuple[dict, str]:
+        """
+        単一キー/URL、または複数キー(groq=gsk_..., gemini=AIza... / 改行・カンマ区切り)を解析し
+        (プロバイダ別マップ, 単一デフォルト値) を返す
+        """
+        raw = (raw_api_key or "").strip()
+        if not raw:
+            return {}, ""
+
+        # URL単体の場合はそのまま返す
+        if cls.is_web_url(raw) or cls.is_local_url(raw):
+            det = cls.detect_engine_from_url(raw)
+            pmap = {det: raw} if det else {}
+            return pmap, raw
+
+        parts = [cls._clean_secret_value(p) for p in re.split(r"[\r\n,;]+", raw) if cls._clean_secret_value(p)]
+        if len(parts) == 1 and "=" not in parts[0]:
+            single = parts[0]
+            det = cls._detect_engine_from_key_prefix(single)
+            pmap = {det: single} if det else {}
+            return pmap, single
+
+        pmap = {}
+        for part in parts:
+            if "=" in part and not part.lower().startswith(("http://", "https://")):
+                k_name, k_val = part.split("=", 1)
+                eng = cls.normalize_engine(k_name)
+                clean_kval = cls._clean_secret_value(k_val)
+                if eng and clean_kval:
+                    pmap[eng] = clean_kval
+            else:
+                det = cls._detect_engine_from_key_prefix(part)
+                if det and det not in pmap:
+                    pmap[det] = part
+        return pmap, ""
+
+    @classmethod
+    def get_key_or_url_for_engine(cls, engine: str, raw_api_key: str = "", primary_engine: str = "") -> str:
+        eff_eng = cls.normalize_engine(engine)
+        pmap, single = cls.extract_provider_keys(raw_api_key)
+        if eff_eng in pmap:
+            return pmap[eff_eng]
+        if single:
+            if cls.is_web_url(single) or cls.is_local_url(single):
+                det = cls.detect_engine_from_url(single)
+                if not det or det == eff_eng:
+                    return single
+                return ""
+            det_prefix = cls._detect_engine_from_key_prefix(single)
+            if det_prefix:
+                return single if det_prefix == eff_eng else ""
+            if not primary_engine or cls.normalize_engine(primary_engine) == eff_eng:
+                return single
+        return ""
+
+    @classmethod
     def resolve_engine_and_url(cls, engine: str = "gemini", api_key_or_url: str = "") -> Tuple[str, str]:
         """エンジン指定と接続URL/APIキーから (実効エンジン名, Web起動URL) を解決"""
-        raw_eng = (engine or "gemini").lower().strip()
-        val = (api_key_or_url or "").strip()
+        raw_eng_str = (engine or "gemini").strip()
+        entries = cls.parse_engine_list(raw_eng_str)
+        raw_eng = entries[0][0] if entries else raw_eng_str.lower()
+        ov_key = entries[0][2] if entries else ""
+        eff_norm = cls.normalize_engine(raw_eng)
+        val = ov_key or cls.get_key_or_url_for_engine(eff_norm, api_key_or_url, primary_engine=eff_norm)
 
         if cls.is_web_url(val):
             detected = cls.detect_engine_from_url(val)
-            eff_eng = detected or cls.normalize_engine(raw_eng)
+            eff_eng = detected or eff_norm
             return eff_eng, val
 
         if cls.is_local_url(val):
             detected = cls.detect_engine_from_url(val)
-            eff_eng = detected or (cls.normalize_engine(raw_eng) if cls.normalize_engine(raw_eng) in ("ollama", "lmstudio") else "ollama")
+            eff_eng = detected or (eff_norm if eff_norm in ("ollama", "lmstudio") else "ollama")
             return eff_eng, ""
 
-        eff_eng = cls.normalize_engine(raw_eng)
-        default_url = cls.WEB_ENGINE_URLS.get(eff_eng, "")
-        return eff_eng, default_url
+        default_url = cls.WEB_ENGINE_URLS.get(eff_norm, "")
+        return eff_norm, default_url
 
     @classmethod
     def should_launch_ai_window(cls, engine: str = "gemini", api_key_or_url: str = "", dedicated_flag: bool = True) -> bool:
@@ -174,9 +445,10 @@ class AIGenerator:
         eff_eng, target_url = cls.resolve_engine_and_url(engine, api_key_or_url)
         if eff_eng in ("none", "off", "無効", ""):
             return False
+        scoped_val = cls.get_key_or_url_for_engine(eff_eng, api_key_or_url, primary_engine=eff_eng)
         if dedicated_flag:
             return True
-        if cls.is_web_url(api_key_or_url):
+        if cls.is_web_url(scoped_val):
             return True
         if eff_eng in cls.WEB_ONLY_ENGINES:
             return True
@@ -350,8 +622,10 @@ class AIGenerator:
 
     @classmethod
     def has_api_key(cls, engine: str, api_key: str = "") -> bool:
-        eff_eng = cls.normalize_engine(engine)
-        key = (api_key or "").strip()
+        entries = cls.parse_engine_list(engine)
+        eff_eng = entries[0][0] if entries else cls.normalize_engine(engine)
+        ov_key = entries[0][2] if entries else ""
+        key = ov_key or cls.get_key_or_url_for_engine(eff_eng, api_key, primary_engine=eff_eng)
         if eff_eng in ["ollama", "lmstudio"] or cls.is_local_url(key):
             return True
         # http(s):// で始まるWebチャットURLはAPIキーではなくWebウィンドウ接続先として扱う
@@ -386,7 +660,8 @@ class AIGenerator:
         page = None,
         use_dedicated_window: bool = False,
         parent_post_text: str = "",
-        prompt_config: Optional[dict] = None
+        prompt_config: Optional[dict] = None,
+        model_name: str = ""
     ) -> Tuple[bool, str]:
         """
         指定されたAIエンジンを使用して返信・引用文章を生成
@@ -396,6 +671,7 @@ class AIGenerator:
         if eff_eng in ["none", "off", "無効", ""]:
             return False, "AIエンジンが未指定または無効です"
 
+        scoped_key = cls.get_key_or_url_for_engine(eff_eng, api_key, primary_engine=eff_eng)
         prompt = cls.build_prompt(
             post_url,
             post_text,
@@ -409,7 +685,7 @@ class AIGenerator:
         try:
             # 1. Google Gemini API (推奨)
             if eff_eng == "gemini":
-                key = ("" if cls.is_web_url(api_key) else (api_key or "").strip()) or os.environ.get("GEMINI_API_KEY", "").strip()
+                key = ("" if cls.is_web_url(scoped_key) else (scoped_key or "").strip()) or os.environ.get("GEMINI_API_KEY", "").strip()
                 if not key and page is not None:
                     try:
                         text = cls._call_chrome_builtin(page, prompt)
@@ -418,53 +694,61 @@ class AIGenerator:
                             return True, clean
                     except Exception:
                         pass
-                text = cls._call_gemini(prompt, key)
-                return True, cls._sanitize_output(text)
+                text = cls._call_gemini(prompt, key, model_name=model_name)
+                clean = cls._sanitize_output(text)
+                return (True, clean) if clean else (False, "AIの生成結果が空でした")
 
             # 2. Groq Cloud (超高速推論)
             elif eff_eng == "groq":
-                text = cls._call_groq(prompt, api_key)
-                return True, cls._sanitize_output(text)
+                text = cls._call_groq(prompt, scoped_key, model_name=model_name)
+                clean = cls._sanitize_output(text)
+                return (True, clean) if clean else (False, "AIの生成結果が空でした")
 
             # 3. OpenRouter (各種LLM集約)
             elif eff_eng == "openrouter":
-                text = cls._call_openrouter(prompt, api_key)
-                return True, cls._sanitize_output(text)
+                text = cls._call_openrouter(prompt, scoped_key, model_name=model_name)
+                clean = cls._sanitize_output(text)
+                return (True, clean) if clean else (False, "AIの生成結果が空でした")
 
             # 4. Ollama (ローカルLLM)
             elif eff_eng == "ollama":
-                endpoint = api_key if cls.is_local_url(api_key) else "http://localhost:11434"
-                text = cls._call_ollama(prompt, endpoint)
-                return True, cls._sanitize_output(text)
+                endpoint = scoped_key if cls.is_local_url(scoped_key) else "http://localhost:11434"
+                text = cls._call_ollama(prompt, endpoint, model_name=model_name)
+                clean = cls._sanitize_output(text)
+                return (True, clean) if clean else (False, "AIの生成結果が空でした")
 
             # 5. Chrome 内蔵 AI (Gemini Nano / window.ai)
             elif eff_eng == "chrome_builtin":
                 if page is not None:
                     text = cls._call_chrome_builtin(page, prompt)
-                    return True, cls._sanitize_output(text)
+                    clean = cls._sanitize_output(text)
+                    return (True, clean) if clean else (False, "AIの生成結果が空でした")
                 else:
                     return False, "Chrome内蔵AIの実行にはブラウザページが必要です"
 
             # 6. xAI Grok API
             elif eff_eng == "grok":
-                key = "" if cls.is_web_url(api_key) else api_key
-                text = cls._call_grok(prompt, key)
-                return True, cls._sanitize_output(text)
+                key = "" if cls.is_web_url(scoped_key) else scoped_key
+                text = cls._call_grok(prompt, key, model_name=model_name)
+                clean = cls._sanitize_output(text)
+                return (True, clean) if clean else (False, "AIの生成結果が空でした")
 
             # 7. DeepSeek API
             elif eff_eng == "deepseek":
-                key = "" if cls.is_web_url(api_key) else api_key
-                text = cls._call_deepseek(prompt, key)
-                return True, cls._sanitize_output(text)
+                key = "" if cls.is_web_url(scoped_key) else scoped_key
+                text = cls._call_deepseek(prompt, key, model_name=model_name)
+                clean = cls._sanitize_output(text)
+                return (True, clean) if clean else (False, "AIの生成結果が空でした")
 
             # 8. LM Studio (ローカル)
             elif eff_eng == "lmstudio":
-                endpoint = api_key if cls.is_local_url(api_key) else "http://localhost:1234"
-                text = cls._call_lmstudio(prompt, endpoint)
-                return True, cls._sanitize_output(text)
+                endpoint = scoped_key if cls.is_local_url(scoped_key) else "http://localhost:1234"
+                text = cls._call_lmstudio(prompt, endpoint, model_name=model_name)
+                clean = cls._sanitize_output(text)
+                return (True, clean) if clean else (False, "AIの生成結果が空でした")
 
             # 9. Webチャット専用エンジン (ChatGPT / Claude / Perplexity / Copilot)
-            elif eff_eng in cls.WEB_ONLY_ENGINES or cls.is_web_url(api_key):
+            elif eff_eng in cls.WEB_ONLY_ENGINES or cls.is_web_url(scoped_key):
                 return False, f"Webブラウザ連携エンジン ({eff_eng}) は「AI専用ウィンドウ連携=1」で自動実行されます"
 
             else:
@@ -474,38 +758,387 @@ class AIGenerator:
             err_msg = str(e)
             return False, f"AI生成エラー ({eff_eng}): {err_msg}"
 
+    @classmethod
+    def parse_fallback_specs(cls, fallback_spec: str, default_engine: str = "") -> list[Tuple[str, str, str]]:
+        """
+        カンマ/改行/矢印(→, ->)区切りのフォールバック候補文字列を
+        [(engine, model_name, key_or_url_override), ...] のリストにパース
+        """
+        raw = (fallback_spec or "").strip()
+        if not raw:
+            return []
+        low_raw = raw.lower()
+        if low_raw in ["none", "off", "無効", "なし", "停止", "固定", "しない", "false", "0"]:
+            return []
+
+        tokens = [t.strip() for t in re.split(r"[,、\r\n→>]+|->", raw) if t.strip()]
+        parsed = []
+        for tok in tokens:
+            if tok.lower() in ["none", "off", "無効", "なし", "定型", "テンプレート"]:
+                continue
+            key_ov = ""
+            item = tok
+            if "|" in tok:
+                item, key_ov = [x.strip() for x in tok.split("|", 1)]
+
+            if cls.is_web_url(item) or cls.is_local_url(item):
+                det = cls.detect_engine_from_url(item) or cls.normalize_engine(default_engine or "gemini")
+                parsed.append((det, "", key_ov or item))
+                continue
+
+            low_item = item.lower()
+            known_engine_tokens = {
+                "gemini", "gemini_api", "google", "gemni", "gemma",
+                "chatgpt", "openai", "gpt",
+                "claude", "anthropic",
+                "grok", "xai",
+                "deepseek",
+                "duckai", "duck", "duckduckgo",
+                "venice", "venice_ai",
+                "deepai", "deep_ai",
+                "talkai", "talk_ai",
+                "qwen", "qwen_web",
+                "mistral", "lechat",
+                "perplexity",
+                "copilot", "bing",
+                "groq", "groq_cloud", "groc",
+                "openrouter", "open_router",
+                "ollama", "local_ollama",
+                "lmstudio", "lm_studio", "local",
+                "chrome_builtin", "chrome_ai", "chrome", "builtin", "gemini_nano",
+            }
+            if low_item in known_engine_tokens:
+                eng = cls.normalize_engine(item)
+                parsed.append((eng, "", key_ov))
+                continue
+
+            if ":" in item:
+                left, right = [x.strip() for x in item.split(":", 1)]
+                if right.lower() != "free" and "/" not in left:
+                    eng = cls.normalize_engine(left)
+                    parsed.append((eng, right, key_ov))
+                    continue
+
+            # モデルIDらしき記法ならエンジンを自動推測
+            if "/" in item or any(low_item.startswith(pfx) for pfx in ["gemma-", "gemini-", "llama-", "deepseek-", "grok-", "qwen-", "qwen3", "gpt-oss"]):
+                inferred = cls.infer_engine_from_model(item, default_engine=default_engine or "groq")
+                parsed.append((inferred, item, key_ov))
+            else:
+                eng = cls.normalize_engine(item)
+                parsed.append((eng, "", key_ov))
+        return parsed
+
+    @classmethod
+    def parse_engine_list(cls, engine_spec: str = "gemini", primary_model: str = "") -> list[Tuple[str, str, str]]:
+        """
+        AIエンジン欄（単体またはカンマ/矢印区切り複数指定）を [(engine, model_name, key_or_url), ...] にパース。
+        AIモデル名(primary_model)が指定されている場合は適合する最初のエンジンへ割り当てる。
+        """
+        raw = (engine_spec or "").strip()
+        pm = (primary_model or "").strip()
+        if not raw:
+            return [("gemini", pm, "")]
+        if raw.lower() in ["none", "off", "無効", "なし", "停止", "しない", "false", "0"]:
+            return [("off", "", "")]
+
+        parsed = cls.parse_fallback_specs(raw, default_engine="")
+        if not parsed:
+            return [(cls.normalize_engine(raw), pm, "")]
+
+        if pm:
+            inferred = cls.infer_engine_from_model(pm)
+            assigned = False
+            updated = []
+            for idx, (e, m, ov) in enumerate(parsed):
+                eff_e = cls.normalize_engine(e)
+                if not m and not assigned:
+                    if not inferred or inferred == eff_e:
+                        m = pm
+                        assigned = True
+                updated.append((eff_e, m, ov))
+            return updated
+
+        return [(cls.normalize_engine(e), m, ov) for e, m, ov in parsed]
+
+    @classmethod
+    def build_fallback_chain(
+        cls,
+        primary_engine: str,
+        primary_model: str = "",
+        raw_api_key: str = "",
+        fallback_spec: str = "",
+        allow_web_fallback: bool = True
+    ) -> list[Tuple[str, str, str]]:
+        """
+        プライマリ失敗時に順に試行する [(engine, model_name, effective_key_or_url), ...] を構築
+        - primary_engine に「groq, gemini, duckai」等カンマ区切りで複数指定がある場合は2番目以降を最優先で順に追加
+        - fallback_spec が 'off'/'none'/'無効' なら追加候補は積まない（primary_engine 内の2番目以降のみ）
+        - fallback_spec が明示されていればその順序を続いて追加
+        - fallback_spec が空欄なら同一API別モデル → 他APIキー保持プロバイダ → chrome_builtin → Web AI の順で自動補充
+        """
+        eng_entries = cls.parse_engine_list(primary_engine, primary_model=primary_model)
+        prim_spec_eng, prim_mod, prim_ov = eng_entries[0]
+        prim_eng, _ = cls.resolve_engine_and_url(prim_spec_eng, prim_ov or raw_api_key)
+
+        def _resolve_key(cand_eng: str, cand_ov: str) -> str:
+            if cand_ov:
+                return cand_ov
+            return cls.get_key_or_url_for_engine(cand_eng, raw_api_key, primary_engine=prim_eng)
+
+        seen = {(prim_eng, prim_mod)}
+        chain: list[Tuple[str, str, str]] = []
+
+        def _append_unique(cand_eng: str, cand_mod: str, cand_ov: str = ""):
+            e = cls.normalize_engine(cand_eng)
+            if not e or e in ["none", "off", "無効"]:
+                return
+            m = (cand_mod or "").strip()
+            k = _resolve_key(e, cand_ov)
+            key_sig = (e, m)
+            if key_sig in seen:
+                return
+            seen.add(key_sig)
+            chain.append((e, m, k))
+
+        # 0. AIエンジン欄に2番目以降の指定があれば最優先で順番に追加
+        for e, m, ov in eng_entries[1:]:
+            _append_unique(e, m, ov)
+
+        raw_fb = (fallback_spec or "").strip()
+        if raw_fb.lower() in ["none", "off", "無効", "なし", "停止", "固定", "しない", "false", "0"]:
+            return chain
+
+        explicit = cls.parse_fallback_specs(raw_fb, default_engine=prim_eng)
+        if explicit:
+            for e, m, ov in explicit:
+                _append_unique(e, m, ov)
+            return chain
+
+        # --- 空欄（自動切替モード）: 安全で成功率の高い候補を自動補充 ---
+        # 1. Groq APIキーが使える場合は同プロバイダ内の別モデルへ切替
+        if prim_eng == "groq" and cls.has_api_key("groq", raw_api_key):
+            for gm in ["qwen/qwen3.8-27b", "openai/gpt-oss-120b", "openai/gpt-oss-20b", "llama-3.3-70b-versatile"]:
+                _append_unique("groq", gm)
+
+        # 2. Gemini APIキーが使える場合は同プロバイダ内の別モデルへ切替
+        if prim_eng == "gemini" and cls.has_api_key("gemini", raw_api_key):
+            for gm in ["gemini-2.5-flash", "gemma-3-27b-it", "gemma-4-26b-a4b-it", "gemma-4-31b-it", "gemini-2.5-flash-lite"]:
+                _append_unique("gemini", gm)
+
+        # 3. 他のAPIキー（複数キー入力または環境変数）が設定されているプロバイダへ切替
+        api_defaults = [
+            ("groq", "qwen/qwen3.8-27b"),
+            ("groq", "openai/gpt-oss-120b"),
+            ("gemini", "gemma-3-27b-it"),
+            ("gemini", "gemini-2.5-flash"),
+            ("openrouter", ""),
+            ("deepseek", "deepseek-chat"),
+            ("grok", "grok-3-mini"),
+        ]
+        for eng, def_mod in api_defaults:
+            if cls.has_api_key(eng, raw_api_key):
+                _append_unique(eng, def_mod)
+
+        # 4. Webブラウザ連携・Chrome内蔵AIフォールバック（Playwrightが使える場合）
+        if allow_web_fallback:
+            _append_unique("chrome_builtin", "")
+            # ログイン不要サイト (Duck.ai / Venice / DeepAI / TalkAI / ChatGPT) を最優先し、続いてQwen / Gemini Web等へ切替
+            for web_eng in ["duckai", "venice", "deepai", "talkai", "chatgpt", "qwen", "gemini", "deepseek"]:
+                # もし同じエンジンがWeb経由で既に失敗していたら後ろに回す（あるいはスキップ）
+                if web_eng == prim_eng and not cls.has_api_key(prim_eng, raw_api_key):
+                    continue
+                _append_unique(web_eng, "")
+
+        return chain
+
+    @classmethod
+    def generate_comment_with_fallback(
+        cls,
+        engine: str = "gemini",
+        post_url: str = "",
+        post_text: str = "",
+        action_type: str = "reply",
+        target_name: str = "",
+        api_key: str = "",
+        custom_prompt: str = "",
+        playwright = None,
+        page = None,
+        use_dedicated_window: bool = False,
+        base_dir: str = ".",
+        slot_id: int = 1,
+        headless: bool = False,
+        parent_post_text: str = "",
+        prompt_config: Optional[dict] = None,
+        model_name: str = "",
+        fallback_spec: str = "",
+        logger = None
+    ) -> Tuple[bool, str, str]:
+        """
+        プライマリAI生成を実行し、失敗/タイムアウト/上限時には別モデル・別AIへ自動切替する統合エントリーポイント。
+        AIエンジン欄のカンマ区切り指定（例: groq, gemini, duckai）にも対応。
+        戻り値: (成功フラグ, 生成テキストまたはエラーメッセージ, 実際に使用されたラベル)
+        """
+        def _log(msg: str):
+            if logger:
+                try:
+                    logger(msg)
+                    return
+                except Exception:
+                    pass
+            print(msg)
+
+        eng_entries = cls.parse_engine_list(engine, primary_model=model_name)
+        prim_spec_eng, prim_mod, prim_ov = eng_entries[0]
+        prim_key = prim_ov or api_key
+        prim_eng, _ = cls.resolve_engine_and_url(prim_spec_eng, prim_key)
+        prim_label = f"{prim_eng} ({prim_mod})" if prim_mod else prim_eng
+
+        preview_prompt = cls.build_prompt(
+            post_url,
+            post_text,
+            action_type,
+            target_name,
+            custom_prompt,
+            parent_post_text=parent_post_text,
+            prompt_config=prompt_config,
+        )
+        est_prompt_tok = cls.estimate_tokens(preview_prompt)
+        _log(f"   📤 [AI送信プロンプト全文 / {prim_label}] (入力 {len(preview_prompt)}文字 / 目安約{est_prompt_tok} tok)")
+        sys_msg = cls.OPENAI_SYSTEM_PROMPTS.get(prim_eng, "")
+        if sys_msg and cls.has_api_key(prim_eng, prim_key):
+            _log(f"   | [system] {sys_msg}")
+        _log("   --- 送信プロンプト開始 ---")
+        for _pline in (preview_prompt.splitlines() or [""]):
+            _log(f"   | {_pline}")
+        _log("   --- 送信プロンプト終了 ---")
+
+        def _attempt_one(cand_eng: str, cand_mod: str, cand_key: str, is_fb: bool) -> Tuple[bool, str]:
+            # API専用モデルID（例: gemma-3-27b-it）がフォールバック指定されているがAPIキーが無い場合、
+            # Web版ログイン画面を開かず即スキップして次のログイン不要サイトへ進める
+            norm_ce = cls.normalize_engine(cand_eng)
+            if is_fb and cand_mod and norm_ce in ("gemini", "grok", "deepseek") and not cls.has_api_key(norm_ce, cand_key) and not cls.is_web_url(cand_key):
+                return False, f"{norm_ce} ({cand_mod}): APIキー未設定のためスキップ"
+
+            cls._reset_last_call_meta(prompt_chars=len(preview_prompt))
+            use_win = cls.should_launch_ai_window(
+                cand_eng,
+                cand_key,
+                use_dedicated_window if not is_fb else False
+            )
+            if use_win:
+                if playwright is None:
+                    return False, f"{cand_eng}: Web連携用のブラウザセッションがありません"
+                return AIDedicatedWindowManager.generate_and_copy_via_ai_window(
+                    playwright=playwright,
+                    post_url=post_url,
+                    post_text=post_text,
+                    engine=cand_eng,
+                    action_type=action_type,
+                    target_name=target_name,
+                    api_key=cand_key,
+                    custom_prompt=custom_prompt,
+                    headless=headless,
+                    base_dir=base_dir,
+                    slot_id=slot_id,
+                    parent_post_text=parent_post_text,
+                    prompt_config=prompt_config,
+                    model_name=cand_mod,
+                    is_fallback=is_fb
+                )
+            return cls.generate_comment(
+                engine=cand_eng,
+                post_url=post_url,
+                post_text=post_text,
+                action_type=action_type,
+                target_name=target_name,
+                api_key=cand_key,
+                custom_prompt=custom_prompt,
+                page=page,
+                use_dedicated_window=use_dedicated_window,
+                parent_post_text=parent_post_text,
+                prompt_config=prompt_config,
+                model_name=cand_mod
+            )
+
+        # 1. プライマリ試行
+        ok, res = _attempt_one(prim_spec_eng, prim_mod, prim_key, is_fb=False)
+        if ok and res and res.strip():
+            out_clean = res.strip()
+            _log(cls.format_last_usage_log(prim_label, prompt_text=preview_prompt, output_text=out_clean))
+            return True, out_clean, prim_label
+
+        last_err = res or "生成結果が空でした"
+        candidates = cls.build_fallback_chain(
+            primary_engine=engine,
+            primary_model=model_name,
+            raw_api_key=api_key,
+            fallback_spec=fallback_spec,
+            allow_web_fallback=(playwright is not None)
+        )
+        if not candidates:
+            return False, last_err, prim_label
+
+        _log(f"   ⚠️ AI生成失敗 ({prim_label} / 理由: {last_err}) → 別AI/モデルへ自動切替します")
+
+        total = len(candidates)
+        for idx, (cand_eng, cand_mod, cand_key) in enumerate(candidates, 1):
+            cand_label = f"{cand_eng} ({cand_mod})" if cand_mod else cand_eng
+            _log(f"   🔄 [AI自動切替 {idx}/{total}] {cand_label} で再試行中...")
+            try:
+                fb_ok, fb_res = _attempt_one(cand_eng, cand_mod, cand_key, is_fb=True)
+                if fb_ok and fb_res and fb_res.strip():
+                    out_clean = fb_res.strip()
+                    _log(cls.format_last_usage_log(cand_label, prompt_text=preview_prompt, output_text=out_clean))
+                    return True, out_clean, cand_label
+                last_err = fb_res or "生成結果が空でした"
+                _log(f"      ↳ 切替失敗 ({cand_label}): {last_err}")
+            except Exception as fb_e:
+                last_err = str(fb_e)
+                _log(f"      ↳ 切替エラー ({cand_label}): {last_err}")
+
+        return False, last_err, prim_label
+
     # -------------------------------------------------------------
     # 各エンジン別 API 実装
     # -------------------------------------------------------------
 
-    @staticmethod
-    def _call_gemini(prompt: str, api_key: str = "") -> str:
-        key = api_key.strip() or os.environ.get("GEMINI_API_KEY", "").strip()
+    @classmethod
+    def _call_gemini(cls, prompt: str, api_key: str = "", model_name: str = "") -> str:
+        key = cls._clean_secret_value(api_key) or cls._clean_secret_value(os.environ.get("GEMINI_API_KEY", ""))
         if not key:
             raise ValueError("Gemini APIキーが設定されていません。Excelの「AI APIキー」に入力するか「AI専用ウィンドウ連携=1」を使用してください。")
 
-        payload = {
-            "contents": [
-                {
-                    "parts": [{"text": prompt}]
-                }
-            ],
-            "generationConfig": {
+        pinned = (model_name or "").strip()
+        model_candidates = [pinned] if pinned else ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]
+        last_err = None
+        for m_name in model_candidates:
+            m_low = m_name.lower()
+            is_gemma4 = "gemma-4" in m_low
+            is_thinking = is_gemma4 or ("gemini-2.5" in m_low) or ("gemini-3" in m_low)
+            gen_cfg = {
                 "temperature": 0.7,
-                "maxOutputTokens": 220,
+                "maxOutputTokens": 600 if is_thinking else 240,
                 "topP": 0.95
             }
-        }
+            if is_gemma4:
+                gen_cfg["thinkingConfig"] = {"thinkingLevel": "minimal"}
 
-        last_err = None
-        for model_name in ["gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash"]:
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={key}"
-            req = urllib.request.Request(
-                url,
-                data=json.dumps(payload).encode("utf-8"),
-                headers={"Content-Type": "application/json"}
-            )
-            try:
+            payload = {
+                "contents": [{"parts": [{"text": prompt}]}],
+                "generationConfig": gen_cfg,
+            }
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{m_name}:generateContent?key={key}"
+
+            def _post_gemini(body: dict) -> str:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(body).encode("utf-8"),
+                    headers={
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                        "User-Agent": cls.DEFAULT_HTTP_USER_AGENT,
+                    }
+                )
                 with urllib.request.urlopen(req, timeout=18) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
                     candidates = data.get("candidates", [])
@@ -515,68 +1148,159 @@ class AIGenerator:
                     parts = content.get("parts", [])
                     if not parts:
                         raise ValueError("Geminiの回答パーツが空です")
-                    return parts[0].get("text", "")
+                    non_thought_texts = [p.get("text", "") for p in parts if not p.get("thought") and p.get("text")]
+                    out_txt = "\n".join(non_thought_texts) if non_thought_texts else parts[-1].get("text", "")
+                    usage_meta = data.get("usageMetadata") or {}
+                    cls._set_last_call_meta(
+                        engine="gemini",
+                        model=m_name,
+                        prompt_tokens=usage_meta.get("promptTokenCount"),
+                        completion_tokens=usage_meta.get("candidatesTokenCount"),
+                        thoughts_tokens=usage_meta.get("thoughtsTokenCount"),
+                        total_tokens=usage_meta.get("totalTokenCount"),
+                        prompt_chars=len(prompt),
+                        output_chars=len(out_txt),
+                        estimated=False if usage_meta else True,
+                    )
+                    return out_txt
+
+            try:
+                return _post_gemini(payload)
             except urllib.error.HTTPError as he:
-                last_err = he
-                if he.code == 404:
+                if he.code == 400 and "thinkingConfig" in gen_cfg:
+                    try:
+                        he.close()
+                    except Exception:
+                        pass
+                    try:
+                        fallback_cfg = {k: v for k, v in gen_cfg.items() if k != "thinkingConfig"}
+                        fallback_body = {"contents": payload["contents"], "generationConfig": fallback_cfg}
+                        return _post_gemini(fallback_body)
+                    except urllib.error.HTTPError as he2:
+                        last_err = RuntimeError(cls._format_http_error(he2, "Gemini"))
+                        if he2.code == 404 and not pinned:
+                            continue
+                        raise last_err
+                last_err = RuntimeError(cls._format_http_error(he, "Gemini"))
+                if he.code == 404 and not pinned:
                     continue
-                raise
+                raise last_err
             except Exception as e:
                 last_err = e
                 raise
         raise last_err or ValueError("Gemini API呼び出しに失敗しました")
 
-    @staticmethod
-    def _call_groq(prompt: str, api_key: str = "") -> str:
-        key = api_key.strip() or os.environ.get("GROQ_API_KEY", "").strip()
+    @classmethod
+    def _call_groq(cls, prompt: str, api_key: str = "", model_name: str = "") -> str:
+        key = cls._clean_secret_value(api_key) or cls._clean_secret_value(os.environ.get("GROQ_API_KEY", ""))
         if not key:
             raise ValueError("Groq APIキーが設定されていません。Excelの「AI APIキー / 接続URL」または環境変数 GROQ_API_KEY に入力してください。")
 
+        eff_model = (model_name or "").strip() or os.environ.get("GROQ_MODEL", "").strip() or "llama-3.3-70b-versatile"
+        m_low = eff_model.lower()
+        messages = [
+            {"role": "system", "content": cls.OPENAI_SYSTEM_PROMPTS["groq"]},
+            {"role": "user", "content": prompt}
+        ]
+
         url = "https://api.groq.com/openai/v1/chat/completions"
+        is_qwen3 = "qwen3" in m_low
+        is_gpt_oss = "gpt-oss" in m_low
+        is_reasoning = is_qwen3 or is_gpt_oss or ("deepseek-r1" in m_low) or ("qwq" in m_low)
+
         payload = {
-            "model": "llama-3.3-70b-versatile",
-            "messages": [
-                {"role": "system", "content": "あなたはX(Twitter)の親切なユーザーです。自然で好意的な日本語の返信本文のみを出力します。"},
-                {"role": "user", "content": prompt}
-            ],
-            "max_tokens": 160,
-            "temperature": 0.7
+            "model": eff_model,
+            "messages": messages,
+            "temperature": 0.7,
         }
+        if is_qwen3:
+            # Qwen3/3.8系は思考OFF(none)にしてトークン消費を節約しつつ本文だけ取得
+            payload["reasoning_effort"] = "none"
+            payload["max_completion_tokens"] = 512
+        elif is_gpt_oss:
+            # gpt-oss系はlow + 十分な完了トークン上限で本文欠損を防ぐ
+            payload["reasoning_effort"] = "low"
+            payload["max_completion_tokens"] = 1024
+        elif is_reasoning:
+            # deepseek-r1 / qwq等の思考モデルはlow + hidden + 十分な完了トークン上限で本文欠損を防ぐ
+            payload["reasoning_effort"] = "low"
+            payload["reasoning_format"] = "hidden"
+            payload["max_completion_tokens"] = 1024
+        else:
+            payload["max_tokens"] = 180
 
-        req = urllib.request.Request(
-            url,
-            data=json.dumps(payload).encode("utf-8"),
-            headers={
-                "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}"
-            }
-        )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+        def _post_groq(body: dict) -> str:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(body).encode("utf-8"),
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json",
+                    "Authorization": f"Bearer {key}",
+                    # CloudflareがPython-urllibをError 1010 (403)でブロックするのを防止
+                    "User-Agent": cls.DEFAULT_HTTP_USER_AGENT,
+                }
+            )
+            with urllib.request.urlopen(req, timeout=20) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                out_txt = data["choices"][0]["message"].get("content") or ""
+                usage = data.get("usage") or {}
+                cls._set_last_call_meta(
+                    engine="groq",
+                    model=data.get("model") or eff_model,
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                    total_tokens=usage.get("total_tokens"),
+                    prompt_chars=len(prompt),
+                    output_chars=len(out_txt),
+                    estimated=False if usage else True,
+                )
+                return out_txt
 
-    @staticmethod
-    def _call_openrouter(prompt: str, api_key: str = "") -> str:
-        key = api_key.strip() or os.environ.get("OPENROUTER_API_KEY", "").strip()
+        try:
+            return _post_groq(payload)
+        except urllib.error.HTTPError as he:
+            # 一部モデルでreasoning_effort/reasoning_formatが非対応で400となった場合は最小構成で自動リトライ
+            if he.code == 400 and is_reasoning:
+                try:
+                    he.close()
+                except Exception:
+                    pass
+                fallback_payload = {
+                    "model": eff_model,
+                    "messages": messages,
+                    "max_completion_tokens": 1024,
+                    "temperature": 0.7,
+                }
+                try:
+                    return _post_groq(fallback_payload)
+                except urllib.error.HTTPError as he2:
+                    raise RuntimeError(cls._format_http_error(he2, "Groq"))
+            raise RuntimeError(cls._format_http_error(he, "Groq"))
+
+    @classmethod
+    def _call_openrouter(cls, prompt: str, api_key: str = "", model_name: str = "") -> str:
+        key = cls._clean_secret_value(api_key) or cls._clean_secret_value(os.environ.get("OPENROUTER_API_KEY", ""))
         if not key:
             raise ValueError("OpenRouter APIキーが設定されていません。Excelの「AI APIキー / 接続URL」または環境変数 OPENROUTER_API_KEY に入力してください。")
 
         url = "https://openrouter.ai/api/v1/chat/completions"
-        free_models = [
+        pinned = (model_name or "").strip()
+        free_models = [pinned] if pinned else [
             "meta-llama/llama-3.3-70b-instruct:free",
             "google/gemini-2.0-flash-exp:free",
             "deepseek/deepseek-chat-v3-0324:free",
             "qwen/qwen-2.5-72b-instruct:free",
         ]
         last_err = None
-        for model_name in free_models:
+        for m_name in free_models:
             payload = {
-                "model": model_name,
+                "model": m_name,
                 "messages": [
-                    {"role": "system", "content": "あなたはX(Twitter)の自然なユーザーです。返信本文のみを出力します。"},
+                    {"role": "system", "content": cls.OPENAI_SYSTEM_PROMPTS["openrouter"]},
                     {"role": "user", "content": prompt}
                 ],
-                "max_tokens": 160,
+                "max_tokens": 220,
                 "temperature": 0.7
             }
             req = urllib.request.Request(
@@ -584,7 +1308,9 @@ class AIGenerator:
                 data=json.dumps(payload).encode("utf-8"),
                 headers={
                     "Content-Type": "application/json",
+                    "Accept": "application/json",
                     "Authorization": f"Bearer {key}",
+                    "User-Agent": cls.DEFAULT_HTTP_USER_AGENT,
                     "HTTP-Referer": "https://github.com/shinky0924-wq/XAutoTool_",
                     "X-Title": "XAutoTool"
                 }
@@ -592,31 +1318,46 @@ class AIGenerator:
             try:
                 with urllib.request.urlopen(req, timeout=18) as resp:
                     data = json.loads(resp.read().decode("utf-8"))
-                    return data["choices"][0]["message"]["content"]
+                    out_txt = data["choices"][0]["message"].get("content") or ""
+                    usage = data.get("usage") or {}
+                    cls._set_last_call_meta(
+                        engine="openrouter",
+                        model=data.get("model") or m_name,
+                        prompt_tokens=usage.get("prompt_tokens"),
+                        completion_tokens=usage.get("completion_tokens"),
+                        total_tokens=usage.get("total_tokens"),
+                        prompt_chars=len(prompt),
+                        output_chars=len(out_txt),
+                        estimated=False if usage else True,
+                    )
+                    return out_txt
             except urllib.error.HTTPError as he:
-                last_err = he
-                if he.code in (400, 404, 429, 503):
+                last_err = RuntimeError(cls._format_http_error(he, "OpenRouter"))
+                if he.code in (400, 404, 429, 503) and not pinned:
                     continue
-                raise
+                raise last_err
             except Exception as e:
                 last_err = e
-                continue
+                if not pinned:
+                    continue
+                raise
         raise last_err or ValueError("OpenRouter API呼び出しに失敗しました")
 
-    @staticmethod
-    def _call_deepseek(prompt: str, api_key: str = "") -> str:
-        key = api_key.strip() or os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    @classmethod
+    def _call_deepseek(cls, prompt: str, api_key: str = "", model_name: str = "") -> str:
+        key = cls._clean_secret_value(api_key) or cls._clean_secret_value(os.environ.get("DEEPSEEK_API_KEY", ""))
         if not key:
             raise ValueError("DeepSeek APIキーが設定されていません。https://chat.deepseek.com/ のWeb連携またはAPIキーを入力してください。")
 
         url = "https://api.deepseek.com/chat/completions"
+        eff_model = (model_name or "").strip() or "deepseek-chat"
         payload = {
-            "model": "deepseek-chat",
+            "model": eff_model,
             "messages": [
-                {"role": "system", "content": "あなたはX(Twitter)の親しみやすいユーザーです。返信本文のみを出力します。"},
+                {"role": "system", "content": cls.OPENAI_SYSTEM_PROMPTS["deepseek"]},
                 {"role": "user", "content": prompt}
             ],
-            "max_tokens": 160,
+            "max_tokens": 400 if "reasoner" in eff_model.lower() else 160,
             "temperature": 0.7
         }
         req = urllib.request.Request(
@@ -624,19 +1365,37 @@ class AIGenerator:
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}"
+                "Accept": "application/json",
+                "Authorization": f"Bearer {key}",
+                "User-Agent": cls.DEFAULT_HTTP_USER_AGENT,
             }
         )
-        with urllib.request.urlopen(req, timeout=18) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+        try:
+            with urllib.request.urlopen(req, timeout=18) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                out_txt = data["choices"][0]["message"].get("content") or ""
+                usage = data.get("usage") or {}
+                cls._set_last_call_meta(
+                    engine="deepseek",
+                    model=data.get("model") or eff_model,
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                    total_tokens=usage.get("total_tokens"),
+                    prompt_chars=len(prompt),
+                    output_chars=len(out_txt),
+                    estimated=False if usage else True,
+                )
+                return out_txt
+        except urllib.error.HTTPError as he:
+            raise RuntimeError(cls._format_http_error(he, "DeepSeek"))
 
-    @staticmethod
-    def _call_ollama(prompt: str, endpoint: str = "http://localhost:11434") -> str:
+    @classmethod
+    def _call_ollama(cls, prompt: str, endpoint: str = "http://localhost:11434", model_name: str = "") -> str:
         base = endpoint.rstrip("/")
         url = f"{base}/api/generate"
+        eff_model = (model_name or "").strip() or "llama3"
         payload = {
-            "model": "llama3",
+            "model": eff_model,
             "prompt": prompt,
             "stream": False
         }
@@ -648,10 +1407,23 @@ class AIGenerator:
         )
         with urllib.request.urlopen(req, timeout=25) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data.get("response", "")
+            out_txt = data.get("response", "")
+            pt = data.get("prompt_eval_count")
+            ct = data.get("eval_count")
+            cls._set_last_call_meta(
+                engine="ollama",
+                model=data.get("model") or eff_model,
+                prompt_tokens=pt,
+                completion_tokens=ct,
+                total_tokens=(int(pt) + int(ct)) if (pt is not None and ct is not None) else None,
+                prompt_chars=len(prompt),
+                output_chars=len(out_txt),
+                estimated=False if (pt is not None or ct is not None) else True,
+            )
+            return out_txt
 
-    @staticmethod
-    def _call_chrome_builtin(page, prompt: str) -> str:
+    @classmethod
+    def _call_chrome_builtin(cls, page, prompt: str) -> str:
         """
         Chrome 128+ 内蔵の Gemini Nano Prompt API (window.ai.languageModel / LanguageModel) を直接実行
         """
@@ -682,19 +1454,30 @@ class AIGenerator:
         }
         """
         res = page.evaluate(js_code, prompt)
-        return str(res)
+        out_txt = str(res)
+        cls._set_last_call_meta(
+            engine="chrome_builtin",
+            model="gemini-nano",
+            prompt_tokens=cls.estimate_tokens(prompt),
+            completion_tokens=cls.estimate_tokens(out_txt),
+            prompt_chars=len(prompt),
+            output_chars=len(out_txt),
+            estimated=True,
+        )
+        return out_txt
 
-    @staticmethod
-    def _call_grok(prompt: str, api_key: str = "") -> str:
-        key = api_key.strip() or os.environ.get("XAI_API_KEY", "").strip()
+    @classmethod
+    def _call_grok(cls, prompt: str, api_key: str = "", model_name: str = "") -> str:
+        key = cls._clean_secret_value(api_key) or cls._clean_secret_value(os.environ.get("XAI_API_KEY", ""))
         if not key:
             raise ValueError("xAI Grok APIキーが設定されていません。Excelの「AI APIキー / 接続URL」に入力してください。")
 
         url = "https://api.x.ai/v1/chat/completions"
+        eff_model = (model_name or "").strip() or "grok-beta"
         payload = {
-            "model": "grok-beta",
+            "model": eff_model,
             "messages": [
-                {"role": "system", "content": "あなたは親しみやすいXユーザーです。返信本文のみを出力します。"},
+                {"role": "system", "content": cls.OPENAI_SYSTEM_PROMPTS["grok"]},
                 {"role": "user", "content": prompt}
             ],
             "max_tokens": 150,
@@ -706,25 +1489,44 @@ class AIGenerator:
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
-                "Authorization": f"Bearer {key}"
+                "Accept": "application/json",
+                "Authorization": f"Bearer {key}",
+                "User-Agent": cls.DEFAULT_HTTP_USER_AGENT,
             }
         )
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+        try:
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+                out_txt = data["choices"][0]["message"].get("content") or ""
+                usage = data.get("usage") or {}
+                cls._set_last_call_meta(
+                    engine="grok",
+                    model=data.get("model") or eff_model,
+                    prompt_tokens=usage.get("prompt_tokens"),
+                    completion_tokens=usage.get("completion_tokens"),
+                    total_tokens=usage.get("total_tokens"),
+                    prompt_chars=len(prompt),
+                    output_chars=len(out_txt),
+                    estimated=False if usage else True,
+                )
+                return out_txt
+        except urllib.error.HTTPError as he:
+            raise RuntimeError(cls._format_http_error(he, "xAI Grok"))
 
-    @staticmethod
-    def _call_lmstudio(prompt: str, endpoint: str = "http://localhost:1234") -> str:
+    @classmethod
+    def _call_lmstudio(cls, prompt: str, endpoint: str = "http://localhost:1234", model_name: str = "") -> str:
         base = endpoint.rstrip("/")
         url = f"{base}/v1/chat/completions"
         payload = {
             "messages": [
-                {"role": "system", "content": "返信本文のみを出力してください。"},
+                {"role": "system", "content": cls.OPENAI_SYSTEM_PROMPTS["lmstudio"]},
                 {"role": "user", "content": prompt}
             ],
             "temperature": 0.7,
             "max_tokens": 150
         }
+        if (model_name or "").strip():
+            payload["model"] = model_name.strip()
 
         req = urllib.request.Request(
             url,
@@ -733,13 +1535,28 @@ class AIGenerator:
         )
         with urllib.request.urlopen(req, timeout=20) as resp:
             data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+            out_txt = data["choices"][0]["message"].get("content") or ""
+            usage = data.get("usage") or {}
+            cls._set_last_call_meta(
+                engine="lmstudio",
+                model=data.get("model") or (model_name or "").strip() or "lmstudio",
+                prompt_tokens=usage.get("prompt_tokens"),
+                completion_tokens=usage.get("completion_tokens"),
+                total_tokens=usage.get("total_tokens"),
+                prompt_chars=len(prompt),
+                output_chars=len(out_txt),
+                estimated=False if usage else True,
+            )
+            return out_txt
 
     @staticmethod
     def _sanitize_output(text: str) -> str:
-        """生成結果から見出し・挨拶・文字数メモ・引用符などをクリーニングし、自然な本文のみを抽出"""
+        """生成結果から見出し・挨拶・文字数メモ・引用符・<think>思考タグなどをクリーニングし、自然な本文のみを抽出"""
         clean = (text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
         if not clean:
+            return ""
+        clean = re.sub(r"<think>.*?</think>", "", clean, flags=re.DOTALL | re.IGNORECASE).strip()
+        if clean.lower().startswith("<think>"):
             return ""
 
         # 万が一3案の比較後に「最適案」「最終案」等を出力した場合は、その後の本文を優先抽出
@@ -1031,8 +1848,9 @@ class AIDedicatedWindowManager:
 
         input_el = None
         login_notified = False
+        max_wait_sec = float(getattr(cls._get_state(), "web_login_wait_sec", None) or 180.0)
         wait_start = time.time()
-        while time.time() - wait_start < 180.0:
+        while time.time() - wait_start < max_wait_sec:
             input_el = cls._find_visible_input(ai_page, input_selectors)
             if input_el is not None:
                 return input_el
@@ -1177,10 +1995,11 @@ class AIDedicatedWindowManager:
             ai_page.keyboard.press("Enter")
 
         print(f"   🤖 [AI専用ウィンドウ] {service_label} でリプライ/引用文を生成中（改行保持プロンプト送信済）...")
+        eff_timeout = float(getattr(cls._get_state(), "web_stream_timeout_sec", None) or timeout_sec)
         gen_start = time.time()
         last_txt = ""
         stable_ticks = 0
-        while time.time() - gen_start < timeout_sec:
+        while time.time() - gen_start < eff_timeout:
             time.sleep(0.8)
             cur_txt = ""
             for rsel in resp_selectors:
@@ -1707,6 +2526,194 @@ class AIDedicatedWindowManager:
             return False, f"Mistral Le Chat Web連携エラー: {e}"
 
     @classmethod
+    def _generate_via_venice_web(cls, ai_page, prompt: str, custom_url: str = "") -> Tuple[bool, str]:
+        """Venice AI (https://venice.ai/chat - 登録不要ゲスト利用可) 連携"""
+        try:
+            target = custom_url or "https://venice.ai/chat"
+            cur_url = ai_page.url or ""
+            if "venice.ai" not in cur_url:
+                print(f"🌐 [AI専用ウィンドウ] Venice AI ({target}) へ移動します...")
+                ai_page.goto(target, timeout=35000, wait_until="domcontentloaded")
+                time.sleep(2.5)
+
+            for guest_sel in [
+                'button:has-text("Try without")',
+                'button:has-text("Continue as Guest")',
+                'button:has-text("Start Chatting")',
+                'button:has-text("Accept")',
+                'button:has-text("I Agree")',
+                'button:has-text("同意")',
+            ]:
+                try:
+                    btn = ai_page.locator(guest_sel)
+                    if btn.count() > 0 and btn.first.is_visible():
+                        btn.first.click(timeout=2500)
+                        time.sleep(1.0)
+                except Exception:
+                    continue
+
+            input_el = cls._wait_for_input_or_login(
+                ai_page,
+                input_selectors=[
+                    'textarea[placeholder*="Ask"]',
+                    'textarea[placeholder*="Message"]',
+                    'textarea[placeholder*="Type"]',
+                    'textarea',
+                    'div[contenteditable="true"]',
+                ],
+                service_label="Venice AI",
+                target_url=target,
+                login_markers=[],
+                new_chat_selectors=['button:has-text("New Chat")', 'button[aria-label*="New"]']
+            )
+            if input_el is None:
+                return False, "Venice AIの入力欄が検出できませんでした"
+
+            return cls._submit_and_stream_response(
+                ai_page,
+                input_el,
+                prompt,
+                resp_selectors=[
+                    'div[class*="assistant"]',
+                    '.prose',
+                    '.markdown',
+                    'article',
+                ],
+                send_selectors=[
+                    'button[type="submit"]',
+                    'button[aria-label*="Send"]',
+                    'button[aria-label*="送信"]',
+                ],
+                stop_selectors=[
+                    'button[aria-label*="Stop"]',
+                    'button[aria-label*="停止"]',
+                ],
+                service_label="Venice AI Web"
+            )
+        except Exception as e:
+            return False, f"Venice AI Web連携エラー: {e}"
+
+    @classmethod
+    def _generate_via_deepai_web(cls, ai_page, prompt: str, custom_url: str = "") -> Tuple[bool, str]:
+        """DeepAI Chat (https://deepai.org/chat - 登録不要・無料) 連携"""
+        try:
+            target = custom_url or "https://deepai.org/chat"
+            cur_url = ai_page.url or ""
+            if "deepai.org" not in cur_url:
+                print(f"🌐 [AI専用ウィンドウ] DeepAI Chat ({target}) へ移動します...")
+                ai_page.goto(target, timeout=35000, wait_until="domcontentloaded")
+                time.sleep(2.5)
+
+            for agree_sel in [
+                'button:has-text("Accept")',
+                'button:has-text("Agree")',
+                'button:has-text("Continue")',
+                'button:has-text("同意")',
+            ]:
+                try:
+                    btn = ai_page.locator(agree_sel)
+                    if btn.count() > 0 and btn.first.is_visible():
+                        btn.first.click(timeout=2000)
+                        time.sleep(0.8)
+                except Exception:
+                    continue
+
+            input_el = cls._wait_for_input_or_login(
+                ai_page,
+                input_selectors=[
+                    'textarea.chatbox',
+                    'textarea[placeholder*="Chat"]',
+                    'textarea[placeholder*="Ask"]',
+                    'textarea',
+                    'div[contenteditable="true"]',
+                ],
+                service_label="DeepAI Chat",
+                target_url=target,
+                login_markers=[],
+                new_chat_selectors=['button:has-text("New Chat")', 'button:has-text("Clear")']
+            )
+            if input_el is None:
+                return False, "DeepAI Chatの入力欄が検出できませんでした"
+
+            return cls._submit_and_stream_response(
+                ai_page,
+                input_el,
+                prompt,
+                resp_selectors=[
+                    '.markdown-body',
+                    '.outputBox',
+                    'div[class*="chatMessage"]',
+                    '.prose',
+                    '.markdown',
+                ],
+                send_selectors=[
+                    'button#chatSubmitButton',
+                    'button[type="submit"]',
+                    'button:has-text("Send")',
+                    'button[aria-label*="Send"]',
+                ],
+                stop_selectors=[
+                    'button[aria-label*="Stop"]',
+                    'button:has-text("Stop")',
+                ],
+                service_label="DeepAI Chat Web"
+            )
+        except Exception as e:
+            return False, f"DeepAI Chat Web連携エラー: {e}"
+
+    @classmethod
+    def _generate_via_talkai_web(cls, ai_page, prompt: str, custom_url: str = "") -> Tuple[bool, str]:
+        """TalkAI (https://talkai.info/ - 登録不要・無料チャット) 連携"""
+        try:
+            target = custom_url or "https://talkai.info/"
+            cur_url = ai_page.url or ""
+            if "talkai.info" not in cur_url:
+                print(f"🌐 [AI専用ウィンドウ] TalkAI ({target}) へ移動します...")
+                ai_page.goto(target, timeout=35000, wait_until="domcontentloaded")
+                time.sleep(2.5)
+
+            input_el = cls._wait_for_input_or_login(
+                ai_page,
+                input_selectors=[
+                    'textarea[placeholder*="Ask"]',
+                    'textarea[placeholder*="Message"]',
+                    'textarea',
+                    'div[contenteditable="true"]',
+                    'input[type="text"]',
+                ],
+                service_label="TalkAI",
+                target_url=target,
+                login_markers=[],
+                new_chat_selectors=['button:has-text("New")', 'button:has-text("Clear")']
+            )
+            if input_el is None:
+                return False, "TalkAIの入力欄が検出できませんでした"
+
+            return cls._submit_and_stream_response(
+                ai_page,
+                input_el,
+                prompt,
+                resp_selectors=[
+                    'div[class*="assistant"]',
+                    'div[class*="message"]',
+                    '.markdown',
+                    '.prose',
+                    'article',
+                ],
+                send_selectors=[
+                    'button[type="submit"]',
+                    'button:has-text("Send")',
+                    'button[aria-label*="Send"]',
+                ],
+                stop_selectors=[
+                    'button[aria-label*="Stop"]',
+                ],
+                service_label="TalkAI Web"
+            )
+        except Exception as e:
+            return False, f"TalkAI Web連携エラー: {e}"
+
+    @classmethod
     def _generate_via_generic_web_ai(cls, ai_page, prompt: str, target_url: str) -> Tuple[bool, str]:
         """接続URLに直接指定された任意のWeb AIチャットサイトとの汎用連携"""
         try:
@@ -1765,16 +2772,25 @@ class AIDedicatedWindowManager:
         base_dir: str = ".",
         slot_id: int = 1,
         parent_post_text: str = "",
-        prompt_config: Optional[dict] = None
+        prompt_config: Optional[dict] = None,
+        model_name: str = "",
+        is_fallback: bool = False
     ) -> Tuple[bool, str]:
         """
         AI専用ウィンドウで選択されたAIエンジン・接続URLを起動して文章を生成し、クリップボードおよび戻り値として返却
         """
-        eff_eng, target_url = AIGenerator.resolve_engine_and_url(engine, api_key)
+        eff_eng, _ = AIGenerator.resolve_engine_and_url(engine, api_key)
         if eff_eng in ["none", "off", "無効", ""]:
             return False, "AIエンジンが未指定または無効です"
 
+        scoped_val = AIGenerator.get_key_or_url_for_engine(eff_eng, api_key, primary_engine=eff_eng)
         has_key = AIGenerator.has_api_key(eff_eng, api_key)
+        st = cls._get_state()
+        prev_login_wait = getattr(st, "web_login_wait_sec", None)
+        prev_stream_timeout = getattr(st, "web_stream_timeout_sec", None)
+        if is_fallback:
+            st.web_login_wait_sec = 8.0
+            st.web_stream_timeout_sec = 30.0
         try:
             ai_page = cls.get_or_create_ai_page(
                 playwright,
@@ -1783,7 +2799,7 @@ class AIDedicatedWindowManager:
                 initial_engine=eff_eng,
                 has_api_key=has_key,
                 slot_id=slot_id,
-                connection_url=api_key
+                connection_url=scoped_val
             )
 
             ok = False
@@ -1802,7 +2818,8 @@ class AIDedicatedWindowManager:
                     page=ai_page,
                     use_dedicated_window=True,
                     parent_post_text=parent_post_text,
-                    prompt_config=prompt_config
+                    prompt_config=prompt_config,
+                    model_name=model_name
                 )
                 if ok and result_text:
                     try:
@@ -1825,7 +2842,7 @@ class AIDedicatedWindowManager:
                         pass
 
             # 2. Chrome内蔵AI指定時
-            elif eff_eng == "chrome_builtin" and not AIGenerator.is_web_url(api_key):
+            elif eff_eng == "chrome_builtin" and not AIGenerator.is_web_url(scoped_val):
                 ok, result_text = AIGenerator.generate_comment(
                     engine=eff_eng,
                     post_url=post_url,
@@ -1837,9 +2854,10 @@ class AIDedicatedWindowManager:
                     page=ai_page,
                     use_dedicated_window=True,
                     parent_post_text=parent_post_text,
-                    prompt_config=prompt_config
+                    prompt_config=prompt_config,
+                    model_name=model_name
                 )
-                if not ok:
+                if not ok and not is_fallback:
                     prompt = AIGenerator.build_prompt(
                         post_url, post_text, action_type, target_name, custom_prompt,
                         parent_post_text=parent_post_text, prompt_config=prompt_config
@@ -1852,7 +2870,7 @@ class AIDedicatedWindowManager:
                     post_url, post_text, action_type, target_name, custom_prompt,
                     parent_post_text=parent_post_text, prompt_config=prompt_config
                 )
-                custom_web_url = api_key.strip() if AIGenerator.is_web_url(api_key) else ""
+                custom_web_url = scoped_val.strip() if AIGenerator.is_web_url(scoped_val) else ""
                 if eff_eng == "chatgpt":
                     ok, result_text = cls._generate_via_chatgpt_web(ai_page, prompt, custom_web_url)
                 elif eff_eng == "claude":
@@ -1863,6 +2881,12 @@ class AIDedicatedWindowManager:
                     ok, result_text = cls._generate_via_deepseek_web(ai_page, prompt, custom_web_url)
                 elif eff_eng == "duckai":
                     ok, result_text = cls._generate_via_duckai_web(ai_page, prompt, custom_web_url)
+                elif eff_eng == "venice":
+                    ok, result_text = cls._generate_via_venice_web(ai_page, prompt, custom_web_url)
+                elif eff_eng == "deepai":
+                    ok, result_text = cls._generate_via_deepai_web(ai_page, prompt, custom_web_url)
+                elif eff_eng == "talkai":
+                    ok, result_text = cls._generate_via_talkai_web(ai_page, prompt, custom_web_url)
                 elif eff_eng == "qwen":
                     ok, result_text = cls._generate_via_qwen_web(ai_page, prompt, custom_web_url)
                 elif eff_eng == "mistral":
@@ -1873,7 +2897,7 @@ class AIDedicatedWindowManager:
                     ok, result_text = cls._generate_via_copilot_web(ai_page, prompt, custom_web_url)
                 elif eff_eng == "gemini":
                     ok, result_text = cls._generate_via_gemini_web(ai_page, prompt, custom_web_url)
-                    if not ok:
+                    if not ok and not is_fallback:
                         try:
                             txt = AIGenerator._call_chrome_builtin(ai_page, prompt)
                             clean = AIGenerator._sanitize_output(txt)
@@ -1887,6 +2911,21 @@ class AIDedicatedWindowManager:
                     ok, result_text = cls._generate_via_gemini_web(ai_page, prompt)
 
             if ok and result_text:
+                cur_meta = AIGenerator.get_last_call_meta()
+                if not cur_meta.get("engine"):
+                    used_prompt = prompt if 'prompt' in locals() else AIGenerator.build_prompt(
+                        post_url, post_text, action_type, target_name, custom_prompt,
+                        parent_post_text=parent_post_text, prompt_config=prompt_config
+                    )
+                    AIGenerator._set_last_call_meta(
+                        engine=eff_eng,
+                        model=(model_name or (custom_web_url if 'custom_web_url' in locals() and custom_web_url else "web")),
+                        prompt_tokens=AIGenerator.estimate_tokens(used_prompt),
+                        completion_tokens=AIGenerator.estimate_tokens(result_text),
+                        prompt_chars=len(used_prompt),
+                        output_chars=len(result_text),
+                        estimated=True,
+                    )
                 try:
                     ai_page.evaluate("(text) => { try { navigator.clipboard && navigator.clipboard.writeText(text); } catch(e){} }", result_text)
                 except Exception:
@@ -1897,3 +2936,6 @@ class AIDedicatedWindowManager:
 
         except Exception as e:
             return False, f"AI専用ウィンドウエラー: {str(e)}"
+        finally:
+            st.web_login_wait_sec = prev_login_wait
+            st.web_stream_timeout_sec = prev_stream_timeout
