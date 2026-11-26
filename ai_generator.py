@@ -82,6 +82,161 @@ class AIGenerator:
         "lmstudio": "返信本文のみを出力してください。",
     }
 
+    SKIP_SIGNAL_PREFIX = "__AI_SKIP_RULE__:"
+
+    @classmethod
+    def is_skip_token_prefix(cls, text: str) -> bool:
+        return str(text or "").startswith(cls.SKIP_SIGNAL_PREFIX)
+
+    @classmethod
+    def extract_skip_reason(cls, text: str) -> str:
+        s = str(text or "")
+        if s.startswith(cls.SKIP_SIGNAL_PREFIX):
+            return s[len(cls.SKIP_SIGNAL_PREFIX):].strip() or "出力ルール対象外"
+        return s.strip() or "出力ルール対象外"
+
+    @classmethod
+    def detect_skip_response(cls, raw_text: str, clean_text: Optional[str] = None) -> Tuple[bool, str]:
+        """AIが空欄・SKIP・「返信しない」・「対象外」等のスキップ指示を返したかを判定する"""
+        for val in (raw_text, clean_text):
+            s_val = str(val or "").strip()
+            if cls.is_skip_token_prefix(s_val):
+                return True, cls.extract_skip_reason(s_val)
+
+        raw_s = str(raw_text or "").strip()
+        # 明示的な空文字括弧（"" / 「」 / （空欄） 等）を空欄スキップとして検知
+        if raw_s in {'""', "''", "「」", "『』", "“”", "()", "（）", "[]", "【】"}:
+            return True, "空欄"
+
+        candidates = []
+        if clean_text is not None:
+            candidates.append(str(clean_text).strip())
+        if raw_s:
+            candidates.append(raw_s)
+
+        exact_skip_tokens = {
+            "skip", "ng", "none", "n/a", "na", "no_reply", "noreply", "pass", "null", "empty",
+            "空欄", "空白", "無回答", "なし", "無し", "該当なし", "該当しません",
+            "対象外", "対象外です", "条件外", "スキップ", "スキップする", "スキップします",
+            "見送り", "見送る", "見送ります",
+            "返信しない", "返信しません", "返信不要", "返信不可",
+            "リプライしない", "リプライしません", "リプライ不要",
+            "引用しない", "引用しません", "引用不要", "引用リツイートしない", "引用rtしない",
+            "投稿しない", "投稿しません", "ポストしない", "ポストしません",
+            "反応しない", "反応しません",
+        }
+
+        for cand in candidates:
+            if not cand:
+                continue
+            s = cand.strip()
+            for _ in range(2):
+                for lq, rq in [('"', '"'), ("'", "'"), ("「", "」"), ("『", "』"), ("“", "”"), ("(", ")"), ("（", "）"), ("[", "]"), ("【", "】")]:
+                    if s.startswith(lq) and s.endswith(rq) and len(s) >= 2:
+                        s = s[1:-1].strip()
+            norm = s.strip().rstrip(".。…・!！?？:：").strip()
+            if not norm:
+                if cand in {'""', "''", "「」", "『』", "“”", "()", "（）", "[]", "【】"}:
+                    return True, "空欄"
+                continue
+            if norm.lower() in exact_skip_tokens:
+                return True, norm
+            if len(norm) <= 90:
+                if re.match(r"^(?:【?\s*(?:SKIP|スキップ|対象外|該当なし|NG|返信しない|リプライしない|引用しない|投稿しない)\s*】?(?:[\s:：\-（(]|$))", norm, re.IGNORECASE):
+                    return True, norm
+                if re.search(
+                    r"(?:(?:返信|リプライ|引用(?:リツイート|rt)?|投稿|ポスト|反応)(?:は|を|し)?(?:いた)?しません"
+                    r"|(?:返信|リプライ|引用(?:リツイート|rt)?|投稿|ポスト)しない(?:ことにします|判断|対象|方向)?"
+                    r"|(?:スキップ|対象外|該当なし|見送り)(?:と?(?:いた)?します|です|と判定)"
+                    r"|のため(?:返信|リプライ|引用|投稿|スキップ)(?:いた)?(?:しません|しない|します))$",
+                    norm,
+                    re.IGNORECASE,
+                ):
+                    return True, norm
+        return False, ""
+
+    @classmethod
+    def _finalize_api_text(cls, raw_text: str, prompt_text: str = "") -> Tuple[bool, str]:
+        """API応答テキストをサニタイズし、正常な空欄・SKIP応答はスキップ指示として返す"""
+        raw_s = str(raw_text or "").strip()
+        clean = cls._sanitize_output(raw_s)
+        if cls.is_prompt_echo(raw_s, prompt_text) or cls.is_prompt_echo(clean, prompt_text):
+            return False, "AIが入力プロンプト本文をそのまま返したため無効と判定しました"
+        is_skip, reason = cls.detect_skip_response(raw_s, clean)
+        if is_skip:
+            return True, f"{cls.SKIP_SIGNAL_PREFIX}{reason}"
+        if not clean:
+            return True, f"{cls.SKIP_SIGNAL_PREFIX}空欄"
+        return True, clean
+
+    @classmethod
+    def is_prompt_echo(cls, text: str, prompt_text: str = "") -> bool:
+        """入力プロンプト本文またはその一部（キャラ設定・投稿情報・出力ルール等）が誤って拾われていないか判定する"""
+        raw_s = str(text or "").strip()
+        if not raw_s:
+            return False
+        sanitized_s = cls._sanitize_output(raw_s)
+
+        prompt_markers = (
+            "以下の投稿に対して、魅力的な",
+            "以下の【設定・指示】と【対象の投稿情報】を踏まえ",
+            "【対象の投稿情報】",
+            "【対象の投稿情報（やり取り・返信への反応）】",
+            "【元ポスト（会話の前提）】",
+            "【対象者の返信内容】",
+            "【作成方針（自動選定）】",
+            "【出力ルール（厳守）】",
+            "【口調・文体ルール】",
+            "【キャラ設定】",
+            "【お手本サンプル（参考例）】",
+            "【NGルール】",
+            "※検討過程や他案・比較・番号",
+            "実際にXへ投稿する本文のみを1つ返してください",
+        )
+        for sample in (raw_s, sanitized_s):
+            if not sample:
+                continue
+            for marker in prompt_markers:
+                if marker in sample:
+                    return True
+
+        p_raw = str(prompt_text or "").strip()
+        if not p_raw:
+            return False
+
+        prompt_ws = " ".join(p_raw.split())
+        if not prompt_ws:
+            return False
+
+        # お手本サンプル欄は正当な生成文と表現が重なりやすいため部分一致判定の対象外にする
+        p_non_example = re.sub(
+            r"【(?:お手本|サンプル|参考例)[^】]*】.*?(?=\n\s*【|$)",
+            "",
+            p_raw,
+            flags=re.DOTALL,
+        )
+        prompt_non_ex_ws = " ".join(p_non_example.split())
+
+        for sample in (raw_s, sanitized_s):
+            if not sample:
+                continue
+            cand_ws = " ".join(sample.split())
+            if not cand_ws:
+                continue
+            if cand_ws == prompt_ws:
+                return True
+            cand_trimmed = cand_ws.rstrip("….").strip()
+            if len(cand_trimmed) >= 20 and prompt_ws.startswith(cand_trimmed):
+                return True
+            if len(prompt_ws) >= 24 and prompt_ws[:24] in cand_ws:
+                return True
+            if len(cand_ws) >= 24 and cand_ws[:24] == prompt_ws[:24]:
+                return True
+            if len(cand_trimmed) >= 22 and prompt_non_ex_ws and cand_trimmed in prompt_non_ex_ws:
+                return True
+
+        return False
+
     _last_call_meta = threading.local()
 
     @staticmethod
@@ -689,40 +844,33 @@ class AIGenerator:
                 if not key and page is not None:
                     try:
                         text = cls._call_chrome_builtin(page, prompt)
-                        clean = cls._sanitize_output(text)
-                        if clean:
-                            return True, clean
+                        return cls._finalize_api_text(text, prompt_text=prompt)
                     except Exception:
                         pass
                 text = cls._call_gemini(prompt, key, model_name=model_name)
-                clean = cls._sanitize_output(text)
-                return (True, clean) if clean else (False, "AIの生成結果が空でした")
+                return cls._finalize_api_text(text, prompt_text=prompt)
 
             # 2. Groq Cloud (超高速推論)
             elif eff_eng == "groq":
                 text = cls._call_groq(prompt, scoped_key, model_name=model_name)
-                clean = cls._sanitize_output(text)
-                return (True, clean) if clean else (False, "AIの生成結果が空でした")
+                return cls._finalize_api_text(text, prompt_text=prompt)
 
             # 3. OpenRouter (各種LLM集約)
             elif eff_eng == "openrouter":
                 text = cls._call_openrouter(prompt, scoped_key, model_name=model_name)
-                clean = cls._sanitize_output(text)
-                return (True, clean) if clean else (False, "AIの生成結果が空でした")
+                return cls._finalize_api_text(text, prompt_text=prompt)
 
             # 4. Ollama (ローカルLLM)
             elif eff_eng == "ollama":
                 endpoint = scoped_key if cls.is_local_url(scoped_key) else "http://localhost:11434"
                 text = cls._call_ollama(prompt, endpoint, model_name=model_name)
-                clean = cls._sanitize_output(text)
-                return (True, clean) if clean else (False, "AIの生成結果が空でした")
+                return cls._finalize_api_text(text, prompt_text=prompt)
 
             # 5. Chrome 内蔵 AI (Gemini Nano / window.ai)
             elif eff_eng == "chrome_builtin":
                 if page is not None:
                     text = cls._call_chrome_builtin(page, prompt)
-                    clean = cls._sanitize_output(text)
-                    return (True, clean) if clean else (False, "AIの生成結果が空でした")
+                    return cls._finalize_api_text(text, prompt_text=prompt)
                 else:
                     return False, "Chrome内蔵AIの実行にはブラウザページが必要です"
 
@@ -730,22 +878,19 @@ class AIGenerator:
             elif eff_eng == "grok":
                 key = "" if cls.is_web_url(scoped_key) else scoped_key
                 text = cls._call_grok(prompt, key, model_name=model_name)
-                clean = cls._sanitize_output(text)
-                return (True, clean) if clean else (False, "AIの生成結果が空でした")
+                return cls._finalize_api_text(text, prompt_text=prompt)
 
             # 7. DeepSeek API
             elif eff_eng == "deepseek":
                 key = "" if cls.is_web_url(scoped_key) else scoped_key
                 text = cls._call_deepseek(prompt, key, model_name=model_name)
-                clean = cls._sanitize_output(text)
-                return (True, clean) if clean else (False, "AIの生成結果が空でした")
+                return cls._finalize_api_text(text, prompt_text=prompt)
 
             # 8. LM Studio (ローカル)
             elif eff_eng == "lmstudio":
                 endpoint = scoped_key if cls.is_local_url(scoped_key) else "http://localhost:1234"
                 text = cls._call_lmstudio(prompt, endpoint, model_name=model_name)
-                clean = cls._sanitize_output(text)
-                return (True, clean) if clean else (False, "AIの生成結果が空でした")
+                return cls._finalize_api_text(text, prompt_text=prompt)
 
             # 9. Webチャット専用エンジン (ChatGPT / Claude / Perplexity / Copilot)
             elif eff_eng in cls.WEB_ONLY_ENGINES or cls.is_web_url(scoped_key):
@@ -1062,10 +1207,20 @@ class AIGenerator:
 
         # 1. プライマリ試行
         ok, res = _attempt_one(prim_spec_eng, prim_mod, prim_key, is_fb=False)
-        if ok and res and res.strip():
-            out_clean = res.strip()
-            _log(cls.format_last_usage_log(prim_label, prompt_text=preview_prompt, output_text=out_clean))
-            return True, out_clean, prim_label
+        if ok and cls.is_prompt_echo(res, preview_prompt):
+            ok = False
+            res = "AIが入力プロンプト本文をそのまま返したため無効と判定しました"
+        if ok:
+            is_skip, skip_reason = cls.detect_skip_response(res)
+            if is_skip:
+                skip_token = f"{cls.SKIP_SIGNAL_PREFIX}{skip_reason}"
+                _log(cls.format_last_usage_log(prim_label, prompt_text=preview_prompt, output_text=f"[スキップ:{skip_reason}]"))
+                _log(f"   ⏭️ [AI出力ルール判定スキップ / {prim_label}] 「{skip_reason}」→ 他AIへの切替や定型文は使わずこのポストをスキップします")
+                return True, skip_token, prim_label
+            if res and res.strip():
+                out_clean = res.strip()
+                _log(cls.format_last_usage_log(prim_label, prompt_text=preview_prompt, output_text=out_clean))
+                return True, out_clean, prim_label
 
         last_err = res or "生成結果が空でした"
         candidates = cls.build_fallback_chain(
@@ -1086,10 +1241,20 @@ class AIGenerator:
             _log(f"   🔄 [AI自動切替 {idx}/{total}] {cand_label} で再試行中...")
             try:
                 fb_ok, fb_res = _attempt_one(cand_eng, cand_mod, cand_key, is_fb=True)
-                if fb_ok and fb_res and fb_res.strip():
-                    out_clean = fb_res.strip()
-                    _log(cls.format_last_usage_log(cand_label, prompt_text=preview_prompt, output_text=out_clean))
-                    return True, out_clean, cand_label
+                if fb_ok and cls.is_prompt_echo(fb_res, preview_prompt):
+                    fb_ok = False
+                    fb_res = "AIが入力プロンプト本文をそのまま返したため無効と判定しました"
+                if fb_ok:
+                    is_fb_skip, fb_skip_reason = cls.detect_skip_response(fb_res)
+                    if is_fb_skip:
+                        skip_token = f"{cls.SKIP_SIGNAL_PREFIX}{fb_skip_reason}"
+                        _log(cls.format_last_usage_log(cand_label, prompt_text=preview_prompt, output_text=f"[スキップ:{fb_skip_reason}]"))
+                        _log(f"   ⏭️ [AI出力ルール判定スキップ / {cand_label}] 「{fb_skip_reason}」→ 定型文は使わずこのポストをスキップします")
+                        return True, skip_token, cand_label
+                    if fb_res and fb_res.strip():
+                        out_clean = fb_res.strip()
+                        _log(cls.format_last_usage_log(cand_label, prompt_text=preview_prompt, output_text=out_clean))
+                        return True, out_clean, cand_label
                 last_err = fb_res or "生成結果が空でした"
                 _log(f"      ↳ 切替失敗 ({cand_label}): {last_err}")
             except Exception as fb_e:
@@ -1578,12 +1743,49 @@ class AIGenerator:
             clean = split_multi[0].strip()
             clean = re.sub(r"^(?:[1１][\.．\)）]\s+|①\s*)", "", clean).strip()
 
-        # 先頭の前置き行・ラベル行（【返信案】、了解しました。、**返信案** 等）を段階的に除去
+        # Duck.ai等の「下書き / コピー」カード本体が含まれる場合、カードヘッダ直後の本文を優先抽出
+        card_match = re.search(
+            r"(?:^|\n)\s*(?:下書き|Draft)\s*(?:\n|\s+)(?:コピー(?:する)?|コードをコピー|Copy(?:\s*code)?)\s*\n(.*)$",
+            clean,
+            re.DOTALL | re.IGNORECASE,
+        )
+        if card_match and card_match.group(1).strip():
+            clean = card_match.group(1).strip()
+
+        # 先頭の前置き行・ラベル行・モデル名・Web UIカード見出し・AIメタ発言を段階的に除去
+        _status_noise_pat = (
+            r"(?:(?:応答|回答|返信|メッセージ|文章|テキスト)?を?(?:生成|作成|思考|検討|入力|読み込み|処理|待機|検索|ウェブ検索|web検索)(?:しています|中)"
+            r"|考えています|考え中|思考中|お待ちください"
+            r"|generating(?:\s+(?:a\s+)?(?:response|answer|reply))?|thinking|searching(?:\s+the\s+web)?|loading|please\s+wait)"
+        )
+        _model_badge_pat = (
+            r"(?:GPT-[\w.\-]+(?:\s+[\w.\-]+){0,3}"
+            r"|Claude(?:\s+[\w.\-]+){0,3}"
+            r"|Llama(?:\s+[\w.\-]+){0,3}"
+            r"|Mistral(?:\s+[\w.\-]+){0,3}"
+            r"|Mixtral(?:\s+[\w.\-]+){0,3}"
+            r"|DeepSeek(?:\s+[\w.\-]+){0,3}"
+            r"|Gemini(?:\s+[\w.\-]+){0,3}"
+            r"|Grok(?:\s+[\w.\-]+){0,2}"
+            r"|o[1-9](?:-(?:mini|preview|pro))?"
+            r"|Duck\.?ai)"
+        )
+        _ai_meta_pat = (
+            r"(?:(?:はい[、,]\s*)?(?:[^\n。]{0,25}(?:の|に対する|への))?(?:返信文?|リプライ文?|引用文?|メッセージ|返信案|リプライ案|引用案|投稿文|文章|テキスト|回答|下書き)を?(?:作成|生成|用意|提案)(?:いた)?しました[^\n]{0,20}"
+            r"|(?:はい[、,]\s*)?(?:作成|生成)(?:いた)?しました"
+            r"|(?:いかが(?:でしょうか|ですか)|他にご要望[^\n]{0,25}|調整(?:が|も)?(?:必要|可能)[^\n]{0,20}|修正(?:が|も)?(?:必要|可能)[^\n]{0,20}|書き直し(?:ます|ましょう)か|別の案(?:も|を)(?:作成|提案)[^\n]{0,20}))[。．\.…！!？?：:\s]*"
+        )
         header_line_re = re.compile(
             r"^(?:【\s*(?:返信案|リプライ案|引用案|作成案|回答|出力|メッセージ|案\s*[1１①]?)\s*】"
             r"|\[\s*(?:返信案|リプライ案|引用案|回答|出力)\s*\]"
             r"|\*\*\s*(?:返信案|リプライ案|引用案|回答|出力)\s*\*\*"
-            r"|(?:了解しました|承知しました|かしこまりました|作成しました|以下(?:が|に|の通り)[^\n。]{0,30})[。！!：:\s]*)$"
+            r"|" + _model_badge_pat +
+            r"|(?:下書き|Draft)(?:\s+(?:コピー|Copy(?:\s*code)?))?"
+            r"|(?:コピー(?:する)?|コードをコピー|Copy(?:\s*code)?|plaintext|markdown|text)"
+            r"|" + _status_noise_pat + r"[。．\.…・！!：:\s]*"
+            r"|" + _ai_meta_pat +
+            r"|(?:了解しました|承知しました|かしこまりました|以下(?:が|に|の通り)[^\n。]{0,30})[。！!：:\s]*)$",
+            re.IGNORECASE,
         )
         inline_prefix_re = re.compile(
             r"^(?:(?:【\s*(?:返信案|リプライ案|引用案|回答|出力)\s*】"
@@ -1608,9 +1810,13 @@ class AIGenerator:
                     continue
             break
 
-        # 末尾の文字数メモやUIコピー補助文字を除去
+        # 末尾の文字数メモやUIコピー/再生成ボタン/生成中ステータス/AIメタ発言を除去
         footer_line_re = re.compile(
-            r"^(?:[（(]\s*(?:約\s*)?\d+\s*文字\s*[）)]|※\s*文字数[:：]?.*|コピー(?:する)?|Copy(?:\s*code)?)$",
+            r"^(?:[（(]\s*(?:約\s*)?\d+\s*文字\s*[）)]|※\s*文字数[:：]?.*"
+            r"|下書き|Draft|コピー(?:する)?|コードをコピー|Copy(?:\s*code)?"
+            r"|" + _status_noise_pat + r"[。．\.…・！!：:\s]*"
+            r"|" + _ai_meta_pat +
+            r"|再生成|Regenerate|やり直す|Retry|共有|Share|良い回答|悪い回答|Good response|Bad response)$",
             re.IGNORECASE,
         )
         while lines:
@@ -1764,6 +1970,11 @@ class AIDedicatedWindowManager:
 
         if st.ai_context is None:
             raise RuntimeError(f"AI専用ウィンドウの起動に失敗しました: {last_err}")
+
+        try:
+            st.ai_context.grant_permissions(["clipboard-read", "clipboard-write"])
+        except Exception:
+            pass
 
         if st.ai_context.pages:
             st.ai_page = st.ai_context.pages[0]
@@ -1945,6 +2156,101 @@ class AIDedicatedWindowManager:
         return normalized_prompt
 
     @classmethod
+    def _is_inside_user_bubble(cls, el) -> bool:
+        """要素または祖先要素がユーザー発言（送信プロンプト）バブルまたは入力欄か判定する"""
+        try:
+            return bool(el.evaluate("""(node) => {
+                let cur = node;
+                while (cur && cur.nodeType === 1) {
+                    const role = (cur.getAttribute('data-message-author-role') || cur.getAttribute('data-author') || '').toLowerCase();
+                    if (role === 'user' || role === 'human') return true;
+                    const turn = (cur.getAttribute('data-turn') || cur.getAttribute('data-role') || '').toLowerCase();
+                    if (turn === 'user' || turn === 'human') return true;
+                    const tid = (cur.getAttribute('data-testid') || '').toLowerCase();
+                    if (tid.includes('user-message') || tid.includes('user_message') || tid === 'user' || tid.startsWith('user-')) return true;
+                    const id = (cur.getAttribute('id') || '').toLowerCase();
+                    if (id.includes('-user-message') || id.includes('user-message') || id.startsWith('user-')) return true;
+                    const cls = (typeof cur.className === 'string' ? cur.className : '').toLowerCase();
+                    if (cls.includes('user-message') || cls.includes('user_message') || cls.includes('usermessage')) return true;
+                    const al = (cur.getAttribute('aria-label') || '').toLowerCase();
+                    if (al.includes('your message') || al.includes('user message') || al.includes('あなたのメッセージ') || al.includes('自分のメッセージ')) return true;
+                    if (cur.tagName === 'TEXTAREA' || cur.tagName === 'INPUT') return true;
+                    cur = cur.parentElement;
+                }
+                return false;
+            }"""))
+        except Exception:
+            return False
+
+    @classmethod
+    def _try_copy_latest_output(
+        cls,
+        ai_page,
+        prompt_ws: str,
+        prev_copy_counts: dict,
+        card_copy_selectors: list[str],
+        is_loading_fn,
+        prompt_text: str = "",
+    ) -> str:
+        """出力完了後にカード等の「コピー」ボタンをクリックしてクリップボードから本文を取得する"""
+        if not card_copy_selectors:
+            return ""
+        eff_prompt = prompt_text or prompt_ws
+        sentinel = "__XAUTO_CLIP_WAIT__"
+        for require_new in (True, False):
+            for csel in card_copy_selectors:
+                try:
+                    loc = ai_page.locator(csel)
+                    cnt = loc.count()
+                    if cnt <= 0:
+                        continue
+                    prev_cnt = prev_copy_counts.get(csel, 0)
+                    if require_new and cnt <= prev_cnt:
+                        continue
+                    start_idx = cnt - 1
+                    min_idx = prev_cnt if require_new else 0
+                    for idx in range(start_idx, min_idx - 1, -1):
+                        btn = loc.nth(idx)
+                        try:
+                            if not btn.is_visible() or not btn.is_enabled():
+                                continue
+                            if cls._is_inside_user_bubble(btn):
+                                continue
+                            try:
+                                ai_page.evaluate(
+                                    "(val) => { try { return navigator.clipboard && navigator.clipboard.writeText(val); } catch(e) {} }",
+                                    sentinel,
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                btn.scroll_into_view_if_needed(timeout=1500)
+                            except Exception:
+                                pass
+                            btn.click(timeout=2500)
+                            time.sleep(0.25)
+                            clip_txt = ai_page.evaluate(
+                                "async () => { try { return await navigator.clipboard.readText(); } catch(e) { return ''; } }"
+                            )
+                            if clip_txt and clip_txt != sentinel:
+                                raw_clip = str(clip_txt).strip()
+                                if AIGenerator.is_prompt_echo(raw_clip, eff_prompt):
+                                    continue
+                                clean_clip = AIGenerator._sanitize_output(raw_clip)
+                                if AIGenerator.is_prompt_echo(clean_clip, eff_prompt):
+                                    continue
+                                is_skip_clip, skip_reason_clip = AIGenerator.detect_skip_response(raw_clip, clean_clip)
+                                if is_skip_clip:
+                                    return f"{AIGenerator.SKIP_SIGNAL_PREFIX}{skip_reason_clip}"
+                                if clean_clip and not is_loading_fn(clean_clip):
+                                    return clean_clip
+                        except Exception:
+                            continue
+                except Exception:
+                    continue
+        return ""
+
+    @classmethod
     def _submit_and_stream_response(
         cls,
         ai_page,
@@ -1954,19 +2260,47 @@ class AIDedicatedWindowManager:
         send_selectors: list[str],
         stop_selectors: list[str],
         service_label: str,
-        timeout_sec: float = 55.0
+        timeout_sec: float = 55.0,
+        completion_selectors: list[str] = None,
+        card_copy_selectors: list[str] = None,
+        prefer_copy_card: bool = False,
     ) -> Tuple[bool, str]:
         prev_counts = {}
         prev_last_texts = {}
+        prev_tail_sets = {}
         for rsel in resp_selectors:
             try:
                 loc = ai_page.locator(rsel)
                 cnt = loc.count()
                 prev_counts[rsel] = cnt
                 prev_last_texts[rsel] = loc.last.inner_text().strip() if cnt > 0 else ""
+                tail = set()
+                for idx in range(max(0, cnt - 4), cnt):
+                    try:
+                        t = loc.nth(idx).inner_text().strip()
+                        if t:
+                            tail.add(t)
+                    except Exception:
+                        pass
+                prev_tail_sets[rsel] = tail
             except Exception:
                 prev_counts[rsel] = 0
                 prev_last_texts[rsel] = ""
+                prev_tail_sets[rsel] = set()
+
+        prev_comp_counts = {}
+        for csel in (completion_selectors or []):
+            try:
+                prev_comp_counts[csel] = ai_page.locator(csel).count()
+            except Exception:
+                prev_comp_counts[csel] = 0
+
+        prev_copy_counts = {}
+        for csel in (card_copy_selectors or []):
+            try:
+                prev_copy_counts[csel] = ai_page.locator(csel).count()
+            except Exception:
+                prev_copy_counts[csel] = 0
 
         normalized_prompt = cls._input_multiline_prompt(ai_page, input_el, prompt)
         prompt_ws = " ".join(normalized_prompt.split())
@@ -1994,6 +2328,34 @@ class AIDedicatedWindowManager:
                 pass
             ai_page.keyboard.press("Enter")
 
+        def _is_loading_placeholder(val: str) -> bool:
+            s = (val or "").strip().lower().strip(".。…・!！●•|｜")
+            if not s:
+                return True
+            loading_set = {
+                "考え中", "考えています", "思考中", "生成中", "回答を生成中", "応答を生成中", "返信を生成中",
+                "入力中", "処理中", "読み込み中", "待機中", "お待ちください", "検索中", "web検索中", "ウェブ検索中",
+                "応答を生成しています", "回答を生成しています", "返信を生成しています",
+                "メッセージを生成しています", "文章を生成しています", "生成しています", "作成しています",
+                "応答を作成しています", "回答を作成しています", "読み込んでいます",
+                "thinking", "generating", "generating response", "generating a response",
+                "generating answer", "searching", "searching the web",
+                "loading", "typing", "just a moment", "please wait",
+            }
+            if s in loading_set:
+                return True
+            return bool(re.match(
+                r"^(?:(?:応答|回答|返信|メッセージ|文章|テキスト)?を?(?:生成|作成|思考|検討|入力|読み込み|処理|待機|検索|ウェブ検索|web検索)(?:しています|中)|考えています|generating(?:\s+(?:a\s+)?(?:response|answer|reply))?|thinking|searching(?:\s+the\s+web)?|loading|please\s+wait)$",
+                s,
+                re.IGNORECASE,
+            ))
+
+        def _is_generic_fallback_selector(sel: str) -> bool:
+            s = (sel or "").lower()
+            if any(k in s for k in ("assistant", "model-response", "grokmessage", "ai-message", "ds-markdown", "font-claude")):
+                return False
+            return any(k in s for k in ('dir="auto"', ".prose", ".markdown", "article", "main p", "message-content", "chat-message"))
+
         print(f"   🤖 [AI専用ウィンドウ] {service_label} でリプライ/引用文を生成中（改行保持プロンプト送信済）...")
         eff_timeout = float(getattr(cls._get_state(), "web_stream_timeout_sec", None) or timeout_sec)
         gen_start = time.time()
@@ -2002,24 +2364,67 @@ class AIDedicatedWindowManager:
         while time.time() - gen_start < eff_timeout:
             time.sleep(0.8)
             cur_txt = ""
+            high_prio_loading = False
             for rsel in resp_selectors:
+                is_generic = _is_generic_fallback_selector(rsel)
+                if high_prio_loading and is_generic:
+                    continue
                 try:
                     loc = ai_page.locator(rsel)
                     cnt = loc.count()
-                    if cnt > prev_counts.get(rsel, 0):
-                        candidate = loc.last.inner_text().strip()
-                        if candidate:
-                            cand_ws = " ".join(candidate.split())
-                            if cand_ws != prompt_ws and candidate != normalized_prompt:
+                    prev_cnt = prev_counts.get(rsel, 0)
+                    prev_last = prev_last_texts.get(rsel, "")
+                    tail_set = prev_tail_sets.get(rsel, set())
+                    if cnt > prev_cnt:
+                        for idx in range(cnt - 1, max(-1, cnt - 5), -1):
+                            el = loc.nth(idx)
+                            if cls._is_inside_user_bubble(el):
+                                continue
+                            try:
+                                candidate = el.inner_text().strip()
+                            except Exception:
+                                continue
+                            if not candidate:
+                                continue
+                            if AIGenerator.is_prompt_echo(candidate, normalized_prompt):
+                                continue
+                            if idx < cnt - 1 and candidate in tail_set:
+                                continue
+                            if idx == cnt - 1 and prev_last and candidate == prev_last:
+                                continue
+                            cleaned_cand = AIGenerator._sanitize_output(candidate)
+                            if AIGenerator.is_prompt_echo(cleaned_cand, normalized_prompt):
+                                continue
+                            is_skip_cand, _ = AIGenerator.detect_skip_response(candidate, cleaned_cand)
+                            if is_skip_cand:
                                 cur_txt = candidate
                                 break
+                            if _is_loading_placeholder(cleaned_cand):
+                                if not is_generic:
+                                    high_prio_loading = True
+                                continue
+                            if cleaned_cand:
+                                cur_txt = candidate
+                                break
+                        if cur_txt:
+                            break
                     elif cnt > 0:
-                        candidate = loc.last.inner_text().strip()
-                        if candidate and candidate != prev_last_texts.get(rsel, ""):
-                            cand_ws = " ".join(candidate.split())
-                            if cand_ws != prompt_ws and candidate != normalized_prompt:
-                                cur_txt = candidate
-                                break
+                        el = loc.last
+                        if not cls._is_inside_user_bubble(el):
+                            candidate = el.inner_text().strip()
+                            if candidate and candidate != prev_last and not AIGenerator.is_prompt_echo(candidate, normalized_prompt):
+                                cleaned_cand = AIGenerator._sanitize_output(candidate)
+                                if not AIGenerator.is_prompt_echo(cleaned_cand, normalized_prompt):
+                                    is_skip_cand, _ = AIGenerator.detect_skip_response(candidate, cleaned_cand)
+                                    if is_skip_cand:
+                                        cur_txt = candidate
+                                        break
+                                    if _is_loading_placeholder(cleaned_cand):
+                                        if not is_generic:
+                                            high_prio_loading = True
+                                    elif cleaned_cand:
+                                        cur_txt = candidate
+                                        break
                 except Exception:
                     continue
 
@@ -2034,20 +2439,72 @@ class AIDedicatedWindowManager:
                     except Exception:
                         pass
 
+                has_completion_ui = not bool(completion_selectors)
+                if completion_selectors:
+                    for csel in completion_selectors:
+                        try:
+                            cloc = ai_page.locator(csel)
+                            ccnt = cloc.count()
+                            prev_cc = prev_comp_counts.get(csel, 0)
+                            if ccnt > prev_cc:
+                                for cidx in range(ccnt - 1, prev_cc - 1, -1):
+                                    cbtn = cloc.nth(cidx)
+                                    if cbtn.is_visible() and not cls._is_inside_user_bubble(cbtn):
+                                        has_completion_ui = True
+                                        break
+                            if has_completion_ui:
+                                break
+                        except Exception:
+                            pass
+
                 if cur_txt == last_txt and not is_streaming:
                     stable_ticks += 1
-                    if stable_ticks >= 2:
+                    required_ticks = 2 if has_completion_ui else 3
+                    if stable_ticks >= required_ticks:
+                        if prefer_copy_card and card_copy_selectors:
+                            copied_out = cls._try_copy_latest_output(
+                                ai_page, prompt_ws, prev_copy_counts, card_copy_selectors, _is_loading_placeholder,
+                                prompt_text=normalized_prompt,
+                            )
+                            if copied_out:
+                                if AIGenerator.is_skip_token_prefix(copied_out):
+                                    return True, copied_out
+                                if not AIGenerator.is_prompt_echo(copied_out, normalized_prompt):
+                                    print(f"   📋 [AI専用ウィンドウ] {service_label} の出力完了を確認し「コピー」ボタンから本文を取得しました ({len(copied_out)}文字)")
+                                    return True, copied_out
                         clean_out = AIGenerator._sanitize_output(cur_txt)
-                        if clean_out:
+                        if AIGenerator.is_prompt_echo(cur_txt, normalized_prompt) or AIGenerator.is_prompt_echo(clean_out, normalized_prompt):
+                            last_txt = ""
+                            stable_ticks = 0
+                            continue
+                        is_skip_out, skip_reason = AIGenerator.detect_skip_response(cur_txt, clean_out)
+                        if is_skip_out:
+                            return True, f"{AIGenerator.SKIP_SIGNAL_PREFIX}{skip_reason}"
+                        if clean_out and not _is_loading_placeholder(clean_out):
                             return True, clean_out
                 else:
                     stable_ticks = 0
                     last_txt = cur_txt
 
-        if last_txt:
+        if last_txt and not AIGenerator.is_prompt_echo(last_txt, normalized_prompt):
+            if prefer_copy_card and card_copy_selectors:
+                copied_out = cls._try_copy_latest_output(
+                    ai_page, prompt_ws, prev_copy_counts, card_copy_selectors, _is_loading_placeholder,
+                    prompt_text=normalized_prompt,
+                )
+                if copied_out:
+                    if AIGenerator.is_skip_token_prefix(copied_out):
+                        return True, copied_out
+                    if not AIGenerator.is_prompt_echo(copied_out, normalized_prompt):
+                        print(f"   📋 [AI専用ウィンドウ] {service_label} の出力を確認し「コピー」ボタンから本文を取得しました ({len(copied_out)}文字)")
+                        return True, copied_out
             clean_out = AIGenerator._sanitize_output(last_txt)
-            if clean_out:
-                return True, clean_out
+            if not AIGenerator.is_prompt_echo(clean_out, normalized_prompt):
+                is_skip_out, skip_reason = AIGenerator.detect_skip_response(last_txt, clean_out)
+                if is_skip_out:
+                    return True, f"{AIGenerator.SKIP_SIGNAL_PREFIX}{skip_reason}"
+                if clean_out and not _is_loading_placeholder(clean_out):
+                    return True, clean_out
         return False, f"{service_label} からの回答取得がタイムアウトしました"
 
     @classmethod
@@ -2418,21 +2875,63 @@ class AIDedicatedWindowManager:
                 input_el,
                 prompt,
                 resp_selectors=[
-                    'div[data-testid="message-content"]',
-                    'div[class*="message"] .markdown',
+                    'main pre code',
+                    'main pre',
+                    '[id*="-assistant-message-"]:not([role="status"])',
+                    '[id*="assistant-message"]:not([role="status"])',
+                    '[data-testid*="assistant-message"]:not([role="status"])',
+                    '[class*="assistant-message"]:not([role="status"])',
+                    '[data-message-author-role="assistant"]',
+                    'div[data-testid="message-content"]:not([data-testid*="user"])',
+                    'div[data-testid="chat-message"]:not([data-testid*="user"])',
+                    'section [id*="-message-"]:not([id*="user"]):not([role="status"])',
+                    'div[class*="message"]:not([id*="user"]):not([class*="user"]) .markdown',
                     '.prose',
-                    'div[dir="auto"]',
+                    'main section div[dir="auto"]:not([aria-live]):not([role="status"])',
                 ],
                 send_selectors=[
                     'button[aria-label="Send"]',
+                    'button[aria-label*="Send"]',
                     'button[aria-label*="送信"]',
                     'button[type="submit"]',
                 ],
                 stop_selectors=[
                     'button[aria-label*="Stop"]',
                     'button[aria-label*="停止"]',
+                    'button[data-testid*="stop"]',
+                    'button:has-text("停止")',
+                    'button:has-text("Stop")',
                 ],
-                service_label="Duck.ai Web"
+                service_label="Duck.ai Web",
+                completion_selectors=[
+                    '[id*="-assistant-message-"] button:has-text("コピー")',
+                    '[id*="-assistant-message-"] button:has-text("Copy")',
+                    '[id*="-assistant-message-"] button[aria-label*="コピー"]',
+                    '[id*="-assistant-message-"] button[aria-label*="Copy"]',
+                    '[data-message-author-role="assistant"] button:has-text("コピー")',
+                    '[data-message-author-role="assistant"] button:has-text("Copy")',
+                    'button[aria-label*="Good"]',
+                    'button[aria-label*="Bad"]',
+                    'button[aria-label*="良い"]',
+                    'button[aria-label*="悪い"]',
+                    'main button:has-text("コピー")',
+                    'main button:has-text("Copy")',
+                    'button[aria-label*="コピー"]',
+                    'button[aria-label*="Copy"]',
+                ],
+                card_copy_selectors=[
+                    '[id*="-assistant-message-"] button:has-text("コピー")',
+                    '[id*="-assistant-message-"] button:has-text("Copy")',
+                    '[id*="-assistant-message-"] button[aria-label*="コピー"]',
+                    '[id*="-assistant-message-"] button[aria-label*="Copy"]',
+                    '[data-message-author-role="assistant"] button:has-text("コピー")',
+                    '[data-message-author-role="assistant"] button:has-text("Copy")',
+                    'main button:has-text("コピー")',
+                    'main button:has-text("Copy")',
+                    'main button[aria-label*="コピー"]',
+                    'main button[aria-label*="Copy"]',
+                ],
+                prefer_copy_card=True,
             )
         except Exception as e:
             return False, f"Duck.ai Web連携エラー: {e}"
@@ -2911,25 +3410,28 @@ class AIDedicatedWindowManager:
                     ok, result_text = cls._generate_via_gemini_web(ai_page, prompt)
 
             if ok and result_text:
+                is_win_skip = AIGenerator.is_skip_token_prefix(result_text)
                 cur_meta = AIGenerator.get_last_call_meta()
                 if not cur_meta.get("engine"):
                     used_prompt = prompt if 'prompt' in locals() else AIGenerator.build_prompt(
                         post_url, post_text, action_type, target_name, custom_prompt,
                         parent_post_text=parent_post_text, prompt_config=prompt_config
                     )
+                    meta_out = f"[スキップ:{AIGenerator.extract_skip_reason(result_text)}]" if is_win_skip else result_text
                     AIGenerator._set_last_call_meta(
                         engine=eff_eng,
                         model=(model_name or (custom_web_url if 'custom_web_url' in locals() and custom_web_url else "web")),
                         prompt_tokens=AIGenerator.estimate_tokens(used_prompt),
-                        completion_tokens=AIGenerator.estimate_tokens(result_text),
+                        completion_tokens=AIGenerator.estimate_tokens(meta_out),
                         prompt_chars=len(used_prompt),
-                        output_chars=len(result_text),
+                        output_chars=len(meta_out),
                         estimated=True,
                     )
-                try:
-                    ai_page.evaluate("(text) => { try { navigator.clipboard && navigator.clipboard.writeText(text); } catch(e){} }", result_text)
-                except Exception:
-                    pass
+                if not is_win_skip:
+                    try:
+                        ai_page.evaluate("(text) => { try { navigator.clipboard && navigator.clipboard.writeText(text); } catch(e){} }", result_text)
+                    except Exception:
+                        pass
                 return True, result_text
             else:
                 return False, result_text

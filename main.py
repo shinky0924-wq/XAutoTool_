@@ -1518,16 +1518,22 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             logger=log
                         )
                         if ok_ai and ai_res and ai_res.strip():
-                            prim_spec_eng, prim_spec_mod, prim_spec_ov = AIGenerator.parse_engine_list(ai_engine, ai_model)[0]
-                            prim_norm, _ = AIGenerator.resolve_engine_and_url(prim_spec_eng, prim_spec_ov or ai_api_key)
-                            prim_lbl = f"{prim_norm} ({prim_spec_mod})" if prim_spec_mod else prim_norm
-                            if used_ai_label != prim_lbl:
-                                prefix_icon = "🔄 [AI自動切替生成成功"
+                            if AIGenerator.is_prompt_echo(ai_res, ""):
+                                log(f"   ⚠️ [AI出力異常検知] プロンプト本文の誤取得をブロックしました → 定型テンプレートへフォールバックします")
+                            elif AIGenerator.is_skip_token_prefix(ai_res) or AIGenerator.detect_skip_response(ai_res)[0]:
+                                skip_rsn = AIGenerator.extract_skip_reason(ai_res)
+                                return f"{AIGenerator.SKIP_SIGNAL_PREFIX}{skip_rsn}"
                             else:
-                                use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
-                                prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if use_win_flow else "🤖 [AI生成成功"
-                            log(f"   {prefix_icon}/{used_ai_label}] 「{ai_res.strip()[:45]}...」")
-                            return ai_res.strip()
+                                prim_spec_eng, prim_spec_mod, prim_spec_ov = AIGenerator.parse_engine_list(ai_engine, ai_model)[0]
+                                prim_norm, _ = AIGenerator.resolve_engine_and_url(prim_spec_eng, prim_spec_ov or ai_api_key)
+                                prim_lbl = f"{prim_norm} ({prim_spec_mod})" if prim_spec_mod else prim_norm
+                                if used_ai_label != prim_lbl:
+                                    prefix_icon = "🔄 [AI自動切替生成成功"
+                                else:
+                                    use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
+                                    prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if use_win_flow else "🤖 [AI生成成功"
+                                log(f"   {prefix_icon}/{used_ai_label}] 「{ai_res.strip()[:45]}...」")
+                                return ai_res.strip()
                         else:
                             log(f"   ⚠️ AI生成フォールバック (全候補失敗 / 最終理由: {ai_res}) → 定型テンプレートを使用します")
                     except Exception as ai_e:
@@ -1707,6 +1713,12 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         target_parent_text = str(target_item.get("親ツイート本文") or target_item.get("parent_tweet_text") or "").strip()
                         is_rep_tgt = bool(target_item.get("is_reply", False)) or target_tweet_text.lstrip().startswith("@")
                         rep_msg = generate_ai_or_template_text("reply", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai, cached_tweet_text=target_tweet_text, cached_parent_text=target_parent_text, is_reply_target=is_rep_tgt)
+                        if not rep_msg or not rep_msg.strip() or rep_msg.startswith("__AI_SKIP_RULE__:"):
+                            skip_reason = rep_msg.split(":", 1)[1].strip() if ":" in (rep_msg or "") else "空欄/出力ルール対象外"
+                            log(f"   ⏭️ [リプライスキップ] @{target_screen_name}: AIが「{skip_reason}」と判定したため投稿を中止します（連動処理もスキップ）")
+                            db_mgr.record_sent(target_screen_name, account_id, "REPLY", "SKIPPED_AI_RULE", f"AIスキップ({skip_reason[:30]})", target_url=target_tweet_url)
+                            config_mgr.update_target_status(target_screen_name, f"AIスキップ({skip_reason[:20]})", target_path_override=acc_target_path)
+                            return False, "SKIPPED_AI_RULE"
                         preview_name = resolved_disp or "相手のアカウント名"
                         preview_log = format_template_message(rep_msg, preview_name, target_screen_name, preserve_unresolved=False)
                         log(f"   💬 [リプライ送信中] 「{preview_log[:35]}...」")
@@ -1773,6 +1785,12 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                         target_parent_text = str(target_item.get("親ツイート本文") or target_item.get("parent_tweet_text") or "").strip()
                         is_rep_tgt = bool(target_item.get("is_reply", False)) or target_tweet_text.lstrip().startswith("@")
                         q_msg = generate_ai_or_template_text("quote", target_screen_name, resolved_disp, target_tweet_url, use_ai=use_ai, cached_tweet_text=target_tweet_text, cached_parent_text=target_parent_text, is_reply_target=is_rep_tgt)
+                        if not q_msg or not q_msg.strip() or q_msg.startswith("__AI_SKIP_RULE__:"):
+                            skip_reason = q_msg.split(":", 1)[1].strip() if ":" in (q_msg or "") else "空欄/出力ルール対象外"
+                            log(f"   ⏭️ [引用RTスキップ] @{target_screen_name}: AIが「{skip_reason}」と判定したため投稿を中止します（連動処理もスキップ）")
+                            db_mgr.record_sent(target_screen_name, account_id, "QUOTE", "SKIPPED_AI_RULE", f"AIスキップ({skip_reason[:30]})", target_url=target_tweet_url)
+                            config_mgr.update_target_status(target_screen_name, f"AIスキップ({skip_reason[:20]})", target_path_override=acc_target_path)
+                            return False, "SKIPPED_AI_RULE"
                         preview_name = resolved_disp or "相手のアカウント名"
                         preview_log = format_template_message(q_msg, preview_name, target_screen_name, preserve_unresolved=False)
                         log(f"   🔁 [引用RT実行中] 「{preview_log[:35]}...」")
