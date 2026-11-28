@@ -1497,32 +1497,52 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                             log(f"   🧵 [会話コンテキスト取得] 元ポスト: 「{parent_txt[:35]}...」 / 対象返信: 「{post_txt[:35]}...」")
 
                         custom_p = acc_prompt_setting if acc_ai_prompt_cfg.get("has_sheet") else (acc_prompt_setting or ai_prompt_extra)
-                        ok_ai, ai_res, used_ai_label = AIGenerator.generate_comment_with_fallback(
-                            engine=ai_engine,
-                            post_url=tweet_url,
-                            post_text=post_txt,
-                            action_type="reply" if kind == "reply" else "quote",
-                            target_name=resolved_disp or target_screen_name,
-                            api_key=ai_api_key,
-                            custom_prompt=custom_p,
-                            playwright=browser_ctrl.playwright,
-                            page=browser_ctrl.page,
-                            use_dedicated_window=ai_dedicated_window,
-                            base_dir=base_dir,
-                            slot_id=active_slot,
-                            headless=False,
-                            parent_post_text=parent_txt,
-                            prompt_config=acc_ai_prompt_cfg,
-                            model_name=ai_model,
-                            fallback_spec=ai_fallback_models,
-                            logger=log
-                        )
+
+                        def _run_ai_once():
+                            return AIGenerator.generate_comment_with_fallback(
+                                engine=ai_engine,
+                                post_url=tweet_url,
+                                post_text=post_txt,
+                                action_type="reply" if kind == "reply" else "quote",
+                                target_name=resolved_disp or target_screen_name,
+                                api_key=ai_api_key,
+                                custom_prompt=custom_p,
+                                playwright=browser_ctrl.playwright,
+                                page=browser_ctrl.page,
+                                use_dedicated_window=ai_dedicated_window,
+                                base_dir=base_dir,
+                                slot_id=active_slot,
+                                headless=False,
+                                parent_post_text=parent_txt,
+                                prompt_config=acc_ai_prompt_cfg,
+                                model_name=ai_model,
+                                fallback_spec=ai_fallback_models,
+                                logger=log
+                            )
+
+                        ok_ai, ai_res, used_ai_label = _run_ai_once()
+                        use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
+                        if (not ok_ai or not (ai_res or "").strip() or AIGenerator.is_loading_placeholder(ai_res)) and use_win_flow:
+                            log(f"   ⏳ [AI出力確認リトライ] ラグ等により本文未確認のため、AI専用ウィンドウ状態を確認して1回再生成します...")
+                            try:
+                                st_ai = AIDedicatedWindowManager._get_state()
+                                cur_ai_p = getattr(st_ai, "ai_page", None)
+                                if cur_ai_p is None or cur_ai_p.is_closed():
+                                    AIDedicatedWindowManager.close_ai_window()
+                            except Exception:
+                                pass
+                            time.sleep(1.5)
+                            ok_ai, ai_res, used_ai_label = _run_ai_once()
+
                         if ok_ai and ai_res and ai_res.strip():
-                            if AIGenerator.is_prompt_echo(ai_res, ""):
+                            out_cand = ai_res.strip()
+                            if AIGenerator.is_prompt_echo(out_cand, ""):
                                 log(f"   ⚠️ [AI出力異常検知] プロンプト本文の誤取得をブロックしました → 定型テンプレートへフォールバックします")
-                            elif AIGenerator.is_skip_token_prefix(ai_res) or AIGenerator.detect_skip_response(ai_res)[0]:
-                                skip_rsn = AIGenerator.extract_skip_reason(ai_res)
+                            elif AIGenerator.is_skip_token_prefix(out_cand) or AIGenerator.detect_skip_response(out_cand)[0]:
+                                skip_rsn = AIGenerator.extract_skip_reason(out_cand)
                                 return f"{AIGenerator.SKIP_SIGNAL_PREFIX}{skip_rsn}"
+                            elif AIGenerator.is_loading_placeholder(out_cand):
+                                log(f"   ⚠️ [AI出力未完了検知] 生成中プレースホルダ（「{out_cand[:20]}」）のままだったため投稿を保留しフォールバックします")
                             else:
                                 prim_spec_eng, prim_spec_mod, prim_spec_ov = AIGenerator.parse_engine_list(ai_engine, ai_model)[0]
                                 prim_norm, _ = AIGenerator.resolve_engine_and_url(prim_spec_eng, prim_spec_ov or ai_api_key)
@@ -1530,10 +1550,10 @@ def run_single_cycle(config_mgr, global_db_mgr, base_dir, cycle_count: int = 1, 
                                 if used_ai_label != prim_lbl:
                                     prefix_icon = "🔄 [AI自動切替生成成功"
                                 else:
-                                    use_win_flow = AIGenerator.should_launch_ai_window(ai_engine, ai_api_key, ai_dedicated_window)
                                     prefix_icon = "🪟 [AI専用ウィンドウ生成成功" if use_win_flow else "🤖 [AI生成成功"
-                                log(f"   {prefix_icon}/{used_ai_label}] 「{ai_res.strip()[:45]}...」")
-                                return ai_res.strip()
+                                log(f"   {prefix_icon}/{used_ai_label}] 「{out_cand[:45]}...」")
+                                log(f"   ✅ [AI本文出力確認完了/{used_ai_label}] 本文({len(out_cand)}文字)の出力を確認しました → X投稿処理へ進みます")
+                                return out_cand
                         else:
                             log(f"   ⚠️ AI生成フォールバック (全候補失敗 / 最終理由: {ai_res}) → 定型テンプレートを使用します")
                     except Exception as ai_e:

@@ -155,6 +155,40 @@ class AIGenerator:
                     return True, norm
         return False, ""
 
+    @staticmethod
+    def is_loading_placeholder(val: str) -> bool:
+        """Web AIが思考中・生成中に一時表示するプレースホルダ文言かどうか判定"""
+        raw = str(val or "").strip()
+        if not raw:
+            return True
+        s = raw.lower().strip(".。…・!！●•|｜*＊_-—～~　 ")
+        if not s:
+            return True
+        loading_set = {
+            "考え中", "考えています", "思考中", "推論中", "生成中", "回答を生成中", "応答を生成中", "返信を生成中",
+            "入力中", "処理中", "読み込み中", "待機中", "お待ちください", "検索中", "web検索中", "ウェブ検索中",
+            "回答を準備中", "準備中", "応答を生成しています", "回答を生成しています", "返信を生成しています",
+            "メッセージを生成しています", "文章を生成しています", "生成しています", "作成しています",
+            "応答を作成しています", "回答を作成しています", "読み込んでいます", "モデルを読み込んでいます",
+            "thinking", "reasoning", "generating", "generating response", "generating a response",
+            "generating answer", "generating reply", "searching", "searching the web",
+            "loading", "loading model", "typing", "just a moment", "please wait", "working on it",
+            "preparing response", "duck.ai",
+        }
+        if s in loading_set:
+            return True
+        if re.match(
+            r"^(?:thought\s+for\s+\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds|秒)?|thinking\s+for\s+\d+.*|思考時間[:：]?\s*\d+.*)$",
+            s,
+            re.IGNORECASE,
+        ):
+            return True
+        return bool(re.match(
+            r"^(?:(?:応答|回答|返信|メッセージ|文章|テキスト|モデル)?を?(?:生成|作成|思考|推論|検討|入力|読み込み|読込|処理|待機|準備|検索|ウェブ検索|web検索)(?:しています|中)|考えています|generating(?:\s+(?:a\s+)?(?:response|answer|reply))?|thinking|reasoning|searching(?:\s+the\s+web)?|loading(?:\s+model)?|please\s+wait|working\s+on\s+it)$",
+            s,
+            re.IGNORECASE,
+        ))
+
     @classmethod
     def _finalize_api_text(cls, raw_text: str, prompt_text: str = "") -> Tuple[bool, str]:
         """API応答テキストをサニタイズし、正常な空欄・SKIP応答はスキップ指示として返す"""
@@ -165,7 +199,7 @@ class AIGenerator:
         is_skip, reason = cls.detect_skip_response(raw_s, clean)
         if is_skip:
             return True, f"{cls.SKIP_SIGNAL_PREFIX}{reason}"
-        if not clean:
+        if not clean or cls.is_loading_placeholder(clean):
             return True, f"{cls.SKIP_SIGNAL_PREFIX}空欄"
         return True, clean
 
@@ -180,13 +214,20 @@ class AIGenerator:
         prompt_markers = (
             "以下の投稿に対して、魅力的な",
             "以下の【設定・指示】と【対象の投稿情報】を踏まえ",
+            "【あなたの役割】",
+            "【リプライの目的】",
+            "【アカウント知識DB】",
+            "【店舗の前提知識",
+            "【参照情報",
             "【対象の投稿情報】",
             "【対象の投稿情報（やり取り・返信への反応）】",
             "【元ポスト（会話の前提）】",
             "【対象者の返信内容】",
             "【作成方針（自動選定）】",
+            "【出力ルール】",
             "【出力ルール（厳守）】",
             "【口調・文体ルール】",
+            "【指示】",
             "【キャラ設定】",
             "【お手本サンプル（参考例）】",
             "【NGルール】",
@@ -665,23 +706,54 @@ class AIGenerator:
 
         internal_selection_rule = (
             "【作成方針（自動選定）】\n"
-            "設定されたキャラ・指示に沿った切り口を内部で3パターン（共感・補足・視点の共有など）検討し、"
+            "設定された役割・目的・キャラ・知識DB（投稿と関係ある要素のみ）・指示に沿った切り口を内部で3パターン（共感・補足・視点の共有など）検討し、"
             f"対象の投稿に最も自然で噛み合っている1つだけを選んでください。\n"
             f"※検討過程や他案・比較・番号（1. 2. 3. 等）は一切書かず、選んだ1つの{action_label}本文のみを出力してください。"
         )
 
-        if isinstance(prompt_config, dict) and any(k in prompt_config for k in ("character", "tone_style", "post_format", "instruction", "examples", "ng_rules", "output_rule")):
+        if isinstance(prompt_config, dict) and any(
+            k in prompt_config
+            for k in ("role", "purpose", "character", "knowledge_db", "tone_style", "post_format", "instruction", "examples", "ng_rules", "output_rule")
+        ):
             parts = []
             action_intro = f"以下の投稿に対して、魅力的な{action_label}のメッセージを作成してください。"
+            role_raw = str(prompt_config.get("role", "") or "").strip()
             char_raw = str(prompt_config.get("character", "") or "").strip()
-            if not char_raw or ("{アクション}" not in char_raw and "作成してください" not in char_raw):
+            has_task_in_role = bool(role_raw and ("{アクション}" in role_raw or "作成してください" in role_raw or "リプライ" in role_raw or "引用" in role_raw))
+            has_task_in_char = bool(not role_raw and char_raw and ("{アクション}" in char_raw or "作成してください" in char_raw))
+
+            if not has_task_in_role and not has_task_in_char:
                 parts.append(action_intro)
+
+            if role_raw:
+                rendered_role = _apply_tags(role_raw)
+                if rendered_role.lstrip().startswith(("【あなたの役割", "【役割")):
+                    parts.append(rendered_role)
+                else:
+                    parts.append(f"【あなたの役割】\n{rendered_role}")
+
+            purpose_raw = str(prompt_config.get("purpose", "") or "").strip()
+            if purpose_raw:
+                rendered_purpose = _apply_tags(purpose_raw)
+                if rendered_purpose.lstrip().startswith(("【リプライの目的", "【目的")):
+                    parts.append(rendered_purpose)
+                else:
+                    parts.append(f"【リプライの目的】\n{rendered_purpose}")
+
             if char_raw:
                 rendered_char = _apply_tags(char_raw)
                 if rendered_char.lstrip().startswith(("【キャラ", "【役割")):
                     parts.append(rendered_char)
                 else:
                     parts.append(f"【キャラ設定】\n{rendered_char}")
+
+            knowledge_raw = str(prompt_config.get("knowledge_db", "") or "").strip()
+            if knowledge_raw:
+                rendered_knowledge = _apply_tags(knowledge_raw)
+                if rendered_knowledge.lstrip().startswith(("【アカウント知識", "【知識", "【店舗の前提知識", "【参照情報", "【前提知識", "【背景知識", "【店舗プロフィール")):
+                    parts.append(rendered_knowledge)
+                else:
+                    parts.append(f"【アカウント知識DB】\n{rendered_knowledge}")
 
             post_raw = str(prompt_config.get("post_format", "") or "").strip()
             if post_raw:
@@ -1754,9 +1826,10 @@ class AIGenerator:
 
         # 先頭の前置き行・ラベル行・モデル名・Web UIカード見出し・AIメタ発言を段階的に除去
         _status_noise_pat = (
-            r"(?:(?:応答|回答|返信|メッセージ|文章|テキスト)?を?(?:生成|作成|思考|検討|入力|読み込み|処理|待機|検索|ウェブ検索|web検索)(?:しています|中)"
-            r"|考えています|考え中|思考中|お待ちください"
-            r"|generating(?:\s+(?:a\s+)?(?:response|answer|reply))?|thinking|searching(?:\s+the\s+web)?|loading|please\s+wait)"
+            r"(?:(?:応答|回答|返信|メッセージ|文章|テキスト|モデル)?を?(?:生成|作成|思考|推論|検討|入力|読み込み|読込|処理|待機|準備|検索|ウェブ検索|web検索)(?:しています|中)"
+            r"|考えています|考え中|思考中|推論中|準備中|お待ちください"
+            r"|thought\s+for\s+\d+(?:\.\d+)?\s*(?:s|sec|secs|second|seconds|秒)?"
+            r"|generating(?:\s+(?:a\s+)?(?:response|answer|reply))?|thinking|reasoning|searching(?:\s+the\s+web)?|loading(?:\s+model)?|please\s+wait|preparing\s+response)"
         )
         _model_badge_pat = (
             r"(?:GPT-[\w.\-]+(?:\s+[\w.\-]+){0,3}"
@@ -1864,6 +1937,8 @@ class AIDedicatedWindowManager:
         if not hasattr(cls._thread_local, "ai_context"):
             cls._thread_local.ai_context = None
             cls._thread_local.ai_page = None
+            cls._thread_local.playwright_ref = None
+            cls._thread_local.owned_playwright = None
         return cls._thread_local
 
     @classmethod
@@ -1875,6 +1950,31 @@ class AIDedicatedWindowManager:
                     os.remove(p)
             except Exception:
                 pass
+
+    @classmethod
+    def _terminate_zombie_browsers(cls, profile_dir: str):
+        """AI専用プロファイルを掴んだまま残留しているchrome/msedgeゾンビプロセスを安全に解放"""
+        if sys.platform != "win32" or not profile_dir:
+            return
+        prof_name = os.path.basename(os.path.normpath(profile_dir))
+        if not prof_name or not prof_name.startswith("ai_worker"):
+            return
+        try:
+            import subprocess
+            ps_cmd = (
+                f'Get-CimInstance Win32_Process -Filter "Name=\'chrome.exe\' OR Name=\'msedge.exe\'" '
+                f'| Where-Object {{ $_.CommandLine -like \'*{prof_name}*\' }} '
+                f'| ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}'
+            )
+            cflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+            subprocess.run(
+                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", ps_cmd],
+                capture_output=True,
+                timeout=3,
+                creationflags=cflags,
+            )
+        except Exception:
+            pass
 
     @classmethod
     def _render_standby_card(cls, ai_page, eng: str, connection_url: str = ""):
@@ -1910,19 +2010,35 @@ class AIDedicatedWindowManager:
             or eff_eng in AIGenerator.WEB_ONLY_ENGINES
         )
 
+        # browser_ctrl.close() 等で別Playwrightインスタンスへ切り替わった場合は古いコンテキスト参照をクリア
+        if playwright is not None and getattr(st, "playwright_ref", None) is not None and st.playwright_ref is not playwright:
+            st.ai_page = None
+            st.ai_context = None
+
+        if playwright is None:
+            if getattr(st, "owned_playwright", None) is None:
+                from playwright.sync_api import sync_playwright
+                st.owned_playwright = sync_playwright().start()
+            playwright = st.owned_playwright
+
         if st.ai_page is not None:
+            is_alive = False
             try:
-                if not st.ai_page.is_closed():
-                    if use_web_ui and target_url:
+                is_alive = not st.ai_page.is_closed()
+            except Exception:
+                is_alive = False
+            if is_alive:
+                if use_web_ui and target_url:
+                    try:
                         cur_url = st.ai_page.url or ""
                         cur_host = urlparse(cur_url).netloc.lower()
                         tgt_host = urlparse(target_url).netloc.lower()
                         if not cur_url or cur_url.startswith("about:blank") or cur_url.startswith("data:") or (tgt_host and tgt_host not in cur_host):
                             print(f"🌐 [AI専用ウィンドウ] {eff_eng} ({target_url}) を開いています...")
                             st.ai_page.goto(target_url, timeout=35000, wait_until="domcontentloaded")
-                    return st.ai_page
-            except Exception:
-                pass
+                    except Exception as nav_e:
+                        print(f"   ⚠️ AI専用ウィンドウページ遷移通知: {nav_e}")
+                return st.ai_page
             st.ai_page = None
             st.ai_context = None
 
@@ -1932,11 +2048,15 @@ class AIDedicatedWindowManager:
         if not os.path.exists(ai_profile_dir) and os.path.exists(legacy_dir):
             ai_profile_dir = legacy_dir
         os.makedirs(ai_profile_dir, exist_ok=True)
+        cls._terminate_zombie_browsers(ai_profile_dir)
         cls._cleanup_locks(ai_profile_dir)
 
         launch_args = [
             "--disable-blink-features=AutomationControlled",
             "--enable-features=PromptAPIForGeminiNano,OptimizationGuideModelDownloading",
+            "--disable-backgrounding-occluded-windows",
+            "--disable-renderer-backgrounding",
+            "--disable-background-timer-throttling",
             "--no-first-run",
             "--no-default-browser-check",
             "--disable-infobars",
@@ -1952,6 +2072,7 @@ class AIDedicatedWindowManager:
         last_err = None
         for label, extra in candidates:
             try:
+                cls._cleanup_locks(ai_profile_dir)
                 print(f"🪟 [AI専用ウィンドウ] {label} で起動試行中 (プロファイル: {prof_name} / エンジン: {eff_eng})...")
                 st.ai_context = playwright.chromium.launch_persistent_context(
                     user_data_dir=ai_profile_dir,
@@ -1961,11 +2082,14 @@ class AIDedicatedWindowManager:
                     viewport={"width": 1020, "height": 780},
                     **extra
                 )
+                st.playwright_ref = playwright
                 print(f"   ✅ AI専用ウィンドウの起動に成功しました！ ({label})")
                 break
             except Exception as le:
                 last_err = le
                 print(f"   ⚠️ AI専用ウィンドウ起動スキップ ({label}): {le}")
+                cls._terminate_zombie_browsers(ai_profile_dir)
+                cls._cleanup_locks(ai_profile_dir)
                 continue
 
         if st.ai_context is None:
@@ -2011,9 +2135,16 @@ class AIDedicatedWindowManager:
                 st.ai_context.close()
         except Exception:
             pass
+        try:
+            if getattr(st, "owned_playwright", None) is not None:
+                st.owned_playwright.stop()
+        except Exception:
+            pass
         finally:
             st.ai_page = None
             st.ai_context = None
+            st.playwright_ref = None
+            st.owned_playwright = None
 
     @classmethod
     def _find_visible_input(cls, page, selectors: list[str]):
@@ -2167,11 +2298,11 @@ class AIDedicatedWindowManager:
                     const turn = (cur.getAttribute('data-turn') || cur.getAttribute('data-role') || '').toLowerCase();
                     if (turn === 'user' || turn === 'human') return true;
                     const tid = (cur.getAttribute('data-testid') || '').toLowerCase();
-                    if (tid.includes('user-message') || tid.includes('user_message') || tid === 'user' || tid.startsWith('user-')) return true;
+                    if (tid.includes('user-message') || tid.includes('user_message') || tid.includes('user-prompt') || tid === 'user' || tid.startsWith('user-')) return true;
                     const id = (cur.getAttribute('id') || '').toLowerCase();
-                    if (id.includes('-user-message') || id.includes('user-message') || id.startsWith('user-')) return true;
+                    if (id.includes('-user-message') || id.includes('user-message') || id.includes('user_message') || id.startsWith('user-')) return true;
                     const cls = (typeof cur.className === 'string' ? cur.className : '').toLowerCase();
-                    if (cls.includes('user-message') || cls.includes('user_message') || cls.includes('usermessage')) return true;
+                    if (cls.includes('user-message') || cls.includes('user_message') || cls.includes('usermessage') || cls.includes('user-bubble') || cls.includes('from-user')) return true;
                     const al = (cur.getAttribute('aria-label') || '').toLowerCase();
                     if (al.includes('your message') || al.includes('user message') || al.includes('あなたのメッセージ') || al.includes('自分のメッセージ')) return true;
                     if (cur.tagName === 'TEXTAREA' || cur.tagName === 'INPUT') return true;
@@ -2251,6 +2382,45 @@ class AIDedicatedWindowManager:
         return ""
 
     @classmethod
+    def _detect_streaming_active(cls, ai_page, stop_selectors: list[str]) -> bool:
+        """停止ボタンや生成中スピナー(aria-busy等)が表示されているか確認"""
+        for stsel in (stop_selectors or []):
+            try:
+                loc = ai_page.locator(stsel)
+                cnt = min(loc.count(), 4)
+                for idx in range(cnt):
+                    if loc.nth(idx).is_visible():
+                        return True
+            except Exception:
+                pass
+        for gen_sel in (
+            'main [aria-busy="true"]',
+            '[role="main"] [aria-busy="true"]',
+            'main [role="progressbar"]',
+            'button[aria-label*="Stop generating" i]',
+            'button[aria-label*="生成を停止"]',
+            'button[aria-label*="回答を停止"]',
+        ):
+            try:
+                loc = ai_page.locator(gen_sel)
+                cnt = min(loc.count(), 3)
+                for idx in range(cnt):
+                    if loc.nth(idx).is_visible():
+                        return True
+            except Exception:
+                pass
+        return False
+
+    @classmethod
+    def _read_input_value(cls, input_el) -> str:
+        try:
+            return str(input_el.evaluate(
+                "(el) => el ? (el.tagName === 'TEXTAREA' || el.tagName === 'INPUT' ? (el.value || '') : (el.innerText || el.textContent || '')) : ''"
+            ) or "").strip()
+        except Exception:
+            return ""
+
+    @classmethod
     def _submit_and_stream_response(
         cls,
         ai_page,
@@ -2260,11 +2430,16 @@ class AIDedicatedWindowManager:
         send_selectors: list[str],
         stop_selectors: list[str],
         service_label: str,
-        timeout_sec: float = 55.0,
+        timeout_sec: float = 80.0,
         completion_selectors: list[str] = None,
         card_copy_selectors: list[str] = None,
         prefer_copy_card: bool = False,
     ) -> Tuple[bool, str]:
+        try:
+            ai_page.bring_to_front()
+        except Exception:
+            pass
+
         prev_counts = {}
         prev_last_texts = {}
         prev_tail_sets = {}
@@ -2306,49 +2481,55 @@ class AIDedicatedWindowManager:
         prompt_ws = " ".join(normalized_prompt.split())
         time.sleep(0.5)
 
-        sent = False
-        send_deadline = time.time() + 1.8
-        while time.time() < send_deadline and not sent:
-            for ssel in send_selectors:
-                try:
-                    sbtn = ai_page.locator(ssel)
-                    if sbtn.count() > 0 and sbtn.first.is_visible() and sbtn.first.is_enabled():
-                        sbtn.first.click(timeout=3000)
-                        sent = True
-                        break
-                except Exception:
-                    continue
-            if not sent:
+        def _try_trigger_send(wait_btn_sec: float = 2.2) -> bool:
+            send_deadline = time.time() + wait_btn_sec
+            while time.time() < send_deadline:
+                for ssel in send_selectors:
+                    try:
+                        sbtn = ai_page.locator(ssel)
+                        cnt = min(sbtn.count(), 4)
+                        for idx in range(cnt):
+                            btn = sbtn.nth(idx)
+                            if btn.is_visible() and btn.is_enabled():
+                                btn.click(timeout=3000)
+                                return True
+                    except Exception:
+                        continue
                 time.sleep(0.25)
+            return False
 
+        sent = _try_trigger_send(wait_btn_sec=2.2)
         if not sent:
             try:
                 input_el.click(timeout=2000)
             except Exception:
                 pass
-            ai_page.keyboard.press("Enter")
+            try:
+                ai_page.keyboard.press("Enter")
+            except Exception:
+                pass
+
+        # ラグのあるSPAでは送信直後にまだテキストが入力欄に残る場合があるため、未送信なら再送を実行
+        time.sleep(0.8)
+        prompt_head_ws = prompt_ws[:min(20, len(prompt_ws))]
+        cur_input_ws = " ".join(cls._read_input_value(input_el).split())
+        if prompt_head_ws and prompt_head_ws in cur_input_ws and not cls._detect_streaming_active(ai_page, stop_selectors):
+            if not _try_trigger_send(wait_btn_sec=1.6):
+                try:
+                    input_el.click(timeout=2000)
+                    ai_page.keyboard.press("Enter")
+                except Exception:
+                    pass
+                time.sleep(0.4)
+                cur_input_ws2 = " ".join(cls._read_input_value(input_el).split())
+                if prompt_head_ws in cur_input_ws2:
+                    try:
+                        ai_page.keyboard.press("Control+Enter")
+                    except Exception:
+                        pass
 
         def _is_loading_placeholder(val: str) -> bool:
-            s = (val or "").strip().lower().strip(".。…・!！●•|｜")
-            if not s:
-                return True
-            loading_set = {
-                "考え中", "考えています", "思考中", "生成中", "回答を生成中", "応答を生成中", "返信を生成中",
-                "入力中", "処理中", "読み込み中", "待機中", "お待ちください", "検索中", "web検索中", "ウェブ検索中",
-                "応答を生成しています", "回答を生成しています", "返信を生成しています",
-                "メッセージを生成しています", "文章を生成しています", "生成しています", "作成しています",
-                "応答を作成しています", "回答を作成しています", "読み込んでいます",
-                "thinking", "generating", "generating response", "generating a response",
-                "generating answer", "searching", "searching the web",
-                "loading", "typing", "just a moment", "please wait",
-            }
-            if s in loading_set:
-                return True
-            return bool(re.match(
-                r"^(?:(?:応答|回答|返信|メッセージ|文章|テキスト)?を?(?:生成|作成|思考|検討|入力|読み込み|処理|待機|検索|ウェブ検索|web検索)(?:しています|中)|考えています|generating(?:\s+(?:a\s+)?(?:response|answer|reply))?|thinking|searching(?:\s+the\s+web)?|loading|please\s+wait)$",
-                s,
-                re.IGNORECASE,
-            ))
+            return AIGenerator.is_loading_placeholder(val)
 
         def _is_generic_fallback_selector(sel: str) -> bool:
             s = (sel or "").lower()
@@ -2356,12 +2537,33 @@ class AIDedicatedWindowManager:
                 return False
             return any(k in s for k in ('dir="auto"', ".prose", ".markdown", "article", "main p", "message-content", "chat-message"))
 
-        print(f"   🤖 [AI専用ウィンドウ] {service_label} でリプライ/引用文を生成中（改行保持プロンプト送信済）...")
+        print(f"   🤖 [AI専用ウィンドウ] {service_label} でリプライ/引用文を生成中（本文出力完了を確認するまで待機します）...")
         eff_timeout = float(getattr(cls._get_state(), "web_stream_timeout_sec", None) or timeout_sec)
+        hard_cap = eff_timeout + 40.0
         gen_start = time.time()
         last_txt = ""
+        last_change_ts = 0.0
+        last_activity_ts = 0.0
+        last_is_streaming = False
         stable_ticks = 0
-        while time.time() - gen_start < eff_timeout:
+        grace_logged = False
+
+        while True:
+            now_ts = time.time()
+            elapsed = now_ts - gen_start
+            if elapsed >= hard_cap:
+                break
+            if elapsed >= eff_timeout:
+                still_working = (
+                    last_is_streaming
+                    or (now_ts - last_activity_ts) < 8.0
+                )
+                if not still_working:
+                    break
+                if not grace_logged:
+                    print(f"   ⏳ [AI専用ウィンドウ] {service_label} がまだ生成中のため、本文出力完了まで追加待機します...")
+                    grace_logged = True
+
             time.sleep(0.8)
             cur_txt = ""
             high_prio_loading = False
@@ -2428,18 +2630,13 @@ class AIDedicatedWindowManager:
                 except Exception:
                     continue
 
-            if cur_txt:
-                is_streaming = False
-                for stsel in stop_selectors:
-                    try:
-                        stop_btn = ai_page.locator(stsel)
-                        if stop_btn.count() > 0 and stop_btn.first.is_visible():
-                            is_streaming = True
-                            break
-                    except Exception:
-                        pass
+            is_streaming = cls._detect_streaming_active(ai_page, stop_selectors)
+            last_is_streaming = is_streaming
+            if is_streaming:
+                last_activity_ts = time.time()
 
-                has_completion_ui = not bool(completion_selectors)
+            if cur_txt:
+                explicit_completion_ui = False
                 if completion_selectors:
                     for csel in completion_selectors:
                         try:
@@ -2450,17 +2647,26 @@ class AIDedicatedWindowManager:
                                 for cidx in range(ccnt - 1, prev_cc - 1, -1):
                                     cbtn = cloc.nth(cidx)
                                     if cbtn.is_visible() and not cls._is_inside_user_bubble(cbtn):
-                                        has_completion_ui = True
+                                        explicit_completion_ui = True
                                         break
-                            if has_completion_ui:
+                            if explicit_completion_ui:
                                 break
                         except Exception:
                             pass
 
-                if cur_txt == last_txt and not is_streaming:
+                if cur_txt != last_txt:
+                    stable_ticks = 0
+                    last_txt = cur_txt
+                    last_change_ts = time.time()
+                    last_activity_ts = last_change_ts
+                elif is_streaming or high_prio_loading:
+                    stable_ticks = 0
+                else:
                     stable_ticks += 1
-                    required_ticks = 2 if has_completion_ui else 3
-                    if stable_ticks >= required_ticks:
+                    quiet_elapsed = time.time() - last_change_ts
+                    required_ticks = 2 if explicit_completion_ui else 4
+                    required_quiet_sec = 1.8 if explicit_completion_ui else 3.2
+                    if stable_ticks >= required_ticks and quiet_elapsed >= required_quiet_sec:
                         if prefer_copy_card and card_copy_selectors:
                             copied_out = cls._try_copy_latest_output(
                                 ai_page, prompt_ws, prev_copy_counts, card_copy_selectors, _is_loading_placeholder,
@@ -2469,8 +2675,8 @@ class AIDedicatedWindowManager:
                             if copied_out:
                                 if AIGenerator.is_skip_token_prefix(copied_out):
                                     return True, copied_out
-                                if not AIGenerator.is_prompt_echo(copied_out, normalized_prompt):
-                                    print(f"   📋 [AI専用ウィンドウ] {service_label} の出力完了を確認し「コピー」ボタンから本文を取得しました ({len(copied_out)}文字)")
+                                if not AIGenerator.is_prompt_echo(copied_out, normalized_prompt) and not _is_loading_placeholder(copied_out):
+                                    print(f"   📋 [AI専用ウィンドウ] {service_label} の本文出力完了を確認し「コピー」ボタンから本文を取得しました ({len(copied_out)}文字)")
                                     return True, copied_out
                         clean_out = AIGenerator._sanitize_output(cur_txt)
                         if AIGenerator.is_prompt_echo(cur_txt, normalized_prompt) or AIGenerator.is_prompt_echo(clean_out, normalized_prompt):
@@ -2481,31 +2687,40 @@ class AIDedicatedWindowManager:
                         if is_skip_out:
                             return True, f"{AIGenerator.SKIP_SIGNAL_PREFIX}{skip_reason}"
                         if clean_out and not _is_loading_placeholder(clean_out):
+                            print(f"   ✅ [AI専用ウィンドウ] {service_label} の本文出力完了を確認しました ({len(clean_out)}文字)")
                             return True, clean_out
-                else:
-                    stable_ticks = 0
-                    last_txt = cur_txt
 
+        # タイムアウト境界: ストリーミング中だった場合は最大4秒だけ終了を待ち、完了確認できた本文のみ返す
         if last_txt and not AIGenerator.is_prompt_echo(last_txt, normalized_prompt):
-            if prefer_copy_card and card_copy_selectors:
-                copied_out = cls._try_copy_latest_output(
-                    ai_page, prompt_ws, prev_copy_counts, card_copy_selectors, _is_loading_placeholder,
-                    prompt_text=normalized_prompt,
-                )
-                if copied_out:
-                    if AIGenerator.is_skip_token_prefix(copied_out):
-                        return True, copied_out
-                    if not AIGenerator.is_prompt_echo(copied_out, normalized_prompt):
-                        print(f"   📋 [AI専用ウィンドウ] {service_label} の出力を確認し「コピー」ボタンから本文を取得しました ({len(copied_out)}文字)")
-                        return True, copied_out
-            clean_out = AIGenerator._sanitize_output(last_txt)
-            if not AIGenerator.is_prompt_echo(clean_out, normalized_prompt):
-                is_skip_out, skip_reason = AIGenerator.detect_skip_response(last_txt, clean_out)
-                if is_skip_out:
-                    return True, f"{AIGenerator.SKIP_SIGNAL_PREFIX}{skip_reason}"
-                if clean_out and not _is_loading_placeholder(clean_out):
-                    return True, clean_out
-        return False, f"{service_label} からの回答取得がタイムアウトしました"
+            if last_is_streaming:
+                settle_end = time.time() + 4.0
+                while time.time() < settle_end:
+                    if not cls._detect_streaming_active(ai_page, stop_selectors):
+                        break
+                    time.sleep(0.8)
+            still_streaming = cls._detect_streaming_active(ai_page, stop_selectors)
+            quiet_at_end = (time.time() - last_change_ts) if last_change_ts else 0.0
+            if not still_streaming and quiet_at_end >= 2.0:
+                if prefer_copy_card and card_copy_selectors:
+                    copied_out = cls._try_copy_latest_output(
+                        ai_page, prompt_ws, prev_copy_counts, card_copy_selectors, _is_loading_placeholder,
+                        prompt_text=normalized_prompt,
+                    )
+                    if copied_out:
+                        if AIGenerator.is_skip_token_prefix(copied_out):
+                            return True, copied_out
+                        if not AIGenerator.is_prompt_echo(copied_out, normalized_prompt) and not _is_loading_placeholder(copied_out):
+                            print(f"   📋 [AI専用ウィンドウ] {service_label} の出力を確認し「コピー」ボタンから本文を取得しました ({len(copied_out)}文字)")
+                            return True, copied_out
+                clean_out = AIGenerator._sanitize_output(last_txt)
+                if not AIGenerator.is_prompt_echo(clean_out, normalized_prompt):
+                    is_skip_out, skip_reason = AIGenerator.detect_skip_response(last_txt, clean_out)
+                    if is_skip_out:
+                        return True, f"{AIGenerator.SKIP_SIGNAL_PREFIX}{skip_reason}"
+                    if clean_out and not _is_loading_placeholder(clean_out):
+                        print(f"   ✅ [AI専用ウィンドウ] {service_label} の本文出力完了を確認しました ({len(clean_out)}文字)")
+                        return True, clean_out
+        return False, f"{service_label} からの本文出力完了が確認できませんでした（回答待機タイムアウト）"
 
     @classmethod
     def _generate_via_gemini_web(cls, ai_page, prompt: str, custom_url: str = "") -> Tuple[bool, str]:
@@ -2836,32 +3051,43 @@ class AIDedicatedWindowManager:
                 ai_page.goto(target, timeout=35000, wait_until="domcontentloaded")
                 time.sleep(2.5)
 
-            # 初回訪問時の「始める / 同意する」ウィザードがあれば自動クリック
-            for agree_sel in [
+            # 初回訪問時の「始める / 同意する」ウィザードがラグで遅れて描画されても確実に突破する
+            agree_selectors = [
                 'button:has-text("同意して続行")',
                 'button:has-text("同意する")',
                 'button:has-text("始める")',
                 'button:has-text("I Agree")',
                 'button:has-text("Get Started")',
+                'button:has-text("Continue")',
                 'button:has-text("Next")',
                 'button:has-text("次へ")',
-            ]:
-                try:
-                    btn = ai_page.locator(agree_sel)
-                    if btn.count() > 0 and btn.first.is_visible():
-                        btn.first.click(timeout=2500)
-                        time.sleep(1.0)
-                except Exception:
-                    continue
+            ]
+            duck_input_sels = [
+                'textarea[name="user-prompt"]',
+                'textarea[placeholder*="Chat"]',
+                'textarea[placeholder*="メッセージ"]',
+                'textarea',
+            ]
+            pre_deadline = time.time() + 5.0
+            while time.time() < pre_deadline:
+                if cls._find_visible_input(ai_page, duck_input_sels) is not None:
+                    break
+                clicked_agree = False
+                for agree_sel in agree_selectors:
+                    try:
+                        btn = ai_page.locator(agree_sel)
+                        if btn.count() > 0 and btn.first.is_visible():
+                            btn.first.click(timeout=2500)
+                            clicked_agree = True
+                            time.sleep(0.9)
+                    except Exception:
+                        continue
+                if not clicked_agree:
+                    time.sleep(0.5)
 
             input_el = cls._wait_for_input_or_login(
                 ai_page,
-                input_selectors=[
-                    'textarea[name="user-prompt"]',
-                    'textarea[placeholder*="Chat"]',
-                    'textarea[placeholder*="メッセージ"]',
-                    'textarea',
-                ],
+                input_selectors=duck_input_sels,
                 service_label="Duck.ai",
                 target_url=target,
                 login_markers=[],
@@ -3288,8 +3514,8 @@ class AIDedicatedWindowManager:
         prev_login_wait = getattr(st, "web_login_wait_sec", None)
         prev_stream_timeout = getattr(st, "web_stream_timeout_sec", None)
         if is_fallback:
-            st.web_login_wait_sec = 8.0
-            st.web_stream_timeout_sec = 30.0
+            st.web_login_wait_sec = 10.0
+            st.web_stream_timeout_sec = 50.0
         try:
             ai_page = cls.get_or_create_ai_page(
                 playwright,
